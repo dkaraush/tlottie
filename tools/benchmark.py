@@ -260,6 +260,12 @@ class Tlottie:
                     continue
                 frame = float(i % count)
                 t1 = time.perf_counter_ns()
+                if i % count == 0:
+                    self.lib.tlottie_animation_drop(anim)
+                    anim = self.lib.tlottie_animation_new(buf, len(data))
+                    if not anim:
+                        render_ns += time.perf_counter_ns() - t1
+                        return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "parse"
                 rc = self.lib.tlottie_animation_render_argb(
                     anim, frame, size, size, pixels, size * size, 1
                 )
@@ -271,7 +277,8 @@ class Tlottie:
             other_ms = (render_ns / 1_000_000.0) / other_frames if other_frames else None
             return True, first_ms, other_ms, other_frames, avg(rss_samples), max(rss_samples), ""
         finally:
-            self.lib.tlottie_animation_drop(anim)
+            if anim:
+                self.lib.tlottie_animation_drop(anim)
 
     def render_argb(self, file: Path, size: int, frame: int) -> tuple[bool, list[int], str]:
         data = file.read_bytes()
@@ -289,7 +296,8 @@ class Tlottie:
                 return False, [], f"render:{rc}"
             return True, list(pixels), ""
         finally:
-            self.lib.tlottie_animation_drop(anim)
+            if anim:
+                self.lib.tlottie_animation_drop(anim)
 
     def render_frames_argb(self, file: Path, size: int) -> tuple[bool, list[list[int]], int, str]:
         data = file.read_bytes()
@@ -340,6 +348,12 @@ class Tlottie:
                 if i == 0:
                     continue
                 t1 = time.perf_counter_ns()
+                if i % count == 0:
+                    self.lib.tlottie_animation_drop(anim)
+                    anim = self.lib.tlottie_animation_new(buf, len(data))
+                    if not anim:
+                        render_ns += time.perf_counter_ns() - t1
+                        return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "parse", [], count
                 rc = self.lib.tlottie_animation_render_argb(
                     anim, float(i % count), size, size, pixels, size * size, 1
                 )
@@ -404,6 +418,12 @@ class Rlottie:
                 if i == 0:
                     continue
                 t1 = time.perf_counter_ns()
+                if i % count == 0:
+                    self.lib.lottie_animation_destroy(anim)
+                    anim = self.lib.lottie_animation_from_file(os.fsencode(file))
+                    if not anim:
+                        render_ns += time.perf_counter_ns() - t1
+                        return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "parse"
                 self.lib.lottie_animation_render(
                     anim, i % count, pixels, size, size, size * 4
                 )
@@ -413,7 +433,8 @@ class Rlottie:
             other_ms = (render_ns / 1_000_000.0) / other_frames if other_frames else None
             return True, first_ms, other_ms, other_frames, avg(rss_samples), max(rss_samples), ""
         finally:
-            self.lib.lottie_animation_destroy(anim)
+            if anim:
+                self.lib.lottie_animation_destroy(anim)
 
     def render_argb(self, file: Path, size: int, frame: int) -> tuple[bool, list[int], str]:
         anim = self.lib.lottie_animation_from_file(os.fsencode(file))
@@ -425,7 +446,8 @@ class Rlottie:
             self.lib.lottie_animation_render(anim, frame % count, pixels, size, size, size * 4)
             return True, list(pixels), ""
         finally:
-            self.lib.lottie_animation_destroy(anim)
+            if anim:
+                self.lib.lottie_animation_destroy(anim)
 
     def render_frames_argb(self, file: Path, size: int) -> tuple[bool, list[list[int]], int, str]:
         anim = self.lib.lottie_animation_from_file(os.fsencode(file))
@@ -464,6 +486,12 @@ class Rlottie:
                 if i == 0:
                     continue
                 t1 = time.perf_counter_ns()
+                if i % count == 0:
+                    self.lib.lottie_animation_destroy(anim)
+                    anim = self.lib.lottie_animation_from_file(os.fsencode(file))
+                    if not anim:
+                        render_ns += time.perf_counter_ns() - t1
+                        return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "parse", [], count
                 self.lib.lottie_animation_render(anim, i % count, pixels, size, size, size * 4)
                 render_ns += time.perf_counter_ns() - t1
                 out_frames.append(list(pixels))
@@ -561,6 +589,35 @@ class Thorvg:
                 if i == 0:
                     continue
                 t1 = time.perf_counter_ns()
+                if i % count == 0:
+                    if canvas:
+                        self.lib.tvg_canvas_destroy(canvas)
+                        canvas = None
+                    self.lib.tvg_animation_del(anim)
+                    anim = self.lib.tvg_animation_new()
+                    if not anim:
+                        render_ns += time.perf_counter_ns() - t1
+                        return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "new"
+                    pic = self.lib.tvg_animation_get_picture(anim)
+                    if not pic or self.lib.tvg_picture_load(pic, os.fsencode(file)) != self.SUCCESS:
+                        render_ns += time.perf_counter_ns() - t1
+                        return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "parse"
+                    self.lib.tvg_picture_set_size(pic, float(size), float(size))
+                    canvas = self.lib.tvg_swcanvas_create(self.ENGINE_NONE)
+                    if not canvas:
+                        render_ns += time.perf_counter_ns() - t1
+                        return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "canvas"
+                    if (
+                        self.lib.tvg_swcanvas_set_target(
+                            canvas, pixels, size, size, size, self.ARGB8888
+                        )
+                        != self.SUCCESS
+                    ):
+                        render_ns += time.perf_counter_ns() - t1
+                        return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "target"
+                    if self.lib.tvg_canvas_add(canvas, pic) != self.SUCCESS:
+                        render_ns += time.perf_counter_ns() - t1
+                        return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "add"
                 self.lib.tvg_animation_set_frame(anim, float(i % count))
                 self.lib.tvg_canvas_update(canvas)
                 self.lib.tvg_canvas_draw(canvas, True)
@@ -573,7 +630,8 @@ class Thorvg:
         finally:
             if canvas:
                 self.lib.tvg_canvas_destroy(canvas)
-            self.lib.tvg_animation_del(anim)
+            if anim:
+                self.lib.tvg_animation_del(anim)
 
     def render_argb(self, file: Path, size: int, frame: int) -> tuple[bool, list[int], str]:
         anim = self.lib.tvg_animation_new()
@@ -607,7 +665,8 @@ class Thorvg:
         finally:
             if canvas:
                 self.lib.tvg_canvas_destroy(canvas)
-            self.lib.tvg_animation_del(anim)
+            if anim:
+                self.lib.tvg_animation_del(anim)
 
     def render_frames_argb(self, file: Path, size: int) -> tuple[bool, list[list[int]], int, str]:
         anim = self.lib.tvg_animation_new()
@@ -688,6 +747,35 @@ class Thorvg:
                 if i == 0:
                     continue
                 t1 = time.perf_counter_ns()
+                if i % count == 0:
+                    if canvas:
+                        self.lib.tvg_canvas_destroy(canvas)
+                        canvas = None
+                    self.lib.tvg_animation_del(anim)
+                    anim = self.lib.tvg_animation_new()
+                    if not anim:
+                        render_ns += time.perf_counter_ns() - t1
+                        return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "new", [], count
+                    pic = self.lib.tvg_animation_get_picture(anim)
+                    if not pic or self.lib.tvg_picture_load(pic, os.fsencode(file)) != self.SUCCESS:
+                        render_ns += time.perf_counter_ns() - t1
+                        return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "parse", [], count
+                    self.lib.tvg_picture_set_size(pic, float(size), float(size))
+                    canvas = self.lib.tvg_swcanvas_create(self.ENGINE_NONE)
+                    if not canvas:
+                        render_ns += time.perf_counter_ns() - t1
+                        return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "canvas", [], count
+                    if (
+                        self.lib.tvg_swcanvas_set_target(
+                            canvas, pixels, size, size, size, self.ARGB8888
+                        )
+                        != self.SUCCESS
+                    ):
+                        render_ns += time.perf_counter_ns() - t1
+                        return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "target", [], count
+                    if self.lib.tvg_canvas_add(canvas, pic) != self.SUCCESS:
+                        render_ns += time.perf_counter_ns() - t1
+                        return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "add", [], count
                 self.lib.tvg_animation_set_frame(anim, float(i % count))
                 self.lib.tvg_canvas_update(canvas)
                 self.lib.tvg_canvas_draw(canvas, True)
