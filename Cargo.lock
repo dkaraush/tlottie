@@ -13,6 +13,13 @@ name = "tlottie"
 version = "0.1.0"
 
 [[package]]
+name = "tlottie-capi"
+version = "0.1.0"
+dependencies = [
+ "tlottie",
+]
+
+[[package]]
 name = "tlottie-cli"
 version = "0.1.0"
 dependencies = [
