@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tlottie vs rlottie vs thorvg wasm demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 16px; padding: 16px;
+    box-sizing: border-box;
+    font: 14px/1.5 -apple-system, system-ui, sans-serif;
+    background: light-dark(#f5f5f7, #111);
+    color: light-dark(#333, #ddd);
+  }
+  #drop {
+    border: 2px dashed light-dark(#bbb, #555); border-radius: 12px;
+    padding: 24px 60px; text-align: center; cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  #drop.over { border-color: #4a90d9; background: light-dark(#eaf2fb, #1a2733); }
+  #drop small { color: light-dark(#888, #888); }
+  #tabs { display: none; gap: 4px; flex-wrap: wrap; justify-content: center; }
+  #tabs button {
+    font: inherit; color: inherit; cursor: pointer;
+    background: none; border: none; border-radius: 8px; padding: 6px 14px;
+  }
+  #tabs button:hover { background: light-dark(#e8e8ea, #1c1c1e); }
+  #tabs button.active { background: light-dark(#e0e6ee, #26303a); color: #4a90d9; }
+  #panels { display: none; gap: 24px; flex-wrap: wrap; justify-content: center; }
+  figure { margin: 0; display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  canvas {
+    max-width: min(44vw, 1024px); max-height: 60vh;
+    border-radius: 12px;
+    background:
+      repeating-conic-gradient(light-dark(#e0e0e0, #222) 0% 25%,
+                               light-dark(#fff, #181818) 0% 50%) 0 0 / 24px 24px;
+  }
+  body.single canvas { max-width: min(90vw, 1024px); }
+  figcaption { text-align: center; }
+  figcaption strong { font-size: 15px; }
+  .pstats {
+    display: block; color: light-dark(#777, #999); min-height: 1.5em;
+    font-variant-numeric: tabular-nums;
+  }
+  #info, #statsrow { color: light-dark(#777, #999); min-height: 1.5em; }
+  #statsrow { display: none; gap: 16px; align-items: center; flex-wrap: wrap; justify-content: center; }
+  #stats { font-variant-numeric: tabular-nums; min-width: 11em; text-align: right; }
+  #statsrow label { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px; }
+  #statsrow input { cursor: pointer; }
+  #sizeslider { width: 120px; accent-color: #4a90d9; }
+  #sizeval { min-width: 4.5em; font-variant-numeric: tabular-nums; }
+  #err { color: #d9534f; }
+  input[type=file] { display: none; }
+</style>
+</head>
+<body>
+<div id="drop">
+  <strong>Drop a Lottie file here</strong><br>
+  <small>.json or .tgs &mdash; or click to pick</small>
+</div>
+<nav id="tabs">
+  <button data-mode="both" class="active">All</button>
+  <button data-mode="tl">tlottie</button>
+  <button data-mode="rl">rlottie</button>
+  <button data-mode="tvg">thorvg cpu</button>
+  <button data-mode="twg">thorvg webgpu</button>
+</nav>
+<div id="panels">
+  <figure id="panel-tl">
+    <canvas id="canvas-tl"></canvas>
+    <figcaption><strong>tlottie</strong><span class="pstats" id="stats-tl"></span></figcaption>
+  </figure>
+  <figure id="panel-rl">
+    <canvas id="canvas-rl"></canvas>
+    <figcaption><strong>rlottie</strong><span class="pstats" id="stats-rl"></span></figcaption>
+  </figure>
+  <figure id="panel-tvg">
+    <canvas id="canvas-tvg"></canvas>
+    <figcaption><strong>thorvg cpu</strong><span class="pstats" id="stats-tvg"></span></figcaption>
+  </figure>
+  <figure id="panel-twg">
+    <canvas id="canvas-twg"></canvas>
+    <figcaption><strong>thorvg webgpu</strong><span class="pstats" id="stats-twg"></span></figcaption>
+  </figure>
+</div>
+<div id="info"></div>
+<div id="statsrow">
+  <span id="stats"></span>
+  <label><input type="checkbox" id="capfps"> cap to file fps</label>
+  <label><input type="checkbox" id="antialias" checked> tlottie antialiasing</label>
+  <label>size <input type="range" id="sizeslider" min="64" max="1024" step="32">
+    <span id="sizeval"></span></label>
+</div>
+<div id="err"></div>
+<input type="file" id="picker" accept=".json,.tgs,application/json">
+<script type="module" src="main.js"></script>
+</body>
+</html>
