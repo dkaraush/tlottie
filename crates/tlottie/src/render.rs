@@ -2256,6 +2256,7 @@ impl Canvas<'_> {
     ) {
         let w = self.w;
         let antialias = self.antialias;
+        let dst_clear = self.dirty.is_empty();
         // Fastest path: the paint's premultiplied coverage-scaled SOURCE
         // pixels are cached (geometry + LUT + map all repeat) — replay as a
         // pure composite; bit-exact vs blend_gradient_px (same formula).
@@ -2274,7 +2275,11 @@ impl Canvas<'_> {
                     break;
                 };
                 self.dirty.mark_row(y, x0, x0 + len);
-                crate::simd::composite_over_span(dst_row, src_row, 255);
+                if dst_clear {
+                    dst_row.copy_from_slice(src_row);
+                } else {
+                    crate::simd::composite_over_span(dst_row, src_row, 255);
+                }
                 off += len;
             }
             return;
@@ -2327,8 +2332,14 @@ impl Canvas<'_> {
                         };
                         src_entry.rows.push((y as u32, x0 as u32, len as u32));
                         if let PlaneData::Src(sd) = &mut src_entry.data {
-                            gradient_row_capture(dst_row, cr, y, x0, lut, map, sd);
+                            if dst_clear {
+                                gradient_row_capture_clear(dst_row, cr, y, x0, lut, map, sd);
+                            } else {
+                                gradient_row_capture(dst_row, cr, y, x0, lut, map, sd);
+                            }
                         }
+                    } else if dst_clear {
+                        gradient_span_uniform_clear(dst_row, cov, y, x0, lut, map);
                     } else {
                         gradient_span_uniform(dst_row, cov, y, x0, lut, map);
                     }
@@ -2363,8 +2374,14 @@ impl Canvas<'_> {
                     if capture {
                         src_entry.rows.push((y as u32, x0 as u32, len as u32));
                         if let PlaneData::Src(sd) = &mut src_entry.data {
-                            gradient_row_capture(dst_row, cov_row, y, x0, lut, map, sd);
+                            if dst_clear {
+                                gradient_row_capture_clear(dst_row, cov_row, y, x0, lut, map, sd);
+                            } else {
+                                gradient_row_capture(dst_row, cov_row, y, x0, lut, map, sd);
+                            }
                         }
+                    } else if dst_clear {
+                        gradient_srcs(dst_row, cov_row, y, x0, lut, map);
                     } else {
                         gradient_row(dst_row, cov_row, y, x0, lut, map);
                     }
@@ -2408,7 +2425,11 @@ impl Canvas<'_> {
                 } else {
                     overflow = true;
                 }
-                gradient_span_uniform(dst_row, cov, y, x0, lut, map);
+                if dst_clear {
+                    gradient_span_uniform_clear(dst_row, cov, y, x0, lut, map);
+                } else {
+                    gradient_span_uniform(dst_row, cov, y, x0, lut, map);
+                }
             });
             if overflow || !capture {
                 self.span_buf = spans; // recycle
@@ -2451,7 +2472,11 @@ impl Canvas<'_> {
                     d.extend_from_slice(cov_row);
                 }
             }
-            gradient_row(dst_row, cov_row, y, x0, lut, map);
+            if dst_clear {
+                gradient_srcs(dst_row, cov_row, y, x0, lut, map);
+            } else {
+                gradient_row(dst_row, cov_row, y, x0, lut, map);
+            }
         });
         if capture {
             cache.insert(key, entry);
@@ -2480,6 +2505,26 @@ fn gradient_row_capture(
     };
     gradient_srcs(srcs, cov_row, y, x0, lut, map);
     crate::simd::composite_over_span(dst_row, srcs, 255);
+}
+
+/// Clear-destination form of [`gradient_row_capture`]: source-over onto
+/// transparent pixels is exactly the coverage-scaled premultiplied source.
+fn gradient_row_capture_clear(
+    dst_row: &mut [u32],
+    cov_row: &[u8],
+    y: usize,
+    x0: usize,
+    lut: &[u32; GRADIENT_LUT_SIZE],
+    map: &GradientMap,
+    out: &mut Vec<u32>,
+) {
+    let base = out.len();
+    out.resize(base + dst_row.len(), 0);
+    let Some(srcs) = out.get_mut(base..) else {
+        return;
+    };
+    gradient_srcs(srcs, cov_row, y, x0, lut, map);
+    dst_row.copy_from_slice(srcs);
 }
 
 /// Computes the premultiplied coverage-scaled source pixels of one gradient
@@ -2829,6 +2874,87 @@ fn gradient_span_uniform(
                 }
             }
         }
+    }
+}
+
+/// Clear-destination form of [`gradient_span_uniform`].
+fn gradient_span_uniform_clear(
+    dst_row: &mut [u32],
+    cov: u8,
+    y: usize,
+    x0: usize,
+    lut: &[u32; GRADIENT_LUT_SIZE],
+    map: &GradientMap,
+) {
+    if cov == 0 || dst_row.is_empty() {
+        return;
+    }
+    if cov == 255 {
+        match &map.kind {
+            GradientMapKind::Linear {
+                sx,
+                sy,
+                dx,
+                dy,
+                inv_len_sq,
+            } => {
+                let inv = map.inv;
+                let yf = y as f32 + 0.5;
+                let lx0 = inv.a * 0.5 + inv.c * yf + inv.tx;
+                let ly0 = inv.b * 0.5 + inv.d * yf + inv.ty;
+                let row_base = ((lx0 - sx) * dx + (ly0 - sy) * dy) * inv_len_sq;
+                let dt = (inv.a * dx + inv.b * dy) * inv_len_sq;
+                grad_stat(0, dst_row.len());
+                grad_stat(3, dst_row.len());
+                crate::simd::linear_lut_fill(dst_row, lut, row_base, dt, x0 as f32);
+            }
+            GradientMapKind::Radial { sx, sy, inv_r } => {
+                let inv = map.inv;
+                let yf = y as f32 + 0.5;
+                let lx0 = inv.a * 0.5 + inv.c * yf + inv.tx;
+                let ly0 = inv.b * 0.5 + inv.d * yf + inv.ty;
+                let (dd0x, dd0y) = (lx0 - sx, ly0 - sy);
+                grad_stat(1, dst_row.len());
+                grad_stat(3, dst_row.len());
+                crate::simd::radial_lut_fill(
+                    dst_row, lut, dd0x, dd0y, inv.a, inv.b, *inv_r, x0 as f32,
+                );
+            }
+            GradientMapKind::Focal {
+                fx,
+                fy,
+                dx,
+                dy,
+                a,
+                r,
+            } => {
+                if a.abs() < 1e-9 {
+                    return;
+                }
+                let inv = map.inv;
+                let yf = y as f32 + 0.5;
+                let lx0 = inv.a * 0.5 + inv.c * yf + inv.tx;
+                let ly0 = inv.b * 0.5 + inv.d * yf + inv.ty;
+                let inv2a = 1.0 / (2.0 * a);
+                let (g0x, g0y) = (lx0 - fx, ly0 - fy);
+                grad_stat(2, dst_row.len());
+                grad_stat(4, dst_row.len());
+                crate::simd::focal_lut_fill(
+                    dst_row, lut, g0x, g0y, inv.a, inv.b, *dx, *dy, *a, inv2a, *r, x0 as f32,
+                );
+            }
+        }
+        return;
+    }
+
+    if dst_row.len() > 1024 {
+        gradient_span_uniform(dst_row, cov, y, x0, lut, map);
+        return;
+    }
+    let mut cov_row = [0u8; 1024];
+    if let Some(row) = cov_row.get_mut(..dst_row.len()) {
+        row.fill(cov);
+        gradient_srcs(dst_row, row, y, x0, lut, map);
     }
 }
 
