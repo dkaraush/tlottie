@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/tlottie", "crates/tlottie-cli", "crates/tlottie-wasm"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# The no-panic wall. The core crate must never reach a panic path; these lints
+# make the panic-prone constructs compile errors. Tests are exempted via
+# clippy.toml (allow-*-in-tests). See GOALS.md "Safety contract".
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+fallible_impl_from = "deny"
+unreachable = "deny"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+opt-level = 3
+debug = true  # symbols for profiling; stripped in release-size
+lto = "fat"
+codegen-units = 1
+# panic stays "unwind": the FFI boundary uses catch_unwind as the last-resort
+# backstop; the real contract is that no panic path exists (checked by the
+# absence of core::panicking symbols in the release artifact).
+
+[profile.release-size]
+inherits = "release"
+opt-level = "z"
+strip = "symbols"

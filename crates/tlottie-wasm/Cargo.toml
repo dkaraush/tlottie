@@ -1,0 +1,17 @@
+[package]
+name = "tlottie-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C-ABI wasm32 shim over tlottie for the browser demo (tools/wasm-demo)"
+
+[lib]
+crate-type = ["cdylib"]
+
+# Same zero-dependency policy as the core crate: the JS side talks a plain
+# C ABI, no wasm-bindgen.
+[dependencies]
+tlottie = { path = "../tlottie" }
+
+[lints]
+workspace = true

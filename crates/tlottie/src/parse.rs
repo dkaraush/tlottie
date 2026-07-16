@@ -1,0 +1,1597 @@
+//! Lottie JSON → model parser.
+//!
+//! Strategy: a single forward pass per object; values needed out of order
+//! (e.g. a property's `k` whose interpretation depends on shape, a shape
+//! item's `ty`) get their byte position recorded and are re-parsed from a
+//! forked cursor afterwards. Field order therefore never matters.
+//!
+//! Unsupported shape/layer types are skipped silently for now; the
+//! supported-feature report lands with a later phase.
+
+use crate::error::{Error, JsonErrorKind, Limit, Result};
+use crate::json::Cursor;
+use crate::limits::Limits;
+use crate::math::{Color, Vec2};
+use crate::model::{
+    Asset, Composition, DashElement, EllipseShape, Fill, FillRule, FloatList, GradientFill,
+    GradientKind, GradientStroke, Group, Layer, LayerKind, Mask, PathData, PathShape,
+    PolystarShape, Position, RectShape, Repeater, Shape, Stroke, Transform, Trim, TrimMode,
+};
+use crate::property::{Easing, Keyframe, Lerp, Property, Timeline};
+use crate::stroke::{Cap, Join};
+
+/// Maximum nesting of `gr` shape groups (separate from raw JSON depth).
+const MAX_GROUP_DEPTH: usize = 32;
+
+// ---------------------------------------------------------------------------
+// Object / array walking helpers
+// ---------------------------------------------------------------------------
+
+fn invalid(c: &Cursor<'_>, what: &'static str) -> Error {
+    Error::InvalidLottie {
+        offset: c.pos(),
+        what,
+    }
+}
+
+fn json_err(c: &Cursor<'_>, kind: JsonErrorKind) -> Error {
+    Error::Json {
+        offset: c.pos(),
+        kind,
+    }
+}
+
+/// Iterates fields of a JSON object. The callback must consume each value
+/// (parse it or `skip_value`).
+fn for_each_field<'a>(
+    c: &mut Cursor<'a>,
+    mut f: impl FnMut(&mut Cursor<'a>, &'a [u8]) -> Result<()>,
+) -> Result<()> {
+    c.skip_ws();
+    c.expect(b'{')?;
+    c.skip_ws();
+    if c.peek() == Some(b'}') {
+        c.bump();
+        return Ok(());
+    }
+    loop {
+        c.skip_ws();
+        let key = c.read_string_bytes()?;
+        c.skip_ws();
+        c.expect(b':')?;
+        c.skip_ws();
+        f(c, key)?;
+        c.skip_ws();
+        match c.bump() {
+            Some(b',') => {}
+            Some(b'}') => return Ok(()),
+            Some(b) => return Err(json_err(c, JsonErrorKind::UnexpectedByte(b))),
+            None => return Err(json_err(c, JsonErrorKind::UnexpectedEof)),
+        }
+    }
+}
+
+/// Iterates elements of a JSON array. The callback must consume each element.
+fn for_each_element<'a>(
+    c: &mut Cursor<'a>,
+    mut f: impl FnMut(&mut Cursor<'a>) -> Result<()>,
+) -> Result<()> {
+    c.skip_ws();
+    c.expect(b'[')?;
+    c.skip_ws();
+    if c.peek() == Some(b']') {
+        c.bump();
+        return Ok(());
+    }
+    loop {
+        c.skip_ws();
+        f(c)?;
+        c.skip_ws();
+        match c.bump() {
+            Some(b',') => {}
+            Some(b']') => return Ok(()),
+            Some(b) => return Err(json_err(c, JsonErrorKind::UnexpectedByte(b))),
+            None => return Err(json_err(c, JsonErrorKind::UnexpectedEof)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scalar value parsers
+// ---------------------------------------------------------------------------
+
+fn parse_f32(c: &mut Cursor<'_>) -> Result<f32> {
+    Ok(c.parse_f64()? as f32)
+}
+
+/// Number, or array whose first element is a number (`[12.5]`), as scalars
+/// appear both ways in Lottie.
+fn parse_scalar(c: &mut Cursor<'_>) -> Result<f32> {
+    c.skip_ws();
+    if c.peek() == Some(b'[') {
+        let mut value: Option<f32> = None;
+        for_each_element(c, |c| {
+            if value.is_none() {
+                value = Some(parse_f32(c)?);
+            } else {
+                c.skip_value()?;
+            }
+            Ok(())
+        })?;
+        value.ok_or_else(|| invalid(c, "empty scalar array"))
+    } else {
+        parse_f32(c)
+    }
+}
+
+/// `[x, y, ...]` (extra components ignored).
+fn parse_vec2(c: &mut Cursor<'_>) -> Result<Vec2> {
+    let mut got: [Option<f32>; 2] = [None, None];
+    let mut i = 0usize;
+    for_each_element(c, |c| {
+        if let Some(slot) = got.get_mut(i) {
+            *slot = Some(parse_f32(c)?);
+        } else {
+            c.skip_value()?;
+        }
+        i += 1;
+        Ok(())
+    })?;
+    match got {
+        [Some(x), Some(y)] => Ok(Vec2::new(x, y)),
+        [Some(x), None] => Ok(Vec2::new(x, x)),
+        _ => Err(invalid(c, "expected [x, y]")),
+    }
+}
+
+/// `[r, g, b]` or `[r, g, b, a]`, components 0..=1 (255-scale tolerated).
+fn parse_color(c: &mut Cursor<'_>) -> Result<Color> {
+    let mut comps: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+    let mut i = 0usize;
+    for_each_element(c, |c| {
+        let v = parse_f32(c)?;
+        if let Some(slot) = comps.get_mut(i) {
+            *slot = v;
+        }
+        i += 1;
+        Ok(())
+    })?;
+    if i < 3 {
+        return Err(invalid(c, "color needs at least 3 components"));
+    }
+    // rlottie takes components as-is (no 0..255 rescale heuristic — real
+    // files carry rounding artifacts like 1.0001); clamp to the valid range.
+    // The 4th array component is DISCARDED (rlottie getValue(LottieColor)
+    // reads only rgb; paint alpha flows exclusively from the `o` property —
+    // SunEmoji mouths carry a=0.52 that the reference never applies).
+    Ok(Color {
+        r: comps[0].clamp(0.0, 1.0),
+        g: comps[1].clamp(0.0, 1.0),
+        b: comps[2].clamp(0.0, 1.0),
+        a: 1.0,
+    })
+}
+
+fn parse_f32_list(c: &mut Cursor<'_>) -> Result<FloatList> {
+    let mut out = Vec::new();
+    for_each_element(c, |c| {
+        out.push(parse_f32(c)?);
+        Ok(())
+    })?;
+    Ok(FloatList(out))
+}
+
+fn parse_bool(c: &mut Cursor<'_>) -> Result<bool> {
+    c.skip_ws();
+    match c.peek() {
+        Some(b't') | Some(b'f') => {
+            let pos = c.pos();
+            c.skip_value()?;
+            // skip_value validated the keyword; length tells which it was.
+            Ok(c.pos() - pos == 4)
+        }
+        Some(b'0'..=b'9' | b'-') => Ok(parse_f32(c)? != 0.0),
+        _ => Err(invalid(c, "expected boolean")),
+    }
+}
+
+/// Path contour object `{c, v, i, o}`. Also accepts the array-wrapped form
+/// `[{...}]` used in keyframe `s` fields.
+fn parse_path_value(c: &mut Cursor<'_>) -> Result<PathData> {
+    c.skip_ws();
+    if c.peek() == Some(b'[') {
+        let mut path: Option<PathData> = None;
+        for_each_element(c, |c| {
+            if path.is_none() {
+                path = Some(parse_path_object(c)?);
+            } else {
+                c.skip_value()?;
+            }
+            Ok(())
+        })?;
+        return path.ok_or_else(|| invalid(c, "empty path keyframe value"));
+    }
+    parse_path_object(c)
+}
+
+fn parse_vec2_list(c: &mut Cursor<'_>) -> Result<Vec<Vec2>> {
+    let mut out = Vec::new();
+    for_each_element(c, |c| {
+        out.push(parse_vec2(c)?);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn parse_path_object(c: &mut Cursor<'_>) -> Result<PathData> {
+    let mut data = PathData::default();
+    for_each_field(c, |c, key| {
+        match key {
+            b"v" => data.vertices = parse_vec2_list(c)?,
+            b"i" => data.in_tangents = parse_vec2_list(c)?,
+            b"o" => data.out_tangents = parse_vec2_list(c)?,
+            b"c" => data.closed = parse_bool(c)?,
+            _ => c.skip_value()?,
+        }
+        Ok(())
+    })?;
+    let n = data.vertices.len();
+    // Tolerate missing/short tangent arrays by padding with zeros (= corners).
+    data.in_tangents.resize(n, Vec2::ZERO);
+    data.out_tangents.resize(n, Vec2::ZERO);
+    data.in_tangents.truncate(n);
+    data.out_tangents.truncate(n);
+    Ok(data)
+}
+
+// ---------------------------------------------------------------------------
+// Properties (static or keyframed)
+// ---------------------------------------------------------------------------
+
+/// Parses a property object `{a, k, ...}`. Whether `k` is static or animated
+/// is decided by its own shape (array of objects = keyframes), not by `a`.
+fn parse_property<T: Lerp>(
+    c: &mut Cursor<'_>,
+    limits: &Limits,
+    parse_val: fn(&mut Cursor<'_>) -> Result<T>,
+) -> Result<Property<T>> {
+    let mut k_pos: Option<usize> = None;
+    for_each_field(c, |c, key| {
+        if key == b"k" {
+            k_pos = Some(c.pos());
+        }
+        c.skip_value()
+    })?;
+    let k_pos = k_pos.ok_or_else(|| invalid(c, "property missing k"))?;
+    let mut kc = c.fork_at(k_pos);
+    parse_property_k(&mut kc, limits, parse_val)
+}
+
+fn parse_property_k<T: Lerp>(
+    kc: &mut Cursor<'_>,
+    limits: &Limits,
+    parse_val: fn(&mut Cursor<'_>) -> Result<T>,
+) -> Result<Property<T>> {
+    kc.skip_ws();
+    if kc.peek() == Some(b'[') {
+        // Peek inside: array of objects → keyframes; anything else → static.
+        let mut probe = kc.fork_at(kc.pos() + 1);
+        probe.skip_ws();
+        if probe.peek() == Some(b'{') {
+            return parse_keyframes(kc, limits, parse_val).map(Property::Animated);
+        }
+    }
+    Ok(Property::Static(parse_val(kc)?))
+}
+
+struct RawKeyframe<T> {
+    t: f32,
+    value: Option<T>,
+    end: Option<T>,
+    easing: Easing,
+    spatial: Option<[f32; 4]>,
+}
+
+/// Parses `[{t, s, e?, i, o, h?}, ...]` into a non-empty Timeline.
+fn parse_keyframes<T: Lerp>(
+    c: &mut Cursor<'_>,
+    limits: &Limits,
+    parse_val: fn(&mut Cursor<'_>) -> Result<T>,
+) -> Result<Timeline<T>> {
+    let mut raw: Vec<RawKeyframe<T>> = Vec::new();
+    for_each_element(c, |c| {
+        if raw.len() >= limits.max_keyframes {
+            return Err(Error::LimitExceeded(Limit::Keyframes));
+        }
+        raw.push(parse_one_keyframe(c, parse_val)?);
+        Ok(())
+    })?;
+
+    // Resolve values: a keyframe without `s` (common for the final keyframe)
+    // takes the previous keyframe's segment end value.
+    let mut kfs: Vec<Keyframe<T>> = Vec::with_capacity(raw.len());
+    for rk in raw {
+        let value = match rk.value {
+            Some(v) => v,
+            None => match kfs.last() {
+                Some(prev) => prev.end.clone().unwrap_or_else(|| prev.value.clone()),
+                None => return Err(invalid(c, "first keyframe has no value")),
+            },
+        };
+        kfs.push(Keyframe {
+            t: rk.t,
+            value,
+            end: rk.end,
+            easing: rk.easing,
+            spatial: rk.spatial,
+        });
+    }
+    // Keyframes stay in FILE ORDER — rlottie never sorts them. Some real
+    // files carry non-monotonic time lists (e.g. palindromic 39,36,..,36,39)
+    // which rlottie's front/back checks collapse to a constant; sorting
+    // would invent an animation the reference never plays.
+    let sorted = kfs.windows(2).all(|w| match w {
+        [a, b] => a.t <= b.t,
+        _ => true,
+    });
+    let mut it = kfs.into_iter();
+    let first = it.next().ok_or_else(|| invalid(c, "empty keyframe list"))?;
+    Ok(Timeline {
+        first,
+        rest: it.collect(),
+        sorted,
+    })
+}
+
+fn parse_one_keyframe<T: Lerp>(
+    c: &mut Cursor<'_>,
+    parse_val: fn(&mut Cursor<'_>) -> Result<T>,
+) -> Result<RawKeyframe<T>> {
+    let mut t = 0.0f32;
+    let mut value: Option<T> = None;
+    let mut end: Option<T> = None;
+    let mut hold = false;
+    let mut o = (Easing::LINEAR.ox, Easing::LINEAR.oy);
+    let mut i = (Easing::LINEAR.ix, Easing::LINEAR.iy);
+    let mut to: Option<Vec2> = None;
+    let mut ti: Option<Vec2> = None;
+    for_each_field(c, |c, key| {
+        match key {
+            b"t" => t = parse_f32(c)?,
+            b"s" => value = Some(parse_val(c)?),
+            b"e" => end = Some(parse_val(c)?),
+            b"h" => hold = parse_bool(c)?,
+            b"o" => o = parse_easing_handle(c)?,
+            b"i" => i = parse_easing_handle(c)?,
+            b"to" => to = parse_vec2(c).ok(),
+            b"ti" => ti = parse_vec2(c).ok(),
+            _ => c.skip_value()?,
+        }
+        Ok(())
+    })?;
+    let easing = if hold {
+        Easing::HOLD
+    } else {
+        Easing {
+            ox: o.0,
+            oy: o.1,
+            ix: i.0,
+            iy: i.1,
+            hold: false,
+        }
+    };
+    let spatial = match (to, ti) {
+        (Some(t0), Some(t1)) if t0 != Vec2::ZERO || t1 != Vec2::ZERO => {
+            Some([t0.x, t0.y, t1.x, t1.y])
+        }
+        (Some(t0), None) if t0 != Vec2::ZERO => Some([t0.x, t0.y, 0.0, 0.0]),
+        (None, Some(t1)) if t1 != Vec2::ZERO => Some([0.0, 0.0, t1.x, t1.y]),
+        _ => None,
+    };
+    Ok(RawKeyframe {
+        t,
+        value,
+        end,
+        easing,
+        spatial,
+    })
+}
+
+/// `{x: n|[n], y: n|[n]}` easing handle.
+fn parse_easing_handle(c: &mut Cursor<'_>) -> Result<(f32, f32)> {
+    let mut x = 0.0f32;
+    let mut y = 0.0f32;
+    for_each_field(c, |c, key| {
+        match key {
+            b"x" => x = parse_scalar(c)?,
+            b"y" => y = parse_scalar(c)?,
+            _ => c.skip_value()?,
+        }
+        Ok(())
+    })?;
+    // X (time axis) is NOT clamped: AE exports overshoot/anticipation
+    // handles with x outside [0,1] and rlottie's VInterpolator uses them
+    // verbatim; clamping shifted eased progress on fast segments (TONEmoji
+    // coin 12% oversize). Y stays bounded only against absurd values.
+    Ok((x.clamp(-100.0, 100.0), y.clamp(-100.0, 100.0)))
+}
+
+// ---------------------------------------------------------------------------
+// Transform
+// ---------------------------------------------------------------------------
+
+fn parse_transform(c: &mut Cursor<'_>, limits: &Limits) -> Result<Transform> {
+    let mut tf = Transform::identity();
+    let mut p_pos: Option<usize> = None;
+    for_each_field(c, |c, key| {
+        match key {
+            b"a" => tf.anchor = parse_property(c, limits, parse_vec2)?,
+            b"p" => {
+                p_pos = Some(c.pos());
+                c.skip_value()?;
+            }
+            b"s" => tf.scale = parse_property(c, limits, parse_vec2)?,
+            b"r" => tf.rotation = parse_property(c, limits, parse_scalar)?,
+            b"o" => tf.opacity = parse_property(c, limits, parse_scalar)?,
+            b"sk" => tf.skew = parse_property(c, limits, parse_scalar)?,
+            b"sa" => tf.skew_axis = parse_property(c, limits, parse_scalar)?,
+            _ => c.skip_value()?, // rx/ry/rz, or unknown
+        }
+        Ok(())
+    })?;
+    if let Some(pos) = p_pos {
+        tf.position = parse_position(&mut c.fork_at(pos), limits)?;
+    }
+    Ok(tf)
+}
+
+/// Position property: either a normal `{a,k}` Vec2 property or the split
+/// form `{s: true, x: {a,k}, y: {a,k}}`.
+fn parse_position(c: &mut Cursor<'_>, limits: &Limits) -> Result<Position> {
+    let mut split = false;
+    let mut k_pos: Option<usize> = None;
+    let mut x_pos: Option<usize> = None;
+    let mut y_pos: Option<usize> = None;
+    for_each_field(c, |c, key| {
+        match key {
+            b"s" => split = parse_bool(c)?,
+            b"k" => {
+                k_pos = Some(c.pos());
+                c.skip_value()?;
+            }
+            b"x" => {
+                x_pos = Some(c.pos());
+                c.skip_value()?;
+            }
+            b"y" => {
+                y_pos = Some(c.pos());
+                c.skip_value()?;
+            }
+            _ => c.skip_value()?,
+        }
+        Ok(())
+    })?;
+    if split {
+        let xp = x_pos.ok_or_else(|| invalid(c, "split position missing x"))?;
+        let yp = y_pos.ok_or_else(|| invalid(c, "split position missing y"))?;
+        let x = parse_property(&mut c.fork_at(xp), limits, parse_scalar)?;
+        let y = parse_property(&mut c.fork_at(yp), limits, parse_scalar)?;
+        Ok(Position::Split { x, y })
+    } else {
+        let kp = k_pos.ok_or_else(|| invalid(c, "position missing k"))?;
+        let p = parse_property_k(&mut c.fork_at(kp), limits, parse_vec2)?;
+        Ok(Position::Combined(p))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shapes
+// ---------------------------------------------------------------------------
+
+enum ParsedItem {
+    Shape(Shape),
+    GroupTransform(Transform),
+    Ignored,
+}
+
+fn parse_shape_list(
+    c: &mut Cursor<'_>,
+    limits: &Limits,
+    depth: usize,
+    count: &mut usize,
+) -> Result<(Vec<Shape>, Option<Transform>)> {
+    if depth > MAX_GROUP_DEPTH {
+        return Err(Error::LimitExceeded(Limit::NestingDepth));
+    }
+    let mut shapes = Vec::new();
+    let mut transform: Option<Transform> = None;
+    for_each_element(c, |c| {
+        *count += 1;
+        if *count > limits.max_shapes_per_layer {
+            return Err(Error::LimitExceeded(Limit::ShapesPerLayer));
+        }
+        match parse_shape_item(c, limits, depth, count)? {
+            ParsedItem::Shape(s) => shapes.push(s),
+            ParsedItem::GroupTransform(t) => transform = Some(t),
+            ParsedItem::Ignored => {}
+        }
+        Ok(())
+    })?;
+    Ok((shapes, transform))
+}
+
+fn parse_shape_item(
+    c: &mut Cursor<'_>,
+    limits: &Limits,
+    depth: usize,
+    count: &mut usize,
+) -> Result<ParsedItem> {
+    // Record positions of every field we might need, dispatch after `ty` is known.
+    let mut ty: Option<[u8; 2]> = None;
+    let mut ty_pos: Option<usize> = None;
+    let mut hidden = false;
+    let mut it_pos: Option<usize> = None;
+    let mut ks_pos: Option<usize> = None;
+    let mut p_pos: Option<usize> = None;
+    let mut s_pos: Option<usize> = None;
+    let mut r_pos: Option<usize> = None;
+    let mut c_pos: Option<usize> = None;
+    let mut o_pos: Option<usize> = None;
+    let mut a_pos: Option<usize> = None;
+    let mut w_pos: Option<usize> = None;
+    let mut e_pos: Option<usize> = None;
+    let mut g_pos: Option<usize> = None;
+    let mut d_pos: Option<usize> = None;
+    let mut pt_pos: Option<usize> = None;
+    let mut ir_pos: Option<usize> = None;
+    let mut or_pos: Option<usize> = None;
+    let mut is_pos: Option<usize> = None;
+    let mut os_pos: Option<usize> = None;
+    let mut h_pos: Option<usize> = None;
+    let mut tr_pos: Option<usize> = None;
+    let mut star_type = 1.0f32;
+    let mut grad_type = 1.0f32;
+    let mut trim_mode = 1.0f32;
+    let mut line_cap = 1.0f32;
+    let mut line_join = 1.0f32;
+    // rlottie's model default is 0; the FT stroker clamps the miter
+    // limit up to a MINIMUM of 1.0 — absent or tiny ml means 1.0 (bevel
+    // sharp corners), NOT the AE default of 4.
+    let mut miter_limit = 0.0f32;
+    let obj_start = c.pos();
+
+    for_each_field(c, |c, key| {
+        match key {
+            b"t" => {
+                grad_type = parse_f32(c)?;
+                Ok(())
+            }
+            b"e" => {
+                e_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"g" => {
+                g_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"ty" => {
+                ty_pos = Some(c.pos());
+                let s = c.read_string_bytes()?;
+                let mut tag = [0u8; 2];
+                if let (Some(&b0), b1) = (s.first(), s.get(1)) {
+                    tag[0] = b0;
+                    tag[1] = b1.copied().unwrap_or(0);
+                }
+                ty = Some(tag);
+                Ok(())
+            }
+            b"hd" => {
+                hidden = parse_bool(c)?;
+                Ok(())
+            }
+            b"it" => {
+                it_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"ks" => {
+                ks_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"p" => {
+                p_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"s" => {
+                s_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"r" => {
+                r_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"c" => {
+                c_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"o" => {
+                o_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"a" => {
+                a_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"w" => {
+                w_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"m" => {
+                trim_mode = parse_f32(c)?;
+                Ok(())
+            }
+            b"sy" => {
+                star_type = parse_f32(c)?;
+                Ok(())
+            }
+            b"h" => {
+                h_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"tr" => {
+                tr_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"d" => {
+                d_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"pt" => {
+                pt_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"ir" => {
+                ir_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"or" => {
+                or_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"is" => {
+                is_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"os" => {
+                os_pos = Some(c.pos());
+                c.skip_value()
+            }
+            b"lc" => {
+                line_cap = parse_f32(c)?;
+                Ok(())
+            }
+            b"lj" => {
+                line_join = parse_f32(c)?;
+                Ok(())
+            }
+            b"ml" => {
+                // Usually a plain number, but some exporters write it as an
+                // animated-property object {"a":0,"k":4}; take the value at
+                // frame 0 (animated miter limit is not a real-world case).
+                c.skip_ws();
+                if c.peek() == Some(b'{') {
+                    miter_limit = parse_property(c, limits, parse_f32)?.eval(0.0);
+                } else {
+                    miter_limit = parse_f32(c)?;
+                }
+                Ok(())
+            }
+            _ => c.skip_value(),
+        }
+    })?;
+
+    let Some(ty) = ty else {
+        return Err(Error::InvalidLottie {
+            offset: obj_start,
+            what: "shape item missing ty",
+        });
+    };
+    // rlottie's group sub-parser never reads `hd`, so hidden GROUPS still
+    // render in the reference; only leaf shapes honor it (contract review).
+    if hidden && &ty != b"gr" {
+        return Ok(ParsedItem::Ignored);
+    }
+
+    let prop_vec2 =
+        |c: &Cursor<'_>, pos: Option<usize>, what: &'static str| -> Result<Property<Vec2>> {
+            let pos = pos.ok_or(Error::InvalidLottie {
+                offset: obj_start,
+                what,
+            })?;
+            parse_property(&mut c.fork_at(pos), limits, parse_vec2)
+        };
+    let prop_scalar = |c: &Cursor<'_>, pos: Option<usize>, default: f32| -> Result<Property<f32>> {
+        match pos {
+            Some(pos) => parse_property(&mut c.fork_at(pos), limits, parse_scalar),
+            None => Ok(Property::Static(default)),
+        }
+    };
+    // Path direction on primitives: `d` == 3 reverses the winding (rlottie
+    // passes direction() into addRect/addOval/addPolystar). Malformed `d`
+    // reads as the default (1 = clockwise).
+    let direction_reversed = |c: &Cursor<'_>, pos: Option<usize>| -> bool {
+        // rlottie's streaming parseObject (lottieparser.cpp) Skip()s every
+        // key that appears BEFORE `ty`; the type sub-parser then reads only
+        // the keys after it. A `d` written before `ty` is therefore dropped
+        // and the primitive keeps its default CW winding — key-ORDER
+        // dependent. Match it: honor `d` only when it follows `ty`
+        // (Batoshik coins ring: reversed-ellipse dash phase, 55.4 → 5.3).
+        match (pos, ty_pos) {
+            (Some(p), Some(tp)) if p > tp => parse_f32(&mut c.fork_at(p)).unwrap_or(1.0) == 3.0,
+            _ => false,
+        }
+    };
+
+    match &ty {
+        b"gr" => {
+            let Some(it_pos) = it_pos else {
+                return Ok(ParsedItem::Ignored); // empty group
+            };
+            let mut ic = c.fork_at(it_pos);
+            let (shapes, transform) = parse_shape_list(&mut ic, limits, depth + 1, count)?;
+            Ok(ParsedItem::Shape(Shape::Group(Box::new(Group {
+                transform: transform.unwrap_or_else(Transform::identity),
+                shapes,
+            }))))
+        }
+        b"sh" => {
+            let ks_pos = ks_pos.ok_or(Error::InvalidLottie {
+                offset: obj_start,
+                what: "path shape missing ks",
+            })?;
+            let path = parse_property(&mut c.fork_at(ks_pos), limits, parse_path_value)?;
+            Ok(ParsedItem::Shape(Shape::Path(PathShape { path })))
+        }
+        b"rc" => Ok(ParsedItem::Shape(Shape::Rect(RectShape {
+            position: prop_vec2(c, p_pos, "rect missing p")?,
+            size: prop_vec2(c, s_pos, "rect missing s")?,
+            radius: prop_scalar(c, r_pos, 0.0)?,
+            reversed: direction_reversed(c, d_pos),
+        }))),
+        b"el" => Ok(ParsedItem::Shape(Shape::Ellipse(EllipseShape {
+            position: prop_vec2(c, p_pos, "ellipse missing p")?,
+            size: prop_vec2(c, s_pos, "ellipse missing s")?,
+            reversed: direction_reversed(c, d_pos),
+        }))),
+        b"fl" => {
+            let c_pos = c_pos.ok_or(Error::InvalidLottie {
+                offset: obj_start,
+                what: "fill missing color",
+            })?;
+            let color = parse_property(&mut c.fork_at(c_pos), limits, parse_color)?;
+            let opacity = prop_scalar(c, o_pos, 100.0)?;
+            // In a fill item, `r` is the fill rule (int), not a property.
+            let rule = match r_pos {
+                Some(pos) => {
+                    if parse_f32(&mut c.fork_at(pos))? as i64 == 2 {
+                        FillRule::EvenOdd
+                    } else {
+                        FillRule::NonZero
+                    }
+                }
+                None => FillRule::NonZero,
+            };
+            Ok(ParsedItem::Shape(Shape::Fill(Fill {
+                color,
+                opacity,
+                rule,
+            })))
+        }
+        b"tr" => {
+            // Group transform: rebuild from recorded field positions.
+            let mut tf = Transform::identity();
+            if let Some(pos) = a_pos {
+                tf.anchor = parse_property(&mut c.fork_at(pos), limits, parse_vec2)?;
+            }
+            if let Some(pos) = p_pos {
+                tf.position = parse_position(&mut c.fork_at(pos), limits)?;
+            }
+            if let Some(pos) = s_pos {
+                tf.scale = parse_property(&mut c.fork_at(pos), limits, parse_vec2)?;
+            }
+            if let Some(pos) = r_pos {
+                tf.rotation = parse_property(&mut c.fork_at(pos), limits, parse_scalar)?;
+            }
+            if let Some(pos) = o_pos {
+                tf.opacity = parse_property(&mut c.fork_at(pos), limits, parse_scalar)?;
+            }
+            Ok(ParsedItem::GroupTransform(tf))
+        }
+        b"st" => {
+            let c_pos = c_pos.ok_or(Error::InvalidLottie {
+                offset: obj_start,
+                what: "stroke missing color",
+            })?;
+            let w_pos = w_pos.ok_or(Error::InvalidLottie {
+                offset: obj_start,
+                what: "stroke missing width",
+            })?;
+            let color = parse_property(&mut c.fork_at(c_pos), limits, parse_color)?;
+            let width = parse_property(&mut c.fork_at(w_pos), limits, parse_scalar)?;
+            let opacity = prop_scalar(c, o_pos, 100.0)?;
+            let cap = match line_cap as i64 {
+                2 => Cap::Round,
+                3 => Cap::Square,
+                _ => Cap::Butt,
+            };
+            let join = match line_join as i64 {
+                2 => Join::Round,
+                3 => Join::Bevel,
+                _ => Join::Miter,
+            };
+            let miter_limit = miter_limit.max(1.0);
+            let dashes = match d_pos {
+                Some(pos) => parse_dashes(&mut c.fork_at(pos), limits)?,
+                None => Vec::new(),
+            };
+            Ok(ParsedItem::Shape(Shape::Stroke(Box::new(Stroke {
+                color,
+                opacity,
+                width,
+                cap,
+                join,
+                miter_limit,
+                dashes,
+            }))))
+        }
+        b"gf" => {
+            let s_pos_ = s_pos.ok_or(Error::InvalidLottie {
+                offset: obj_start,
+                what: "gradient missing start",
+            })?;
+            let e_pos_ = e_pos.ok_or(Error::InvalidLottie {
+                offset: obj_start,
+                what: "gradient missing end",
+            })?;
+            let g_pos_ = g_pos.ok_or(Error::InvalidLottie {
+                offset: obj_start,
+                what: "gradient missing stops",
+            })?;
+            let start = parse_property(&mut c.fork_at(s_pos_), limits, parse_vec2)?;
+            let end = parse_property(&mut c.fork_at(e_pos_), limits, parse_vec2)?;
+            let (stops, color_count) = parse_gradient_stops(&mut c.fork_at(g_pos_), limits)?;
+            let opacity = prop_scalar(c, o_pos, 100.0)?;
+            let rule = match r_pos {
+                Some(pos) => {
+                    if parse_f32(&mut c.fork_at(pos))? as i64 == 2 {
+                        FillRule::EvenOdd
+                    } else {
+                        FillRule::NonZero
+                    }
+                }
+                None => FillRule::NonZero,
+            };
+            let kind = if grad_type as i64 == 2 {
+                GradientKind::Radial
+            } else {
+                GradientKind::Linear
+            };
+            let highlight_len = prop_scalar(c, h_pos, 0.0)?;
+            let highlight_angle = prop_scalar(c, a_pos, 0.0)?;
+            Ok(ParsedItem::Shape(Shape::GradientFill(Box::new(
+                GradientFill {
+                    kind,
+                    start,
+                    end,
+                    highlight_len,
+                    highlight_angle,
+                    stops,
+                    color_count,
+                    opacity,
+                    rule,
+                },
+            ))))
+        }
+        b"tm" => {
+            let start = prop_scalar(c, s_pos, 0.0)?;
+            let end = match e_pos {
+                Some(pos) => parse_property(&mut c.fork_at(pos), limits, parse_scalar)?,
+                None => Property::Static(100.0),
+            };
+            let offset = prop_scalar(c, o_pos, 0.0)?;
+            let mode = if trim_mode as i64 == 2 {
+                TrimMode::Individual
+            } else {
+                TrimMode::Simultaneous
+            };
+            Ok(ParsedItem::Shape(Shape::Trim(Box::new(Trim {
+                start,
+                end,
+                offset,
+                mode,
+            }))))
+        }
+        b"gs" => {
+            let s_pos_ = s_pos.ok_or(Error::InvalidLottie {
+                offset: obj_start,
+                what: "gradient stroke missing start",
+            })?;
+            let e_pos_ = e_pos.ok_or(Error::InvalidLottie {
+                offset: obj_start,
+                what: "gradient stroke missing end",
+            })?;
+            let g_pos_ = g_pos.ok_or(Error::InvalidLottie {
+                offset: obj_start,
+                what: "gradient stroke missing stops",
+            })?;
+            let w_pos_ = w_pos.ok_or(Error::InvalidLottie {
+                offset: obj_start,
+                what: "gradient stroke missing width",
+            })?;
+            let start = parse_property(&mut c.fork_at(s_pos_), limits, parse_vec2)?;
+            let end = parse_property(&mut c.fork_at(e_pos_), limits, parse_vec2)?;
+            let (stops, color_count) = parse_gradient_stops(&mut c.fork_at(g_pos_), limits)?;
+            let width = parse_property(&mut c.fork_at(w_pos_), limits, parse_scalar)?;
+            let opacity = prop_scalar(c, o_pos, 100.0)?;
+            let cap = match line_cap as i64 {
+                2 => Cap::Round,
+                3 => Cap::Square,
+                _ => Cap::Butt,
+            };
+            let join = match line_join as i64 {
+                2 => Join::Round,
+                3 => Join::Bevel,
+                _ => Join::Miter,
+            };
+            let dashes = match d_pos {
+                Some(pos) => parse_dashes(&mut c.fork_at(pos), limits)?,
+                None => Vec::new(),
+            };
+            let kind = if grad_type as i64 == 2 {
+                GradientKind::Radial
+            } else {
+                GradientKind::Linear
+            };
+            let highlight_len = prop_scalar(c, h_pos, 0.0)?;
+            let highlight_angle = prop_scalar(c, a_pos, 0.0)?;
+            Ok(ParsedItem::Shape(Shape::GradientStroke(Box::new(
+                GradientStroke {
+                    kind,
+                    start,
+                    end,
+                    highlight_len,
+                    highlight_angle,
+                    stops,
+                    color_count,
+                    opacity,
+                    width,
+                    cap,
+                    join,
+                    miter_limit: miter_limit.max(1.0),
+                    dashes,
+                },
+            ))))
+        }
+        b"sr" => {
+            let prop_scalar_req = |pos: Option<usize>, default: f32| -> Result<Property<f32>> {
+                match pos {
+                    Some(pos) => parse_property(&mut c.fork_at(pos), limits, parse_scalar),
+                    None => Ok(Property::Static(default)),
+                }
+            };
+            Ok(ParsedItem::Shape(Shape::Polystar(Box::new(
+                PolystarShape {
+                    star: star_type as i64 != 2,
+                    reversed: direction_reversed(c, d_pos),
+                    points: prop_scalar_req(pt_pos, 5.0)?,
+                    position: prop_vec2(c, p_pos, "polystar missing p")?,
+                    rotation: prop_scalar_req(r_pos, 0.0)?,
+                    inner_radius: prop_scalar_req(ir_pos, 0.0)?,
+                    outer_radius: prop_scalar_req(or_pos, 0.0)?,
+                    inner_roundness: prop_scalar_req(is_pos, 0.0)?,
+                    outer_roundness: prop_scalar_req(os_pos, 0.0)?,
+                },
+            ))))
+        }
+        // Round-corners modifier: the patched (Telegram) rlottie parser has
+        // no "rd" case at all — corners stay sharp in the reference, so we
+        // ignore it for parity (contract review: shape geometry).
+        b"rd" => Ok(ParsedItem::Ignored),
+        b"rp" => {
+            let copies = match c_pos {
+                Some(pos) => parse_property(&mut c.fork_at(pos), limits, parse_scalar)?,
+                None => Property::Static(1.0),
+            };
+            let offset = prop_scalar(c, o_pos, 0.0)?;
+            let (transform, start_opacity, end_opacity) = match tr_pos {
+                Some(pos) => parse_repeater_transform(&mut c.fork_at(pos), limits)?,
+                None => (
+                    Transform::identity(),
+                    Property::Static(100.0),
+                    Property::Static(100.0),
+                ),
+            };
+            Ok(ParsedItem::Shape(Shape::Repeater(Box::new(Repeater {
+                copies,
+                offset,
+                transform,
+                start_opacity,
+                end_opacity,
+            }))))
+        }
+        // rp/mm/... : later phases.
+        _ => Ok(ParsedItem::Ignored),
+    }
+}
+
+/// Dash array on strokes: `[{n: "d"|"g"|"o", v: {a,k}}, ...]`.
+fn parse_dashes(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<DashElement>> {
+    let mut out = Vec::new();
+    for_each_element(c, |c| {
+        let mut kind = 0u8;
+        let mut v_pos: Option<usize> = None;
+        for_each_field(c, |c, key| {
+            match key {
+                b"n" => {
+                    let raw = c.read_string_bytes()?;
+                    kind = raw.first().copied().unwrap_or(0);
+                }
+                b"v" => {
+                    v_pos = Some(c.pos());
+                    c.skip_value()?;
+                }
+                _ => c.skip_value()?,
+            }
+            Ok(())
+        })?;
+        if let (b'd' | b'g' | b'o', Some(pos)) = (kind, v_pos) {
+            let value = parse_property(&mut c.fork_at(pos), limits, parse_scalar)?;
+            out.push(DashElement { kind, value });
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// `g` object of a gradient: `{p: colorStopCount, k: {a, k: [floats]}}`.
+fn parse_gradient_stops(
+    c: &mut Cursor<'_>,
+    limits: &Limits,
+) -> Result<(Property<FloatList>, usize)> {
+    let mut count = 0usize;
+    let mut k_pos: Option<usize> = None;
+    for_each_field(c, |c, key| {
+        match key {
+            b"p" => count = parse_f32(c)? as usize,
+            b"k" => {
+                k_pos = Some(c.pos());
+                c.skip_value()?;
+            }
+            _ => c.skip_value()?,
+        }
+        Ok(())
+    })?;
+    let pos = k_pos.ok_or_else(|| invalid(c, "gradient stops missing k"))?;
+    let stops = parse_property(&mut c.fork_at(pos), limits, parse_f32_list)?;
+    if count == 0 {
+        // Infer: all floats are color stops.
+        if let Property::Static(FloatList(v)) = &stops {
+            count = v.len() / 4;
+        }
+    }
+    Ok((stops, count.min(64)))
+}
+
+// ---------------------------------------------------------------------------
+// Layers
+// ---------------------------------------------------------------------------
+
+fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
+    let mut ty = 255u8;
+    let mut index = 0i32;
+    let mut parent: Option<i32> = None;
+    let mut in_point = 0.0f32;
+    let mut out_point = f32::MAX;
+    let mut start_time = 0.0f32;
+    let mut time_stretch = 1.0f32;
+    let mut hidden = false;
+    let mut ks_pos: Option<usize> = None;
+    let mut shapes_pos: Option<usize> = None;
+    let mut ref_id: Option<String> = None;
+    let mut layer_w: Option<f32> = None;
+    let mut layer_h: Option<f32> = None;
+    let mut masks_pos: Option<usize> = None;
+    let mut has_mask = false;
+    let mut matte: Option<u8> = None;
+    let mut matte_src = false;
+    let mut solid_w = 0.0f32;
+    let mut solid_h = 0.0f32;
+    let mut solid_color: Option<Color> = None;
+    let mut time_remap_pos: Option<usize> = None;
+    let mut auto_orient = false;
+
+    for_each_field(c, |c, key| {
+        match key {
+            b"ty" => ty = parse_f32(c)? as u8,
+            b"ind" => index = parse_f32(c)? as i32,
+            b"parent" => parent = Some(parse_f32(c)? as i32),
+            b"ip" => in_point = parse_f32(c)?.round(), // patched parser: round()
+            b"op" => out_point = parse_f32(c)?.round(),
+            // rlottie stores start_time as an int (mStartFrame); fractional
+            // st truncates, shifting precomp child frames by one otherwise.
+            b"st" => start_time = parse_f32(c)?.trunc(),
+            b"sr" => time_stretch = parse_f32(c)?,
+            b"hd" => hidden = parse_bool(c)?,
+            b"w" => layer_w = Some(parse_f32(c)?),
+            b"h" => layer_h = Some(parse_f32(c)?),
+            b"refId" => {
+                let raw = c.read_string_bytes()?;
+                ref_id = Some(String::from_utf8_lossy(raw).into_owned());
+            }
+            b"masksProperties" => {
+                masks_pos = Some(c.pos());
+                c.skip_value()?;
+            }
+            b"hasMask" => {
+                has_mask = parse_bool(c)?;
+            }
+            b"tm" => {
+                let pos = c.pos();
+                c.skip_value()?;
+                time_remap_pos = Some(pos);
+            }
+            b"tt" => {
+                let v = parse_f32(c)? as u8;
+                if (1..=4).contains(&v) {
+                    matte = Some(v);
+                }
+            }
+            b"td" => matte_src = parse_f32(c)? != 0.0,
+            b"ao" => auto_orient = parse_bool(c)?,
+            b"sw" => solid_w = parse_f32(c)?,
+            b"sh" => solid_h = parse_f32(c)?,
+            b"sc" => {
+                let raw = c.read_string_bytes()?;
+                solid_color = parse_hex_color(raw);
+            }
+            b"ks" => {
+                ks_pos = Some(c.pos());
+                c.skip_value()?;
+            }
+            b"shapes" => {
+                shapes_pos = Some(c.pos());
+                c.skip_value()?;
+            }
+            _ => c.skip_value()?,
+        }
+        Ok(())
+    })?;
+
+    let kind = match ty {
+        4 => LayerKind::Shape,
+        3 => LayerKind::Null,
+        0 => LayerKind::Precomp,
+        1 => LayerKind::Solid,
+        other => LayerKind::Other(other),
+    };
+    let transform = match ks_pos {
+        Some(pos) => parse_transform(&mut c.fork_at(pos), limits)?,
+        None => Transform::identity(),
+    };
+    let mut shapes = Vec::new();
+    if kind == LayerKind::Shape {
+        if let Some(pos) = shapes_pos {
+            let mut count = 0usize;
+            let (list, _) = parse_shape_list(&mut c.fork_at(pos), limits, 0, &mut count)?;
+            shapes = list;
+        }
+    }
+    let precomp_size = match (kind, layer_w, layer_h) {
+        (LayerKind::Precomp, Some(w), Some(h)) if w > 0.0 && h > 0.0 => Some((w, h)),
+        _ => None,
+    };
+    // rlottie only builds LOTLayerMaskItem when the layer's `hasMask` flag
+    // is true (LOTLayerItem ctor) — masksProperties without the flag are
+    // parsed but never applied.
+    let masks = match masks_pos {
+        Some(pos) if has_mask => parse_masks(&mut c.fork_at(pos), limits)?,
+        _ => Vec::new(),
+    };
+    let solid = match (kind, solid_color) {
+        (LayerKind::Solid, Some(color)) if solid_w > 0.0 && solid_h > 0.0 => {
+            Some((solid_w, solid_h, color))
+        }
+        _ => None,
+    };
+    let time_remap = match (kind, time_remap_pos) {
+        (LayerKind::Precomp, Some(pos)) => {
+            Some(parse_property(&mut c.fork_at(pos), limits, parse_scalar)?)
+        }
+        _ => None,
+    };
+    Ok(Layer {
+        kind,
+        index,
+        parent,
+        in_point,
+        out_point,
+        start_time,
+        time_stretch: if time_stretch > 0.0 {
+            time_stretch
+        } else {
+            1.0
+        },
+        hidden,
+        transform,
+        shapes,
+        ref_id,
+        precomp_size,
+        masks,
+        matte,
+        matte_src,
+        solid,
+        time_remap,
+        auto_orient,
+    })
+}
+
+/// `#rrggbb` or `#rrggbbaa` solid-layer color.
+fn parse_hex_color(raw: &[u8]) -> Option<Color> {
+    let hex = raw.strip_prefix(b"#").unwrap_or(raw);
+    let nib = |b: u8| -> Option<u32> {
+        match b {
+            b'0'..=b'9' => Some(u32::from(b - b'0')),
+            b'a'..=b'f' => Some(u32::from(b - b'a' + 10)),
+            b'A'..=b'F' => Some(u32::from(b - b'A' + 10)),
+            _ => None,
+        }
+    };
+    let byte = |i: usize| -> Option<f32> {
+        let hi = nib(*hex.get(i)?)?;
+        let lo = nib(*hex.get(i + 1)?)?;
+        Some((hi * 16 + lo) as f32 / 255.0)
+    };
+    Some(Color {
+        r: byte(0)?,
+        g: byte(2)?,
+        b: byte(4)?,
+        a: byte(6).unwrap_or(1.0),
+    })
+}
+
+/// Repeater `tr`: a normal transform plus `so`/`eo` copy-opacity ramps.
+#[allow(clippy::type_complexity)]
+fn parse_repeater_transform(
+    c: &mut Cursor<'_>,
+    limits: &Limits,
+) -> Result<(Transform, Property<f32>, Property<f32>)> {
+    let mut tf = Transform::identity();
+    let mut so = Property::Static(100.0);
+    let mut eo = Property::Static(100.0);
+    let mut p_pos: Option<usize> = None;
+    for_each_field(c, |c, key| {
+        match key {
+            b"a" => tf.anchor = parse_property(c, limits, parse_vec2)?,
+            b"p" => {
+                p_pos = Some(c.pos());
+                c.skip_value()?;
+            }
+            b"s" => tf.scale = parse_property(c, limits, parse_vec2)?,
+            b"r" => tf.rotation = parse_property(c, limits, parse_scalar)?,
+            b"o" => tf.opacity = parse_property(c, limits, parse_scalar)?,
+            b"so" => so = parse_property(c, limits, parse_scalar)?,
+            b"eo" => eo = parse_property(c, limits, parse_scalar)?,
+            _ => c.skip_value()?,
+        }
+        Ok(())
+    })?;
+    if let Some(pos) = p_pos {
+        tf.position = parse_position(&mut c.fork_at(pos), limits)?;
+    }
+    Ok((tf, so, eo))
+}
+
+/// `masksProperties` array.
+fn parse_masks(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<Mask>> {
+    let mut out = Vec::new();
+    for_each_element(c, |c| {
+        let mut mode = b'a';
+        let mut invert = false;
+        let mut pt_pos: Option<usize> = None;
+        let mut o_pos: Option<usize> = None;
+        for_each_field(c, |c, key| {
+            match key {
+                b"mode" => {
+                    let raw = c.read_string_bytes()?;
+                    mode = raw.first().copied().unwrap_or(b'a');
+                }
+                b"inv" => invert = parse_bool(c)?,
+                b"pt" => {
+                    pt_pos = Some(c.pos());
+                    c.skip_value()?;
+                }
+                b"o" => {
+                    o_pos = Some(c.pos());
+                    c.skip_value()?;
+                }
+                _ => c.skip_value()?,
+            }
+            Ok(())
+        })?;
+        let Some(pt_pos) = pt_pos else { return Ok(()) };
+        if mode == b'n' {
+            return Ok(());
+        }
+        let path = parse_property(&mut c.fork_at(pt_pos), limits, parse_path_value)?;
+        let opacity = match o_pos {
+            Some(pos) => parse_property(&mut c.fork_at(pos), limits, parse_scalar)?,
+            None => Property::Static(100.0),
+        };
+        out.push(Mask {
+            mode,
+            invert,
+            path,
+            opacity,
+        });
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// One entry of the top-level `assets` array. Only precomp assets (those
+/// with a `layers` list) are kept; image assets are ignored.
+fn parse_asset(
+    c: &mut Cursor<'_>,
+    limits: &Limits,
+    total_layers: &mut usize,
+) -> Result<Option<Asset>> {
+    let mut id = String::new();
+    let mut layers_pos: Option<usize> = None;
+    for_each_field(c, |c, key| {
+        match key {
+            b"id" => {
+                let raw = c.read_string_bytes()?;
+                id = String::from_utf8_lossy(raw).into_owned();
+            }
+            b"layers" => {
+                layers_pos = Some(c.pos());
+                c.skip_value()?;
+            }
+            _ => c.skip_value()?,
+        }
+        Ok(())
+    })?;
+    let Some(pos) = layers_pos else {
+        return Ok(None);
+    };
+    let mut layers = Vec::new();
+    let mut lc = c.fork_at(pos);
+    for_each_element(&mut lc, |c| {
+        *total_layers += 1;
+        if *total_layers > limits.max_layers {
+            return Err(Error::LimitExceeded(Limit::Layers));
+        }
+        layers.push(parse_layer(c, limits)?);
+        Ok(())
+    })?;
+    Ok(Some(Asset { id, layers }))
+}
+
+// ---------------------------------------------------------------------------
+// Top level
+// ---------------------------------------------------------------------------
+
+pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits) -> Result<Composition> {
+    if bytes.len() > limits.max_input_bytes {
+        return Err(Error::LimitExceeded(Limit::InputBytes));
+    }
+
+    let mut c = Cursor::new(bytes, limits.max_nesting_depth);
+    let mut width: Option<f64> = None;
+    let mut height: Option<f64> = None;
+    let mut frame_rate: Option<f64> = None;
+    let mut in_point: Option<f64> = None;
+    let mut out_point: Option<f64> = None;
+    let mut layers: Vec<Layer> = Vec::new();
+    let mut assets: Vec<Asset> = Vec::new();
+    let mut total_layers = 0usize;
+
+    for_each_field(&mut c, |c, key| {
+        match key {
+            b"w" => width = Some(c.parse_f64()?),
+            b"h" => height = Some(c.parse_f64()?),
+            b"fr" => frame_rate = Some(c.parse_f64()?),
+            b"ip" => in_point = Some(c.parse_f64()?),
+            b"op" => out_point = Some(c.parse_f64()?),
+            b"layers" => {
+                for_each_element(c, |c| {
+                    total_layers += 1;
+                    if total_layers > limits.max_layers {
+                        return Err(Error::LimitExceeded(Limit::Layers));
+                    }
+                    layers.push(parse_layer(c, limits)?);
+                    Ok(())
+                })?;
+            }
+            b"assets" => {
+                for_each_element(c, |c| {
+                    if assets.len() >= limits.max_assets {
+                        return Err(Error::LimitExceeded(Limit::Assets));
+                    }
+                    if let Some(asset) = parse_asset(c, limits, &mut total_layers)? {
+                        assets.push(asset);
+                    }
+                    Ok(())
+                })?;
+            }
+            _ => c.skip_value()?,
+        }
+        Ok(())
+    })?;
+    c.skip_ws();
+    if c.peek().is_some() {
+        return Err(json_err(&c, JsonErrorKind::TrailingData));
+    }
+
+    let offset = c.pos();
+    let missing = |what: &'static str| Error::InvalidLottie { offset, what };
+
+    let width = width.ok_or_else(|| missing("missing width (w)"))?;
+    let height = height.ok_or_else(|| missing("missing height (h)"))?;
+    let frame_rate = frame_rate.ok_or_else(|| missing("missing frame rate (fr)"))?;
+    let in_point = in_point.ok_or_else(|| missing("missing in point (ip)"))?;
+    let out_point = out_point.ok_or_else(|| missing("missing out point (op)"))?;
+
+    let max_dim = f64::from(limits.max_dimension);
+    if !(1.0..=max_dim).contains(&width) || !(1.0..=max_dim).contains(&height) {
+        return Err(Error::LimitExceeded(Limit::CompositionSize));
+    }
+    if !(f64::EPSILON..=1000.0).contains(&frame_rate) {
+        return Err(missing("frame rate out of range"));
+    }
+    if !out_point.is_finite() || !in_point.is_finite() || out_point <= in_point {
+        return Err(missing("out point must be greater than in point"));
+    }
+
+    Ok(Composition {
+        width: width as u32,
+        height: height as u32,
+        frame_rate: frame_rate as f32,
+        in_point: in_point as f32,
+        out_point: out_point as f32,
+        layers,
+        assets,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL: &str =
+        r#"{"v":"5.5.2","fr":60,"ip":0,"op":180,"w":512,"h":512,"nm":"t","layers":[]}"#;
+
+    fn parse(s: &str) -> Result<Composition> {
+        parse_composition(s.as_bytes(), &Limits::default())
+    }
+
+    #[test]
+    fn minimal_composition() {
+        let comp = parse(MINIMAL).unwrap();
+        assert_eq!(comp.width, 512);
+        assert_eq!(comp.height, 512);
+        assert_eq!(comp.frame_rate, 60.0);
+        assert_eq!(comp.frame_count(), 180);
+    }
+
+    #[test]
+    fn skips_unknown_fields() {
+        let comp =
+            parse(r#"{"junk":{"a":[1,2,{"b":"\" }"}]},"fr":30,"ip":5,"op":65,"w":100,"h":50}"#)
+                .unwrap();
+        assert_eq!((comp.width, comp.height), (100, 50));
+        assert_eq!(comp.frame_count(), 60);
+    }
+
+    #[test]
+    fn rejects_truncated_input() {
+        let bytes = MINIMAL.as_bytes();
+        for cut in 1..bytes.len() {
+            let sliced = &bytes[..cut];
+            assert!(
+                parse_composition(sliced, &Limits::default()).is_err(),
+                "accepted truncation at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_missing_header_fields() {
+        assert!(matches!(
+            parse(r#"{"fr":30,"ip":0,"op":60,"w":100}"#),
+            Err(Error::InvalidLottie { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_deep_nesting() {
+        let mut s = String::from(r#"{"a":"#);
+        for _ in 0..1000 {
+            s.push('[');
+        }
+        assert!(matches!(
+            parse(&s),
+            Err(Error::LimitExceeded(Limit::NestingDepth))
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_dimensions() {
+        assert!(matches!(
+            parse(r#"{"fr":30,"ip":0,"op":60,"w":1e9,"h":100}"#),
+            Err(Error::LimitExceeded(Limit::CompositionSize))
+        ));
+    }
+
+    #[test]
+    fn rejects_trailing_data() {
+        let with_trailer = format!("{MINIMAL}x");
+        assert!(matches!(
+            parse(&with_trailer),
+            Err(Error::Json {
+                kind: JsonErrorKind::TrailingData,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_non_finite_numbers() {
+        assert!(parse(r#"{"fr":1e999,"ip":0,"op":60,"w":10,"h":10}"#).is_err());
+    }
+
+    #[test]
+    fn parses_shape_layer() {
+        let comp = parse(
+            r#"{"fr":30,"ip":0,"op":30,"w":100,"h":100,"layers":[
+                {"ty":4,"ind":1,"ip":0,"op":30,"st":0,
+                 "ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[50,50]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}},
+                 "shapes":[{"ty":"gr","it":[
+                    {"ty":"sh","ks":{"a":0,"k":{"c":true,"v":[[0,0],[10,0],[10,10]],"i":[[0,0],[0,0],[0,0]],"o":[[0,0],[0,0],[0,0]]}}},
+                    {"ty":"fl","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"r":1},
+                    {"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0},"o":{"a":0,"k":100}}
+                 ]}]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(comp.layers.len(), 1);
+        let Layer { kind, shapes, .. } = comp.layers.first().unwrap();
+        assert_eq!(*kind, LayerKind::Shape);
+        assert_eq!(shapes.len(), 1);
+        let Some(Shape::Group(g)) = shapes.first() else {
+            panic!("expected group");
+        };
+        assert_eq!(g.shapes.len(), 2); // path + fill; tr became the group transform
+        assert!(matches!(g.shapes.first(), Some(Shape::Path(_))));
+        assert!(matches!(g.shapes.get(1), Some(Shape::Fill(_))));
+    }
+
+    #[test]
+    fn parses_animated_position() {
+        let comp = parse(
+            r#"{"fr":30,"ip":0,"op":30,"w":100,"h":100,"layers":[
+                {"ty":4,"ind":1,"ip":0,"op":30,"st":0,
+                 "ks":{"p":{"a":1,"k":[
+                    {"t":0,"s":[0,0],"i":{"x":[0.5],"y":[0.5]},"o":{"x":[0.5],"y":[0.5]}},
+                    {"t":30,"s":[100,100]}
+                 ]}},
+                 "shapes":[]}
+            ]}"#,
+        )
+        .unwrap();
+        let layer = comp.layers.first().unwrap();
+        let p0 = layer.transform.position.eval(0.0);
+        let p30 = layer.transform.position.eval(30.0);
+        assert_eq!((p0.x, p0.y), (0.0, 0.0));
+        assert_eq!((p30.x, p30.y), (100.0, 100.0));
+    }
+}

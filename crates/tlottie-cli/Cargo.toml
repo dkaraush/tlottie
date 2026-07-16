@@ -1,0 +1,13 @@
+[package]
+name = "tlottie-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dev CLI for tlottie: inspect, render, and corpus-test (never ships)"
+
+[dependencies]
+libc = "0.2.186"
+tlottie = { path = "../tlottie" }
+
+[lints]
+workspace = true

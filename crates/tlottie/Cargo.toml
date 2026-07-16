@@ -1,0 +1,14 @@
+[package]
+name = "tlottie"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Dev-only pixel/stroke traffic counters (atomics in hot span loops —
+# measured ~1-3% on-device when compiled in). Benchmark/ship builds leave
+# this off; instrumentation runs enable it explicitly.
+stats = []
+
+[lints]
+workspace = true
