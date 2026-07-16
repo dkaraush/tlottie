@@ -50,6 +50,7 @@ fn dump(file: &str, size: &str, frames: &str, outdir: &str) -> ExitCode {
         .split(',')
         .filter_map(|s| s.parse::<f32>().ok())
         .collect();
+    let fms_t0 = Instant::now();
     let bytes = match std::fs::read(file) {
         Ok(b) => b,
         Err(e) => {
@@ -69,12 +70,16 @@ fn dump(file: &str, size: &str, frames: &str, outdir: &str) -> ExitCode {
     let mut anim = tlottie::Animation::new(comp);
     let options = render_options();
     let mut total_renders: u64 = 0;
+    let mut first_frame_ms: Option<f64> = None;
     for &frame in &frame_list {
         let frame = frame.min(anim.composition().frame_count().saturating_sub(1) as f32);
         let t0 = Instant::now();
         if let Err(e) = anim.render_with_options(frame, &mut pixels, size, size, options) {
             eprintln!("{file}: render error: {e}");
             return ExitCode::FAILURE;
+        }
+        if first_frame_ms.is_none() {
+            first_frame_ms = Some(fms_t0.elapsed().as_secs_f64() * 1000.0);
         }
         let mut dt = t0.elapsed().as_nanos() as u64;
         total_renders += 1;
@@ -113,6 +118,9 @@ fn dump(file: &str, size: &str, frames: &str, outdir: &str) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+    }
+    if let Some(ms) = first_frame_ms {
+        println!("FMS {ms:.3}");
     }
     // Peak RSS in bytes (battery/memory proxy for the harness; macOS
     // reports bytes, Linux kilobytes).

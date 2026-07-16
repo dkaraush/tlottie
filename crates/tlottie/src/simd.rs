@@ -573,6 +573,16 @@ pub(crate) fn linear_lut_over(dst: &mut [u32], lut: &[u32], row_base: f32, dt: f
             return;
         }
     }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        if dst.len() >= SIMD_MIN_SPAN {
+            let full = dst.len() - dst.len() % 4;
+            let (head, tail) = dst.split_at_mut(full);
+            wasm128::linear_lut_over_wasm(head, lut, row_base, dt, x_start, scale);
+            linear_lut_over_scalar(tail, lut, row_base, dt, x_start + full as f32, scale);
+            return;
+        }
+    }
     linear_lut_over_scalar(dst, lut, row_base, dt, x_start, scale);
 }
 
@@ -620,6 +630,26 @@ pub(crate) fn radial_lut_over(
             unsafe {
                 neon::radial_lut_over_neon(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale)
             };
+            radial_lut_over_scalar(
+                tail,
+                lut,
+                dd0x,
+                dd0y,
+                da,
+                db,
+                inv_r,
+                x_start + full as f32,
+                scale,
+            );
+            return;
+        }
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        if dst.len() >= SIMD_MIN_SPAN {
+            let full = dst.len() - dst.len() % 4;
+            let (head, tail) = dst.split_at_mut(full);
+            wasm128::radial_lut_over_wasm(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale);
             radial_lut_over_scalar(
                 tail,
                 lut,
@@ -694,6 +724,32 @@ pub(crate) fn focal_lut_over(
                     head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale,
                 )
             };
+            focal_lut_over_scalar(
+                tail,
+                lut,
+                g0x,
+                g0y,
+                sa,
+                sb,
+                dx,
+                dy,
+                a,
+                inv2a,
+                r,
+                x_start + full as f32,
+                scale,
+            );
+            return;
+        }
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        if dst.len() >= SIMD_MIN_SPAN {
+            let full = dst.len() - dst.len() % 4;
+            let (head, tail) = dst.split_at_mut(full);
+            wasm128::focal_lut_over_wasm(
+                head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale,
+            );
             focal_lut_over_scalar(
                 tail,
                 lut,
@@ -1455,6 +1511,51 @@ mod wasm128 {
         }
     }
 
+    #[inline]
+    fn blend4_over_k255(dpx: &mut [u32], src: &[u32; 4]) {
+        // Source and destination are premultiplied ARGB32-LE bytes
+        // [B,G,R,A]. k=255 means source channels pass through unchanged.
+        let arep_pat = u8x16(3, 3, 3, 3, 7, 7, 7, 7, 11, 11, 11, 11, 15, 15, 15, 15);
+        let full = u16x8_splat(255);
+        // SAFETY: callers pass 4-pixel chunks: exactly 16 readable/writable
+        // bytes for `dpx`, and exactly 16 readable bytes for `src`.
+        #[allow(unsafe_code)]
+        let (d, s) = unsafe {
+            (
+                v128_load(dpx.as_ptr().cast::<v128>()),
+                v128_load(src.as_ptr().cast::<v128>()),
+            )
+        };
+        let s_lo = u16x8_extend_low_u8x16(s);
+        let s_hi = u16x8_extend_high_u8x16(s);
+        let arep = u8x16_swizzle(s, arep_pat);
+        let inv_lo = u16x8_sub(full, u16x8_extend_low_u8x16(arep));
+        let inv_hi = u16x8_sub(full, u16x8_extend_high_u8x16(arep));
+        let o_lo = over(u16x8_extend_low_u8x16(d), s_lo, inv_lo);
+        let o_hi = over(u16x8_extend_high_u8x16(d), s_hi, inv_hi);
+        let out = u8x16_narrow_i16x8(o_lo, o_hi);
+        // SAFETY: same 16-byte destination span as the load above.
+        #[allow(unsafe_code)]
+        unsafe {
+            v128_store(dpx.as_mut_ptr().cast::<v128>(), out)
+        };
+    }
+
+    #[inline]
+    fn lut_blend_over_k255(dpx: &mut [u32], lut: &[u32], idx: v128) {
+        let i0 = u32x4_extract_lane::<0>(idx) as usize;
+        let i1 = u32x4_extract_lane::<1>(idx) as usize;
+        let i2 = u32x4_extract_lane::<2>(idx) as usize;
+        let i3 = u32x4_extract_lane::<3>(idx) as usize;
+        let src = [
+            lut.get(i0).copied().unwrap_or(0),
+            lut.get(i1).copied().unwrap_or(0),
+            lut.get(i2).copied().unwrap_or(0),
+            lut.get(i3).copied().unwrap_or(0),
+        ];
+        blend4_over_k255(dpx, &src);
+    }
+
     /// 4-lane linear gradient LUT fill: `t = row_base + X·dt` at absolute
     /// device column `X = x_start + lane` (segmentation-invariant), exactly
     /// the scalar form.
@@ -1479,6 +1580,28 @@ mod wasm128 {
             // is_finite parity: NaN fails the compare, ±inf fails |t|<inf.
             let finite = f32x4_lt(f32x4_abs(t), inf);
             lut_store(chunk, lut, lut_indices(t, finite, scalev));
+            kf = f32x4_add(kf, four);
+        }
+    }
+
+    pub(super) fn linear_lut_over_wasm(
+        dst: &mut [u32],
+        lut: &[u32],
+        row_base: f32,
+        dt: f32,
+        x_start: f32,
+        scale: f32,
+    ) {
+        let mut kf = f32x4_add(f32x4_splat(x_start), f32x4(0.0, 1.0, 2.0, 3.0));
+        let t0v = f32x4_splat(row_base);
+        let dtv = f32x4_splat(dt);
+        let four = f32x4_splat(4.0);
+        let inf = f32x4_splat(f32::INFINITY);
+        let scalev = f32x4_splat(scale);
+        for chunk in dst.chunks_exact_mut(4) {
+            let t = f32x4_add(t0v, f32x4_mul(kf, dtv));
+            let finite = f32x4_lt(f32x4_abs(t), inf);
+            lut_blend_over_k255(chunk, lut, lut_indices(t, finite, scalev));
             kf = f32x4_add(kf, four);
         }
     }
@@ -1514,6 +1637,38 @@ mod wasm128 {
             let t = f32x4_mul(f32x4_sqrt(gg), inv_rv);
             let finite = f32x4_lt(f32x4_abs(t), inf);
             lut_store(chunk, lut, lut_indices(t, finite, scalev));
+            kf = f32x4_add(kf, four);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn radial_lut_over_wasm(
+        dst: &mut [u32],
+        lut: &[u32],
+        dd0x: f32,
+        dd0y: f32,
+        da: f32,
+        db: f32,
+        inv_r: f32,
+        x_start: f32,
+        scale: f32,
+    ) {
+        let mut kf = f32x4_add(f32x4_splat(x_start), f32x4(0.0, 1.0, 2.0, 3.0));
+        let dav = f32x4_splat(da);
+        let dbv = f32x4_splat(db);
+        let ddx0v = f32x4_splat(dd0x);
+        let ddy0v = f32x4_splat(dd0y);
+        let inv_rv = f32x4_splat(inv_r);
+        let four = f32x4_splat(4.0);
+        let inf = f32x4_splat(f32::INFINITY);
+        let scalev = f32x4_splat(scale);
+        for chunk in dst.chunks_exact_mut(4) {
+            let ddx = f32x4_add(ddx0v, f32x4_mul(kf, dav));
+            let ddy = f32x4_add(ddy0v, f32x4_mul(kf, dbv));
+            let gg = f32x4_add(f32x4_mul(ddx, ddx), f32x4_mul(ddy, ddy));
+            let t = f32x4_mul(f32x4_sqrt(gg), inv_rv);
+            let finite = f32x4_lt(f32x4_abs(t), inf);
+            lut_blend_over_k255(chunk, lut, lut_indices(t, finite, scalev));
             kf = f32x4_add(kf, four);
         }
     }
@@ -1560,6 +1715,50 @@ mod wasm128 {
                 f32x4_lt(f32x4_abs(root), inf),
             );
             lut_store(chunk, lut, lut_indices(root, valid, scalev));
+            kf = f32x4_add(kf, four);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn focal_lut_over_wasm(
+        dst: &mut [u32],
+        lut: &[u32],
+        g0x: f32,
+        g0y: f32,
+        sa: f32,
+        sb: f32,
+        dx: f32,
+        dy: f32,
+        a: f32,
+        inv2a: f32,
+        r: f32,
+        x_start: f32,
+        scale: f32,
+    ) {
+        let mut kf = f32x4_add(f32x4_splat(x_start), f32x4(0.0, 1.0, 2.0, 3.0));
+        let (b0, db, d0, d1, d2) = super::focal_row_coefficients(g0x, g0y, sa, sb, dx, dy, a);
+        let (b0v, dbv) = (f32x4_splat(b0), f32x4_splat(db));
+        let (d0v, d1v, d2v) = (f32x4_splat(d0), f32x4_splat(d1), f32x4_splat(d2));
+        let inv2av = f32x4_splat(inv2a);
+        let rv = f32x4_splat(r);
+        let four = f32x4_splat(4.0);
+        let zero = f32x4_splat(0.0);
+        let inf = f32x4_splat(f32::INFINITY);
+        let scalev = f32x4_splat(scale);
+        for chunk in dst.chunks_exact_mut(4) {
+            let b = f32x4_add(b0v, f32x4_mul(kf, dbv));
+            let det = f32x4_add(d0v, f32x4_mul(kf, f32x4_add(d1v, f32x4_mul(kf, d2v))));
+            let sq = f32x4_sqrt(det);
+            let nb = f32x4_neg(b);
+            let root = f32x4_max(
+                f32x4_mul(f32x4_sub(nb, sq), inv2av),
+                f32x4_mul(f32x4_add(nb, sq), inv2av),
+            );
+            let valid = v128_and(
+                v128_and(f32x4_ge(det, zero), f32x4_ge(f32x4_mul(rv, root), zero)),
+                f32x4_lt(f32x4_abs(root), inf),
+            );
+            lut_blend_over_k255(chunk, lut, lut_indices(root, valid, scalev));
             kf = f32x4_add(kf, four);
         }
     }
