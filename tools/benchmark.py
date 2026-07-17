@@ -4,6 +4,13 @@
 The runner processes one renderer+canvas-size batch at a time so package energy
 counters, when available, can be attributed to that batch. Within each batch it
 uses many worker processes, and each worker loads the native library once.
+
+Energy: on Linux, RAPL package energy is read around the batch and prorated per
+row by measured time. On macOS (Apple Silicon), per-task consumed energy
+(task_info TASK_POWER_INFO_V2.task_energy, the Activity Monitor source — same
+as the tlottie dump tools' E footer) is sampled around each renderer run inside
+the worker, giving direct per-row attribution. Memory on macOS is sampled via
+proc_pid_rusage resident size, the live counterpart of ru_maxrss.
 """
 
 from __future__ import annotations
@@ -42,15 +49,20 @@ PROJECT_DIRS = {
     "thorvg": PROJECTS / "thorvg",
 }
 
+LIB_SUFFIX = ".dylib" if platform.system() == "Darwin" else ".so"
+
 LIBS = {
-    "tlottie": ROOT / "target" / "release" / "libtlottie_capi.so",
-    "rlottie": PROJECT_DIRS["rlottie"] / "build-release" / "src" / "librlottie.so",
-    "rlottie_2019": PROJECT_DIRS["rlottie_2019"] / "build-release" / "src" / "librlottie.so",
+    "tlottie": ROOT / "target" / "release" / f"libtlottie_capi{LIB_SUFFIX}",
+    "rlottie": PROJECT_DIRS["rlottie"] / "build-release" / "src" / f"librlottie{LIB_SUFFIX}",
+    "rlottie_2019": PROJECT_DIRS["rlottie_2019"]
+    / "build-release"
+    / "src"
+    / f"librlottie{LIB_SUFFIX}",
     "rlottie_2019_patched": PROJECT_DIRS["rlottie_2019_patched"]
     / "build-release"
     / "src"
-    / "librlottie.so",
-    "thorvg": PROJECT_DIRS["thorvg"] / "build-release" / "src" / "libthorvg-1.so",
+    / f"librlottie{LIB_SUFFIX}",
+    "thorvg": PROJECT_DIRS["thorvg"] / "build-release" / "src" / f"libthorvg-1{LIB_SUFFIX}",
     "tlottie-vulkan": ROOT / "target" / "release" / "tlottie-cli",
 }
 
@@ -82,36 +94,49 @@ def ensure_builds(skip: bool) -> None:
 
     meson_env = os.environ.copy()
     meson_env["PATH"] = f"/tmp/tlottie-build-tools/bin:{meson_env.get('PATH', '')}"
-    def setup_cmd(project: Path) -> list[str]:
+    def setup_cmd(project: Path, extra_cpp_args: str = "") -> list[str]:
         cmd = [meson, "setup"]
         if (project / "build-release").exists():
             cmd.append("--wipe")
+        cpp_args = ("-march=native " + extra_cpp_args).strip()
         return cmd + [
             "build-release",
             ".",
             "-Dbuildtype=release",
             "-Db_lto=true",
-            "-Dcpp_args=-march=native",
+            f"-Dcpp_args={cpp_args}",
             "-Dc_args=-march=native",
         ]
 
+    # rlottie's NEON fast path calls pixman's 32-bit ARM assembly, which its
+    # meson only assembles for cpu_family 'arm' — on arm64 the symbols don't
+    # exist and linking fails. Undefine the guards to use the C fallback.
+    rlottie_cpp_args = ""
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        rlottie_cpp_args = "-U__ARM_NEON__ -U__ARM64_NEON__"
+
+    thorvg_args = [
+        "-Dengines=cpu",
+        "-Dloaders=lottie",
+        "-Dbindings=capi",
+        "-Dsimd=true",
+        "-Dtools=",
+        "-Dtests=false",
+    ]
+    if platform.system() == "Darwin":
+        # Apple clang ships without OpenMP; thorvg's default extra=[...,'openmp']
+        # defines THORVG_OPENMP_SUPPORT even when meson can't find the runtime.
+        thorvg_args.append("-Dextra=lottie_exp")
     run(
-        setup_cmd(PROJECTS / "thorvg")
-        + [
-            "-Dengines=cpu",
-            "-Dloaders=lottie",
-            "-Dbindings=capi",
-            "-Dsimd=true",
-            "-Dtools=",
-            "-Dtests=false",
-        ],
+        setup_cmd(PROJECTS / "thorvg") + thorvg_args,
         PROJECT_DIRS["thorvg"],
         meson_env,
     )
     run([meson, "compile", "-C", "build-release"], PROJECT_DIRS["thorvg"], meson_env)
 
     run(
-        setup_cmd(PROJECTS / "rlottie") + ["-Dexample=false", "-Dtest=false"],
+        setup_cmd(PROJECTS / "rlottie", rlottie_cpp_args)
+        + ["-Dexample=false", "-Dtest=false"],
         PROJECT_DIRS["rlottie"],
         meson_env,
     )
@@ -120,7 +145,7 @@ def ensure_builds(skip: bool) -> None:
     for project_name in ("rlottie_2019", "rlottie_2019_patched"):
         project = PROJECT_DIRS[project_name]
         run(
-            setup_cmd(project)
+            setup_cmd(project, rlottie_cpp_args)
             + [
                 "-Dexample=false",
                 "-Dtest=false",
@@ -181,7 +206,86 @@ def pack_of(root: Path, file: Path) -> str:
     return rel.parts[0] if len(rel.parts) > 1 else "."
 
 
+_RUSAGE_INFO_V2 = 2
+
+
+class _RusageInfoV2(C.Structure):
+    # sys/resource.h struct rusage_info_v2 (all fields uint64 after the uuid).
+    _fields_ = [
+        ("ri_uuid", C.c_uint8 * 16),
+        ("ri_user_time", C.c_uint64),
+        ("ri_system_time", C.c_uint64),
+        ("ri_pkg_idle_wkups", C.c_uint64),
+        ("ri_interrupt_wkups", C.c_uint64),
+        ("ri_pageins", C.c_uint64),
+        ("ri_wired_size", C.c_uint64),
+        ("ri_resident_size", C.c_uint64),
+        ("ri_phys_footprint", C.c_uint64),
+        ("ri_proc_start_abstime", C.c_uint64),
+        ("ri_proc_exit_abstime", C.c_uint64),
+        ("ri_child_user_time", C.c_uint64),
+        ("ri_child_system_time", C.c_uint64),
+        ("ri_child_pkg_idle_wkups", C.c_uint64),
+        ("ri_child_interrupt_wkups", C.c_uint64),
+        ("ri_child_pageins", C.c_uint64),
+        ("ri_child_elapsed_abstime", C.c_uint64),
+        ("ri_diskio_bytesread", C.c_uint64),
+        ("ri_diskio_byteswritten", C.c_uint64),
+    ]
+
+
+_TASK_POWER_INFO_V2 = 26
+
+
+class _TaskPowerInfoV2(C.Structure):
+    # mach/task_info.h struct task_power_info_v2; task_energy only exists in
+    # the arm/arm64 layout, so this struct must not be used on Intel.
+    _fields_ = [
+        ("total_user", C.c_uint64),
+        ("total_system", C.c_uint64),
+        ("task_interrupt_wakeups", C.c_uint64),
+        ("task_platform_idle_wakeups", C.c_uint64),
+        ("task_timer_wakeups_bin_1", C.c_uint64),
+        ("task_timer_wakeups_bin_2", C.c_uint64),
+        ("task_gpu_utilisation", C.c_uint64),
+        ("task_gpu_stat_reserved0", C.c_uint64),
+        ("task_gpu_stat_reserved1", C.c_uint64),
+        ("task_gpu_stat_reserved2", C.c_uint64),
+        ("task_energy", C.c_uint64),
+        ("task_ptime", C.c_uint64),
+        ("task_pset_switches", C.c_uint64),
+    ]
+
+
+_LIBPROC = None
+_LIBSYSTEM = None
+if platform.system() == "Darwin":
+    try:
+        _LIBPROC = C.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        _LIBPROC.proc_pid_rusage.argtypes = [C.c_int, C.c_int, C.c_void_p]
+        _LIBPROC.proc_pid_rusage.restype = C.c_int
+    except (OSError, AttributeError):
+        _LIBPROC = None
+    if platform.machine() == "arm64":
+        try:
+            _LIBSYSTEM = C.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+            _LIBSYSTEM.task_info.argtypes = [
+                C.c_uint,
+                C.c_uint,
+                C.c_void_p,
+                C.POINTER(C.c_uint),
+            ]
+            _LIBSYSTEM.task_info.restype = C.c_int
+        except (OSError, AttributeError):
+            _LIBSYSTEM = None
+
+
 def rss_mb() -> float:
+    if _LIBPROC is not None:
+        info = _RusageInfoV2()
+        if _LIBPROC.proc_pid_rusage(os.getpid(), _RUSAGE_INFO_V2, C.byref(info)) == 0:
+            return info.ri_resident_size / 1048576.0
+        return 0.0
     try:
         for line in Path("/proc/self/status").read_text().splitlines():
             if line.startswith("VmRSS:"):
@@ -189,6 +293,21 @@ def rss_mb() -> float:
     except OSError:
         pass
     return 0.0
+
+
+def task_energy_nj() -> int | None:
+    """Consumed energy of this task in nJ (macOS Apple Silicon only)."""
+    if _LIBSYSTEM is None:
+        return None
+    info = _TaskPowerInfoV2()
+    count = C.c_uint(C.sizeof(info) // 4)
+    try:
+        task = C.c_uint.in_dll(_LIBSYSTEM, "mach_task_self_").value
+    except ValueError:
+        return None
+    if _LIBSYSTEM.task_info(task, _TASK_POWER_INFO_V2, C.byref(info), C.byref(count)) != 0:
+        return None
+    return int(info.task_energy) or None
 
 
 class EnergySampler:
@@ -1014,6 +1133,9 @@ def worker_measure(file_s: str) -> tuple[list[dict[str, Any]], dict[str, Any] | 
     accuracy_errors: list[str] = []
     for rep in range(_WORKER_REPS):
         for renderer in _WORKER_RENDERER_ORDER:
+            # tlottie-vulkan renders in a child process, whose energy is not
+            # visible in this task's counter — leave its energy_j unset.
+            energy_before = None if renderer == "tlottie-vulkan" else task_energy_nj()
             if capture_accuracy and rep == 0 and renderer in capture_renderers:
                 (
                     ok,
@@ -1042,6 +1164,11 @@ def worker_measure(file_s: str) -> tuple[list[dict[str, Any]], dict[str, Any] | 
                     mem_max,
                     err,
                 ) = _WORKER_RENDERERS[renderer].measure(file, _WORKER_SIZE, _WORKER_FRAMES)
+            energy_j = None
+            if energy_before is not None:
+                energy_after = task_energy_nj()
+                if energy_after is not None:
+                    energy_j = max(0, energy_after - energy_before) / 1e9
             measured_ms = first_frame_ms + ((frame_ms or 0.0) * other_frames) if ok else 0.0
             rows.append(
                 {
@@ -1057,6 +1184,7 @@ def worker_measure(file_s: str) -> tuple[list[dict[str, Any]], dict[str, Any] | 
                     "measured_ms": measured_ms,
                     "memory_avg_mb": mem_avg,
                     "memory_max_mb": mem_max,
+                    "energy_j": energy_j,
                     "error": err,
                 }
             )
@@ -1125,6 +1253,8 @@ def run_size_batch(
     for row in rows:
         row["batch_elapsed_s"] = elapsed
         row["batch_energy_j"] = energy_j
+        if row.get("energy_j") is not None:
+            continue  # per-task energy measured in the worker (macOS)
         if energy_j is not None and total_ms > 0 and row["ok"]:
             row["energy_j"] = energy_j * row["measured_ms"] / total_ms
         else:
@@ -1741,35 +1871,56 @@ def write_html(
 ) -> None:
     system_info = f"{platform.system()} {platform.release()} / {platform.machine()}"
     css = """
-body{font:13px/1.38 system-ui,sans-serif;margin:24px;background:#11151b;color:#dbe3ee}
-h1,h2{color:#f4f7fb}
-a{color:#8ab4ff}
-table{border-collapse:collapse;width:100%;margin:16px 0 32px;background:#161b22}
-th,td{border-top:1px solid #2b3440;border-bottom:1px solid #2b3440;padding:5px 7px;text-align:right;white-space:nowrap}
-th{background:#202936;color:#edf2f7;position:sticky;top:0;z-index:1}
-th.renderer{background:#283447;text-align:center}
-td.left,th.left{text-align:left;border-left:1px solid #2b3440;border-right:1px solid #2b3440}
-th.metric,td.metric{border-left:1px solid #2b3440}
-th.metric-last,td.metric-last{border-right:1px solid #2b3440}
-tr:nth-child(even) td{background:#141a22}
-.winner{background:#184d2b!important;color:#d8ffe5;font-weight:700}
-.loser{background:#5a1f25!important;color:#ffd6dc}
-.acc-badge{float:right;margin-left:16px;border-radius:4px;padding:1px 6px;font-weight:700}
-.acc-ok{background:#163f27;color:#c9f7d5}
-.acc-warn{background:#5a4717;color:#ffe7a3}
-.acc-bad{background:#5a1f25;color:#ffd6dc}
-.note{color:#aab6c5;max-width:980px}
-.muted{color:#8391a3}
+:root{--bg:#f4f6f7;--surface:#fff;--ink:#1d2429;--muted:#5c6b76;--line:#dde4e8;
+--tl:#0d7f8c;--good:#1e7d46;--bad:#bb4436;--head:#f0f3f5;
+--goodsoft:#e0f2e7;--warnsoft:#f5ecd2;--warn:#8a6d1a;--badsoft:#f7e2df}
+@media(prefers-color-scheme:dark){:root{--bg:#14181b;--surface:#1b2126;--ink:#dde5ea;
+--muted:#8b99a3;--line:#2c353c;--tl:#46becb;--good:#4cba7a;--bad:#e0705f;--head:#20272d;
+--goodsoft:#163f27;--warnsoft:#4a3d17;--warn:#ffe7a3;--badsoft:#4a2320}}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);margin:0;font:14px/1.5 system-ui,sans-serif;
+padding:28px 18px 60px}
+main{width:min-content;max-width:100%;margin:0 auto}
+h1{font-size:20px;margin:0 0 4px}
+h2{font-size:15px;margin:28px 0 8px}
+a{color:var(--tl)}
+.note{color:var(--muted);font-size:13px;margin:2px 0;max-width:980px}
+.tablewrap{overflow-x:auto;max-width:100%;width:fit-content;background:var(--surface);
+border:1px solid var(--line);border-radius:6px;margin:0 0 8px}
+table{border-collapse:collapse;width:auto;font-size:12px}
+th{background:var(--head);color:var(--muted);font-weight:600;text-align:right;padding:6px 8px;
+white-space:nowrap;border-bottom:1px solid var(--line);font-size:10.5px;text-transform:uppercase;
+position:sticky;top:0;z-index:1}
+th.left{text-align:left}
+th.renderer{text-align:center;text-transform:none;font-size:11.5px;color:var(--ink)}
+td{padding:4.5px 8px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap;
+font-family:ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;font-size:11.5px}
+td.left{font-family:system-ui;font-weight:550;text-align:left}
+th.metric,td.metric{border-left:1px solid var(--line)}
+th.metric-last,td.metric-last{border-right:1px solid var(--line)}
+tr:last-child td{border-bottom:0}
+.winner{color:var(--tl);font-weight:700}
+.loser{color:var(--bad);font-weight:700}
+.acc-badge{margin-left:8px;border-radius:4px;padding:1px 6px;font-weight:600;font-size:10.5px;
+font-family:system-ui}
+.acc-ok{background:var(--goodsoft);color:var(--good)}
+.acc-warn{background:var(--warnsoft);color:var(--warn)}
+.acc-bad{background:var(--badsoft);color:var(--bad)}
+.muted{color:var(--muted)}
 """
     with path.open("w", encoding="utf-8") as f:
         f.write("<!doctype html><meta charset='utf-8'><title>Lottie Benchmark</title>")
         f.write(f"<style>{css}</style>")
+        f.write("<main><h1>Lottie benchmark</h1>")
         f.write(f"<p class='note'>Run on {esc(system_info)}.</p>")
         f.write(
             "<p class='note'>fms is load/init plus first-frame draw. "
             "ms is the average of subsequent frames only. "
             "Memory columns are process RSS samples inside benchmark workers, "
-            "not isolated renderer-owned allocation.</p>"
+            "not isolated renderer-owned allocation. "
+            "J is consumed energy: on macOS (Apple Silicon) per-task "
+            "task_power_info_v2.task_energy sampled around each renderer run; "
+            "on Linux RAPL package energy prorated by measured time.</p>"
         )
         if accuracy_by_pack:
             f.write(
@@ -1799,6 +1950,7 @@ tr:nth-child(even) td{background:#141a22}
             effect_pack_rows = aggregate_pack_rows(effect_file_rows)
             rows = pivot_aggregate(effect_pack_rows, ("pack", "size"))
             write_grouped_table(f, rows, renderers, ("pack",), include_size=False, accuracy_by_pack=accuracy_by_pack)
+        f.write("</main>")
 
 
 def write_grouped_table(
@@ -1809,7 +1961,7 @@ def write_grouped_table(
     include_size: bool,
     accuracy_by_pack: dict[str, dict[str, Any]] | None = None,
 ) -> None:
-    f.write("<table><tr>")
+    f.write("<div class='tablewrap'><table><tr>")
     for label in labels:
         f.write(f"<th rowspan='2' class='left'>{esc(label)}</th>")
     if include_size:
@@ -1853,7 +2005,7 @@ def write_grouped_table(
             )
             f.write(f"<td class='metric-last {energy_cls}'>{num(row.get(f'{r}_energy_j'))}</td>")
         f.write("</tr>")
-    f.write("</table>")
+    f.write("</table></div>")
 
 
 def pack_label(pack: str, accuracy: dict[str, Any] | None) -> str:
@@ -1936,6 +2088,11 @@ def main() -> int:
     ap.add_argument("--write-raw", action="store_true", help="write benchmark raw JSON files")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--limit", type=int)
+    ap.add_argument(
+        "--packs",
+        type=int,
+        help="benchmark only the first N packs (sorted by name) instead of all",
+    )
     ap.add_argument("--renderers", default=",".join(DEFAULT_RENDERERS))
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--no-open", action="store_true", help="do not open benchmark.html")
@@ -1956,6 +2113,8 @@ def main() -> int:
         raise SystemExit("--accuracy-diff-threshold must be non-negative")
     if args.save_diffs < 0:
         raise SystemExit("--save-diffs must be non-negative")
+    if args.packs is not None and args.packs <= 0:
+        raise SystemExit("--packs must be positive")
     if args.no_accuracy and args.save_diffs:
         raise SystemExit("--save-diffs requires accuracy; remove --no-accuracy")
     ensure_builds(args.skip_build)
@@ -1964,6 +2123,19 @@ def main() -> int:
             raise SystemExit(f"missing {r} library: {LIBS[r]}")
 
     files = discover(args.input, args.limit)
+    if args.packs:
+        all_packs: list[str] = []
+        for file in files:
+            pack = pack_of(args.input, file)
+            if pack not in all_packs:
+                all_packs.append(pack)
+        keep = set(all_packs[: args.packs])
+        files = [f for f in files if pack_of(args.input, f) in keep]
+        print(
+            f"== packs limited to {len(keep)}/{len(all_packs)}: "
+            + ", ".join(sorted(keep)),
+            flush=True,
+        )
     if not files:
         raise SystemExit(f"no .json files found under {args.input}")
     args.out.mkdir(parents=True, exist_ok=True)
@@ -1991,7 +2163,9 @@ def main() -> int:
             flush=True,
         )
 
-    energy_available = EnergySampler().available()
+    energy_available = EnergySampler().available() or task_energy_nj() is not None
+    if not energy_available:
+        print("== energy counters unavailable; J columns will be n/a", flush=True)
     for size in sizes:
         print(
             f"== {size}px: {len(files)} files, {args.jobs} workers, "
