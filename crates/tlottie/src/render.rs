@@ -308,16 +308,6 @@ impl Default for PlaneData {
     }
 }
 
-impl PlaneData {
-    fn byte_len(&self) -> usize {
-        match self {
-            PlaneData::Cov(v) => v.len(),
-            PlaneData::Spans(v) => v.len() * 8,
-            PlaneData::Src(v) => v.len() * 4,
-        }
-    }
-}
-
 /// Rows for one cached plane: `(y, x0, len)` per row into `data`.
 #[derive(Default)]
 struct CovEntry {
@@ -906,6 +896,7 @@ impl Composition {
             comp: self,
             continuous: frame_in_range.fract() != 0.0,
             antialias: options.antialias,
+            curve_tolerance: options.curve_tolerance,
         };
         let res = ctx.render_layers(
             scratch,
@@ -920,6 +911,588 @@ impl Composition {
         scratch.put_raster(canvas.raster);
         scratch.put_cells(canvas.cells);
         res
+    }
+}
+
+#[doc(hidden)]
+pub mod vulkan {
+    //! Unstable evaluated-shape access for the experimental Vulkan renderer.
+    //!
+    //! The data here is intentionally narrow: it exposes one evaluated frame's
+    //! ordered shape paint ranges and device-space contours without committing
+    //! tlottie to a general rendering backend API.
+
+    use super::*;
+
+    /// Device-space point.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Point {
+        /// X coordinate in target pixels.
+        pub x: f32,
+        /// Y coordinate in target pixels.
+        pub y: f32,
+    }
+
+    /// Fill rule for a vector paint.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Rule {
+        /// Non-zero winding rule.
+        NonZero,
+        /// Even-odd winding rule.
+        EvenOdd,
+    }
+
+    /// Premultiplied solid color paint metadata.
+    #[derive(Clone, Copy, Debug)]
+    pub struct SolidPaint {
+        /// Fill rule used by this paint.
+        pub rule: Rule,
+        /// Premultiplied ARGB color after paint opacity has been folded in.
+        pub argb: u32,
+    }
+
+    /// Device-to-gradient-local affine transform.
+    #[derive(Clone, Copy, Debug)]
+    pub struct GradientTransform {
+        pub a: f32,
+        pub b: f32,
+        pub c: f32,
+        pub d: f32,
+        pub tx: f32,
+        pub ty: f32,
+    }
+
+    /// Evaluated gradient coordinate parameters.
+    #[derive(Clone, Copy, Debug)]
+    pub enum GradientKind {
+        Linear {
+            sx: f32,
+            sy: f32,
+            dx: f32,
+            dy: f32,
+            inv_len_sq: f32,
+        },
+        Radial {
+            sx: f32,
+            sy: f32,
+            inv_r: f32,
+        },
+        Focal {
+            fx: f32,
+            fy: f32,
+            dx: f32,
+            dy: f32,
+            a: f32,
+            r: f32,
+        },
+    }
+
+    /// Premultiplied gradient LUT and evaluated coordinate map.
+    #[derive(Clone, Debug)]
+    pub struct GradientPaint {
+        pub rule: Rule,
+        pub lut: std::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
+        pub transform: GradientTransform,
+        pub kind: GradientKind,
+    }
+
+    /// Paint metadata for the initial Vulkan fill baseline.
+    #[derive(Clone, Debug)]
+    pub enum Paint {
+        /// Solid fill or expanded solid stroke.
+        Solid(SolidPaint),
+        /// Gradient fill or expanded gradient stroke. The geometry is exposed,
+        /// but gradient shader data is not public yet.
+        Gradient(GradientPaint),
+        /// Starts a pixel-local isolated layer.
+        BeginLayer,
+        /// Composites the isolated layer once at the evaluated opacity.
+        EndLayer { opacity: u8 },
+        /// Starts a pixel-local matte source.
+        BeginMatte,
+        /// Saves the matte source and starts its target layer.
+        BeginMatteTarget,
+        /// Applies the matte and composites the target once.
+        EndMatte { kind: u8, opacity: u8 },
+    }
+
+    /// One closed or open contour in device space.
+    #[derive(Clone, Debug, Default)]
+    pub struct WalkedContour {
+        /// Points forming this contour.
+        pub points: Vec<Point>,
+        /// Whether the source contour is closed.
+        pub closed: bool,
+    }
+
+    /// One paint operation. Jobs are returned in draw order, bottom to top.
+    #[derive(Clone, Debug)]
+    pub struct WalkedPaint {
+        /// Paint metadata.
+        pub paint: Paint,
+        /// Index into [`WalkedFrame::contours`].
+        pub start: usize,
+        /// Exclusive end index into [`WalkedFrame::contours`].
+        pub end: usize,
+    }
+
+    /// Evaluated shape data for a frame.
+    #[derive(Clone, Debug, Default)]
+    pub struct WalkedFrame {
+        /// Contour arena. Paints reference ranges inside this array.
+        pub contours: Vec<WalkedContour>,
+        /// Ordered paint operations.
+        pub paints: Vec<WalkedPaint>,
+    }
+
+    /// Evaluates visible shape content for one frame into Vulkan-consumable
+    /// device-space geometry.
+    ///
+    /// Masks remain renderer work for a later phase. Solid fills, strokes,
+    /// gradients, isolated layers, and matte commands preserve draw order.
+    pub fn walk_frame(
+        comp: &Composition,
+        frame_index: f32,
+        width: u32,
+        height: u32,
+        options: crate::RenderOptions,
+    ) -> Result<WalkedFrame> {
+        let limits = Limits::default();
+        if width == 0
+            || height == 0
+            || width > limits.max_dimension
+            || height > limits.max_dimension
+        {
+            return Err(Error::InvalidLottie {
+                offset: 0,
+                what: "render size out of range",
+            });
+        }
+
+        let max_frame = comp.frame_count().saturating_sub(1) as f32;
+        let frame_in_range = if frame_index.is_finite() {
+            frame_index.clamp(0.0, max_frame)
+        } else {
+            0.0
+        };
+        let frame = comp.in_point + frame_in_range;
+        let base = Mat2x3::scale(
+            width as f32 / comp.width.max(1) as f32,
+            height as f32 / comp.height.max(1) as f32,
+        );
+
+        let mut pixels = vec![0; (width as usize).saturating_mul(height as usize)];
+        let mut scratch = RenderScratch::default();
+        scratch
+            .cov_cache
+            .set_budget_for_canvas(width as usize, height as usize);
+        let raster = scratch.take_raster(width as usize, height as usize);
+        let cells = scratch.take_cells(width as usize, height as usize);
+        let mut canvas = Canvas::with_raster(
+            &mut pixels,
+            width as usize,
+            height as usize,
+            raster,
+            cells,
+            options.antialias,
+        );
+        let ctx = RenderCtx {
+            comp,
+            continuous: frame_in_range.fract() != 0.0,
+            antialias: options.antialias,
+            curve_tolerance: options.curve_tolerance,
+        };
+        let mut out = WalkedFrame::default();
+        let res = ctx.collect_layers(
+            &mut scratch,
+            &mut canvas,
+            &comp.layers,
+            base,
+            frame,
+            1.0,
+            &Vec::new(),
+            0,
+            &mut out,
+        );
+        scratch.put_raster(canvas.raster);
+        scratch.put_cells(canvas.cells);
+        res?;
+        Ok(out)
+    }
+
+    fn rule_of(rule: FillRule) -> Rule {
+        match rule {
+            FillRule::NonZero => Rule::NonZero,
+            FillRule::EvenOdd => Rule::EvenOdd,
+        }
+    }
+
+    fn premul_argb(color: Color, opacity: f32) -> u32 {
+        let a = (color.a * opacity).clamp(0.0, 1.0);
+        let scale = a;
+        let ai = (a * 255.0 + 0.5) as u32;
+        let ri = (color.r * scale * 255.0 + 0.5) as u32;
+        let gi = (color.g * scale * 255.0 + 0.5) as u32;
+        let bi = (color.b * scale * 255.0 + 0.5) as u32;
+        (ai.min(255) << 24) | (ri.min(255) << 16) | (gi.min(255) << 8) | bi.min(255)
+    }
+
+    fn push_contours(out: &mut WalkedFrame, contours: &[Contour], closed: bool) -> (usize, usize) {
+        let start = out.contours.len();
+        for contour in contours {
+            out.contours.push(WalkedContour {
+                points: contour
+                    .points
+                    .iter()
+                    .map(|p| Point { x: p.x, y: p.y })
+                    .collect(),
+                closed,
+            });
+        }
+        (start, out.contours.len())
+    }
+
+    impl RenderCtx<'_> {
+        #[allow(clippy::too_many_arguments)]
+        fn collect_layers(
+            &self,
+            scratch: &mut RenderScratch,
+            canvas: &mut Canvas<'_>,
+            layers: &[Layer],
+            base: Mat2x3,
+            frame: f32,
+            opacity: f32,
+            clip: &ClipQuad,
+            precomp_depth: usize,
+            out: &mut WalkedFrame,
+        ) -> Result<()> {
+            if precomp_depth > MAX_PRECOMP_DEPTH {
+                return Ok(());
+            }
+            let mut consumed_as_matte = vec![false; layers.len()];
+            for (i, l) in layers.iter().enumerate() {
+                if l.matte.is_some() {
+                    if let Some(slot) = i.checked_sub(1).and_then(|j| consumed_as_matte.get_mut(j))
+                    {
+                        *slot = true;
+                    }
+                }
+            }
+            for (idx, layer) in layers.iter().enumerate().rev() {
+                if consumed_as_matte.get(idx).copied().unwrap_or(false)
+                    || layer.matte_src
+                    || !self.layer_visible(layer, frame)
+                {
+                    continue;
+                }
+                if layer.matte.is_some() {
+                    if let Some(src) = idx.checked_sub(1).and_then(|j| layers.get(j)) {
+                        if !self.layer_visible(src, frame) {
+                            continue;
+                        }
+                    }
+                }
+                let (layer_m, layer_opacity) = layer_transform_at(layer, frame);
+                let m = base
+                    .concat(parent_chain_matrix(layers, layer, frame))
+                    .concat(layer_m);
+                let combined_opacity = opacity * layer_opacity;
+                let group_opacity = opacity_byte(combined_opacity);
+                if group_opacity == 0 {
+                    continue;
+                }
+                if let Some(kind) = layer.matte {
+                    let Some(src) = idx.checked_sub(1).and_then(|j| layers.get(j)) else {
+                        continue;
+                    };
+                    let at = out.contours.len();
+                    out.paints.push(WalkedPaint {
+                        paint: Paint::BeginMatte,
+                        start: at,
+                        end: at,
+                    });
+                    let (src_m, src_opacity) = layer_transform_at(src, frame);
+                    let source_matrix = base
+                        .concat(parent_chain_matrix(layers, src, frame))
+                        .concat(src_m);
+                    self.collect_layer_content(
+                        scratch,
+                        canvas,
+                        src,
+                        source_matrix,
+                        frame,
+                        src_opacity,
+                        clip,
+                        precomp_depth,
+                        out,
+                    )?;
+                    let at = out.contours.len();
+                    out.paints.push(WalkedPaint {
+                        paint: Paint::BeginMatteTarget,
+                        start: at,
+                        end: at,
+                    });
+                    self.collect_layer_content(
+                        scratch,
+                        canvas,
+                        layer,
+                        m,
+                        frame,
+                        1.0,
+                        clip,
+                        precomp_depth,
+                        out,
+                    )?;
+                    let at = out.contours.len();
+                    out.paints.push(WalkedPaint {
+                        paint: Paint::EndMatte {
+                            kind,
+                            opacity: group_opacity as u8,
+                        },
+                        start: at,
+                        end: at,
+                    });
+                    continue;
+                }
+                let complex_precomp = if layer.kind == LayerKind::Precomp {
+                    layer
+                        .ref_id
+                        .as_deref()
+                        .and_then(|ref_id| self.comp.assets.iter().find(|asset| asset.id == ref_id))
+                        .is_some_and(|asset| asset.layers.len() > 1)
+                } else {
+                    false
+                };
+                let isolate = group_opacity < 255 && complex_precomp;
+                if isolate {
+                    let at = out.contours.len();
+                    out.paints.push(WalkedPaint {
+                        paint: Paint::BeginLayer,
+                        start: at,
+                        end: at,
+                    });
+                }
+                self.collect_layer_content(
+                    scratch,
+                    canvas,
+                    layer,
+                    m,
+                    frame,
+                    if isolate { 1.0 } else { combined_opacity },
+                    clip,
+                    precomp_depth,
+                    out,
+                )?;
+                if isolate {
+                    let at = out.contours.len();
+                    out.paints.push(WalkedPaint {
+                        paint: Paint::EndLayer {
+                            opacity: group_opacity as u8,
+                        },
+                        start: at,
+                        end: at,
+                    });
+                }
+            }
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn collect_layer_content(
+            &self,
+            scratch: &mut RenderScratch,
+            canvas: &mut Canvas<'_>,
+            layer: &Layer,
+            m: Mat2x3,
+            frame: f32,
+            content_opacity: f32,
+            clip: &ClipQuad,
+            precomp_depth: usize,
+            out: &mut WalkedFrame,
+        ) -> Result<()> {
+            if opacity_byte(content_opacity) == 0 {
+                return Ok(());
+            }
+            match layer.kind {
+                LayerKind::Shape => {
+                    let mut walker = ShapeWalker {
+                        canvas,
+                        scratch,
+                        frame,
+                        clip,
+                        curve_tolerance: self.curve_tolerance,
+                    };
+                    let (arena, pending) =
+                        walker.walk_shapes(&layer.shapes, m, content_opacity, 0)?;
+                    walker.collect_shape_jobs(&arena, &pending, out);
+                }
+                LayerKind::Solid => {
+                    if let Some((sw, sh, color)) = layer.solid {
+                        let contour = rect_contour(
+                            Vec2::new(sw * 0.5, sh * 0.5),
+                            Vec2::new(sw, sh),
+                            0.0,
+                            false,
+                            &m,
+                            self.curve_tolerance,
+                        );
+                        let (start, end) = push_contours(out, &[contour], true);
+                        out.paints.push(WalkedPaint {
+                            paint: Paint::Solid(SolidPaint {
+                                rule: Rule::NonZero,
+                                argb: premul_argb(color, content_opacity),
+                            }),
+                            start,
+                            end,
+                        });
+                    }
+                }
+                LayerKind::Precomp => {
+                    let Some(ref_id) = layer.ref_id.as_deref() else {
+                        return Ok(());
+                    };
+                    let Some(asset) = self.comp.assets.iter().find(|a| a.id == ref_id) else {
+                        return Ok(());
+                    };
+                    let mut child_clip: ClipQuad = clip.clone();
+                    if let Some((w, h)) = layer.precomp_size {
+                        child_clip.push([
+                            m.apply(Vec2::new(0.0, 0.0)),
+                            m.apply(Vec2::new(w, 0.0)),
+                            m.apply(Vec2::new(w, h)),
+                            m.apply(Vec2::new(0.0, h)),
+                        ]);
+                    }
+                    let sr = if layer.time_stretch.abs() > 1e-6 {
+                        layer.time_stretch
+                    } else {
+                        1.0
+                    };
+                    let quant = |v: f32| if self.continuous { v } else { v.trunc() };
+                    let child_frame = match &layer.time_remap {
+                        Some(tm) => {
+                            let dur = (self.comp.out_point - self.comp.in_point - 1.0).max(0.0);
+                            let fr = self.comp.frame_rate.max(1e-6);
+                            let pos = if dur > 0.0 {
+                                (tm.eval(frame) * fr / dur).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            };
+                            quant(pos * dur / sr)
+                        }
+                        None => quant((frame - layer.start_time) / sr),
+                    };
+                    self.collect_layers(
+                        scratch,
+                        canvas,
+                        &asset.layers,
+                        m,
+                        child_frame,
+                        content_opacity,
+                        &child_clip,
+                        precomp_depth + 1,
+                        out,
+                    )?;
+                }
+                LayerKind::Null | LayerKind::Other(_) => {}
+            }
+            Ok(())
+        }
+    }
+
+    impl ShapeWalker<'_, '_> {
+        fn collect_shape_jobs(
+            &mut self,
+            arena: &[(Contour, bool)],
+            pending: &[PendingJob],
+            out: &mut WalkedFrame,
+        ) {
+            for pj in pending.iter().rev() {
+                match self.materialize(pj, arena) {
+                    DrawJob::Solid {
+                        contours,
+                        rule,
+                        color,
+                        opacity,
+                        ..
+                    } => {
+                        let (start, end) = push_contours(out, &contours, true);
+                        out.paints.push(WalkedPaint {
+                            paint: Paint::Solid(SolidPaint {
+                                rule: rule_of(rule),
+                                argb: premul_argb(color, opacity),
+                            }),
+                            start,
+                            end,
+                        });
+                        for c in contours {
+                            self.scratch.put_pts(c.points);
+                        }
+                    }
+                    DrawJob::Gradient {
+                        contours,
+                        rule,
+                        lut,
+                        map,
+                        ..
+                    } => {
+                        let (start, end) = push_contours(out, &contours, true);
+                        out.paints.push(WalkedPaint {
+                            paint: Paint::Gradient(GradientPaint {
+                                rule: rule_of(rule),
+                                lut,
+                                transform: GradientTransform {
+                                    a: map.inv.a,
+                                    b: map.inv.b,
+                                    c: map.inv.c,
+                                    d: map.inv.d,
+                                    tx: map.inv.tx,
+                                    ty: map.inv.ty,
+                                },
+                                kind: match map.kind {
+                                    super::GradientMapKind::Linear {
+                                        sx,
+                                        sy,
+                                        dx,
+                                        dy,
+                                        inv_len_sq,
+                                    } => GradientKind::Linear {
+                                        sx,
+                                        sy,
+                                        dx,
+                                        dy,
+                                        inv_len_sq,
+                                    },
+                                    super::GradientMapKind::Radial { sx, sy, inv_r } => {
+                                        GradientKind::Radial { sx, sy, inv_r }
+                                    }
+                                    super::GradientMapKind::Focal {
+                                        fx,
+                                        fy,
+                                        dx,
+                                        dy,
+                                        a,
+                                        r,
+                                    } => GradientKind::Focal {
+                                        fx,
+                                        fy,
+                                        dx,
+                                        dy,
+                                        a,
+                                        r,
+                                    },
+                                },
+                            }),
+                            start,
+                            end,
+                        });
+                        for c in contours {
+                            self.scratch.put_pts(c.points);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -938,6 +1511,8 @@ struct RenderCtx<'a> {
     continuous: bool,
     /// Whether edge coverage remains fractional or is thresholded to binary.
     antialias: bool,
+    /// Maximum device-space error used while flattening cubic curves.
+    curve_tolerance: f32,
 }
 
 impl RenderCtx<'_> {
@@ -1177,6 +1752,7 @@ impl RenderCtx<'_> {
                     scratch,
                     frame,
                     clip,
+                    curve_tolerance: self.curve_tolerance,
                 };
                 let lp = layer as *const Layer as usize;
                 let is_static = *walker
@@ -1209,13 +1785,9 @@ impl RenderCtx<'_> {
                     let admit_now = !self.continuous && self.comp.frame_count() <= 1;
                     if admit_now || walker.scratch.jobs_seen.contains(&rkey) {
                         let mut rec = Vec::new();
-                        walker.render_shapes(
-                            &layer.shapes,
-                            m,
-                            content_opacity,
-                            0,
-                            Some(&mut rec),
-                        )?;
+                        let (arena, pending) =
+                            walker.walk_shapes(&layer.shapes, m, content_opacity, 0)?;
+                        walker.render_shape_jobs_cpu(&arena, &pending, Some(&mut rec));
                         if walker.scratch.jobs_cache.len() >= JOBS_CACHE_CAP {
                             walker.scratch.jobs_cache.clear();
                         }
@@ -1225,10 +1797,14 @@ impl RenderCtx<'_> {
                             walker.scratch.jobs_seen.clear();
                         }
                         walker.scratch.jobs_seen.insert(rkey);
-                        let _ = walker.render_shapes(&layer.shapes, m, content_opacity, 0, None)?;
+                        let (arena, pending) =
+                            walker.walk_shapes(&layer.shapes, m, content_opacity, 0)?;
+                        walker.render_shape_jobs_cpu(&arena, &pending, None);
                     }
                 } else {
-                    let _ = walker.render_shapes(&layer.shapes, m, content_opacity, 0, None)?;
+                    let (arena, pending) =
+                        walker.walk_shapes(&layer.shapes, m, content_opacity, 0)?;
+                    walker.render_shape_jobs_cpu(&arena, &pending, None);
                 }
             }
             LayerKind::Solid => {
@@ -1239,12 +1815,14 @@ impl RenderCtx<'_> {
                         0.0,
                         false,
                         &m,
+                        self.curve_tolerance,
                     );
-                    let mut walker = ShapeWalker {
+                    let walker = ShapeWalker {
                         canvas,
                         scratch,
                         frame,
                         clip,
+                        curve_tolerance: self.curve_tolerance,
                     };
                     let key = walker.fill_key(
                         core::slice::from_ref(&(contour.clone(), true)),
@@ -1389,7 +1967,7 @@ impl RenderCtx<'_> {
             }
             let opacity = (mask.opacity.eval(frame) / 100.0).clamp(0.0, 1.0);
             let data = mask.path.eval(frame);
-            let contour = flatten_path(&data, &m);
+            let contour = flatten_path(&data, &m, self.curve_tolerance);
             let clipped = clip_contour(&contour, w as f32, h as f32);
             // Clear only `bound`; the rasterizer sweep below overwrites the
             // mask's covered pixels, leaving `bound`-but-uncovered pixels at 0
@@ -1450,37 +2028,6 @@ impl RenderCtx<'_> {
         scratch.put_raster(raster);
         scratch.put_cells(cells);
         acc
-    }
-}
-
-/// True when a layer's content has more than one paint operation — the
-/// case where folding layer opacity into each paint would double-darken
-/// overlaps and an offscreen composite is required (rlottie's
-/// "complex content" rule).
-fn layer_has_multiple_paints(layer: &Layer) -> bool {
-    fn count(shapes: &[Shape], acc: &mut usize) {
-        for s in shapes {
-            match s {
-                Shape::Fill(_)
-                | Shape::Stroke(_)
-                | Shape::GradientFill(_)
-                | Shape::GradientStroke(_) => *acc += 1,
-                Shape::Group(g) => count(&g.shapes, acc),
-                _ => {}
-            }
-            if *acc > 1 {
-                return;
-            }
-        }
-    }
-    match layer.kind {
-        LayerKind::Shape => {
-            let mut n = 0;
-            count(&layer.shapes, &mut n);
-            n > 1
-        }
-        LayerKind::Precomp => true, // precomps composite as a unit
-        _ => false,
     }
 }
 
@@ -1629,7 +2176,7 @@ fn layer_transform_at(layer: &Layer, frame: f32) -> (Mat2x3, f32) {
     let angle = dy.atan2(dx).to_degrees();
     // Auto-orient rotates around the anchor, i.e. composes like rotation:
     // re-apply an extra rotation between position and the rest.
-    let anchor = layer.transform.anchor.eval(frame);
+    layer.transform.anchor.eval(frame);
     let pos = layer.transform.position.eval(frame);
     let extra = Mat2x3::translate(pos.x, pos.y)
         .concat(Mat2x3::rotate(angle))
@@ -2138,58 +2685,6 @@ impl GradientMap {
             }
         }
         h.finish() as u64
-    }
-
-    fn t_at(&self, x: f32, y: f32) -> f32 {
-        let p = self.inv.apply(Vec2::new(x, y));
-        let (x, y) = (p.x, p.y);
-        match &self.kind {
-            GradientMapKind::Linear {
-                sx,
-                sy,
-                dx,
-                dy,
-                inv_len_sq,
-            } => ((x - sx) * dx + (y - sy) * dy) * inv_len_sq,
-            GradientMapKind::Radial { sx, sy, inv_r } => {
-                let ddx = x - sx;
-                let ddy = y - sy;
-                (ddx * ddx + ddy * ddy).sqrt() * inv_r
-            }
-            GradientMapKind::Focal {
-                fx,
-                fy,
-                dx,
-                dy,
-                a,
-                r,
-            } => {
-                // rlottie fetch_radial_gradient (vdrawhelper.cpp): solve
-                // a·s² + b·s − |g|² = 0 with g = P−F, b = 2(g·d); take the
-                // LARGER root; no real solution / behind the focal cone →
-                // transparent (NaN sentinel, skipped by the fill loop).
-                let gx = x - fx;
-                let gy = y - fy;
-                let b = 2.0 * (gx * dx + gy * dy);
-                let gg = gx * gx + gy * gy;
-                if a.abs() < 1e-9 {
-                    return f32::NAN; // rlottie: vIsZero(a) → transparent
-                }
-                let det = b * b + 4.0 * a * gg;
-                if det < 0.0 {
-                    return f32::NAN;
-                }
-                let sq = det.sqrt();
-                let inv2a = 1.0 / (2.0 * a);
-                let s0 = (-b - sq) * inv2a;
-                let s1 = (-b + sq) * inv2a;
-                let s = s0.max(s1);
-                if r * s < 0.0 {
-                    return f32::NAN;
-                }
-                s
-            }
-        }
     }
 }
 
@@ -2728,20 +3223,6 @@ fn src_px(cov: u8, src: u32) -> u32 {
     (s_a << 24) | (s_r << 16) | (s_g << 8) | s_b
 }
 
-/// Source-over of an already coverage-scaled premultiplied pixel — the
-/// tail of blend_gradient_px.
-#[inline(always)]
-fn blend_premult_px(dst: &mut u32, s: u32) {
-    let s_a = (s >> 24) & 0xff;
-    let d = *dst;
-    let inv = 255 - s_a;
-    let o_a = s_a + (((d >> 24) & 0xff) * inv + 127) / 255;
-    let o_r = ((s >> 16) & 0xff) + (((d >> 16) & 0xff) * inv + 127) / 255;
-    let o_g = ((s >> 8) & 0xff) + (((d >> 8) & 0xff) * inv + 127) / 255;
-    let o_b = (s & 0xff) + ((d & 0xff) * inv + 127) / 255;
-    *dst = (o_a.min(255) << 24) | (o_r.min(255) << 16) | (o_g.min(255) << 8) | o_b.min(255);
-}
-
 /// Blends one coverage row of a gradient paint into `dst_row` (row `y`,
 /// starting column `x0`) in a SINGLE fused pass: each source pixel's
 /// coverage-scaled premultiplied color is computed (t/LUT stepping identical
@@ -3244,6 +3725,7 @@ struct ShapeWalker<'a, 'b> {
     scratch: &'a mut RenderScratch,
     frame: f32,
     clip: &'a ClipQuad,
+    curve_tolerance: f32,
 }
 
 /// A paint recorded during the walk. `range` indexes the geometry arena;
@@ -3302,23 +3784,31 @@ enum DrawJob {
 }
 
 impl ShapeWalker<'_, '_> {
-    fn render_shapes(
+    fn walk_shapes(
         &mut self,
         shapes: &[Shape],
         m: Mat2x3,
         opacity: f32,
         depth: usize,
-        mut record: Option<&mut Vec<ReplayJob>>,
-    ) -> Result<()> {
+    ) -> Result<(Vec<(Contour, bool)>, Vec<PendingJob>)> {
         let mut arena: Vec<(Contour, bool)> = Vec::new();
         let mut pending: Vec<PendingJob> = Vec::new();
         self.walk(shapes, m, opacity, depth, &mut arena, &mut pending)?;
+        Ok((arena, pending))
+    }
+
+    fn render_shape_jobs_cpu(
+        &mut self,
+        arena: &[(Contour, bool)],
+        pending: &[PendingJob],
+        mut record: Option<&mut Vec<ReplayJob>>,
+    ) {
         // Materialize AFTER all modifiers ran, execute in reverse. Fused:
         // materialize is pure per-job (the arena is immutable once the walk
         // finished), so each job's geometry is built, drawn, and freed before
         // the next — nothing forces all jobs' contours to coexist.
         for pj in pending.iter().rev() {
-            let contours = match self.materialize(pj, &arena) {
+            let contours = match self.materialize(pj, arena) {
                 DrawJob::Solid {
                     key,
                     contours,
@@ -3377,7 +3867,6 @@ impl ShapeWalker<'_, '_> {
                 self.scratch.put_pts(c.points);
             }
         }
-        Ok(())
     }
 
     /// Replays a static layer's recorded paints straight from the coverage
@@ -3639,18 +4128,24 @@ impl ShapeWalker<'_, '_> {
                 Shape::Path(p) => {
                     let data = p.path.eval(self.frame);
                     let closed = data.closed;
-                    arena.push((flatten_path(&data, &m), closed));
+                    arena.push((flatten_path(&data, &m, self.curve_tolerance), closed));
                 }
                 Shape::Rect(r) => {
                     let pos = r.position.eval(self.frame);
                     let size = r.size.eval(self.frame);
                     let radius = r.radius.eval(self.frame);
-                    arena.push((rect_contour(pos, size, radius, r.reversed, &m), true));
+                    arena.push((
+                        rect_contour(pos, size, radius, r.reversed, &m, self.curve_tolerance),
+                        true,
+                    ));
                 }
                 Shape::Ellipse(e) => {
                     let pos = e.position.eval(self.frame);
                     let size = e.size.eval(self.frame);
-                    arena.push((ellipse_contour(pos, size, e.reversed, &m), true));
+                    arena.push((
+                        ellipse_contour(pos, size, e.reversed, &m, self.curve_tolerance),
+                        true,
+                    ));
                 }
                 Shape::Polystar(ps) => {
                     let data = polystar_path(
@@ -3664,7 +4159,7 @@ impl ShapeWalker<'_, '_> {
                         ps.inner_roundness.eval(self.frame),
                         ps.outer_roundness.eval(self.frame),
                     );
-                    arena.push((flatten_path(&data, &m), true));
+                    arena.push((flatten_path(&data, &m, self.curve_tolerance), true));
                 }
                 Shape::RoundCorners(rc) => {
                     let radius = rc.radius.eval(self.frame);
@@ -3717,8 +4212,7 @@ impl ShapeWalker<'_, '_> {
                     let end_p = gf.end.eval(self.frame);
                     let inv = m.inverse();
                     let stops = gf.stops.eval(self.frame);
-                    let (lut, lut_id) =
-                        self.scratch.lut_for(&stops, gf.color_count, paint_opacity);
+                    let (lut, lut_id) = self.scratch.lut_for(&stops, gf.color_count, paint_opacity);
                     let map = match gf.kind {
                         GradientKind::Linear => linear_map(start_p, end_p, inv),
                         GradientKind::Radial => radial_map(
@@ -3794,8 +4288,7 @@ impl ShapeWalker<'_, '_> {
                     let end_p = gs.end.eval(self.frame);
                     let inv = m.inverse();
                     let stops = gs.stops.eval(self.frame);
-                    let (lut, lut_id) =
-                        self.scratch.lut_for(&stops, gs.color_count, paint_opacity);
+                    let (lut, lut_id) = self.scratch.lut_for(&stops, gs.color_count, paint_opacity);
                     let map = match gs.kind {
                         GradientKind::Linear => linear_map(start_p, end_p, inv),
                         GradientKind::Radial => radial_map(
@@ -4715,6 +5208,7 @@ mod mask_bound_tests {
             comp: &comp,
             continuous: false,
             antialias: true,
+            curve_tolerance: 0.05,
         };
         let mut scratch = RenderScratch::default();
         ctx.build_mask(&mut scratch, layer, Mat2x3::IDENTITY, 0.0, w, h, bound)

@@ -156,6 +156,7 @@ pub unsafe extern "C" fn tl_render(
             height,
             RenderOptions {
                 antialias: antialias != 0,
+                ..RenderOptions::default()
             },
         )
         .is_err()

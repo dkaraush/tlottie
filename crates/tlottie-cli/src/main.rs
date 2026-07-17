@@ -8,21 +8,27 @@ use std::time::Instant;
 
 use tlottie::{Composition, Limits, RenderOptions};
 
+mod vulkan;
+
 fn render_options() -> RenderOptions {
     let antialias = std::env::var("TLOTTIE_AA")
         .map(|v| !matches!(v.as_str(), "0" | "false" | "off"))
         .unwrap_or(true);
-    RenderOptions { antialias }
+    let curve_tolerance = std::env::var("TLOTTIE_CURVE_TOLERANCE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0.05);
+    RenderOptions {
+        antialias,
+        curve_tolerance,
+    }
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.split_first() {
         Some((cmd, files)) if cmd == "info" && !files.is_empty() => info(files),
-        Some((cmd, rest)) if cmd == "render" => match rest {
-            [file, frame, size, out] => render(file, frame, size, out),
-            _ => usage(),
-        },
+        Some((cmd, rest)) if cmd == "render" => render_cmd(rest),
         Some((cmd, rest)) if cmd == "dump" => match rest {
             [file, size, frames, outdir] => dump(file, size, frames, outdir),
             _ => usage(),
@@ -33,9 +39,20 @@ fn main() -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!("usage: tlottie-cli info <file.json>...");
-    eprintln!("       tlottie-cli render <file.json> <frame> <size> <out.ppm>");
+    eprintln!("       tlottie-cli render [--backend cpu|vulkan] <file.json> <frame> <size> <out.ppm|out.png>");
     eprintln!("       tlottie-cli dump <file.json> <size> <f0,f1,...> <outdir>");
     ExitCode::from(2)
+}
+
+fn render_cmd(args: &[String]) -> ExitCode {
+    let (backend, rest) = match args {
+        [flag, backend, rest @ ..] if flag == "--backend" => (backend.as_str(), rest),
+        rest => ("cpu", rest),
+    };
+    match rest {
+        [file, frame, size, out] => render(file, frame, size, out, backend),
+        _ => usage(),
+    }
 }
 
 /// Same protocol as tools/rlottie_dump.cpp: renders each frame, writes
@@ -306,7 +323,7 @@ fn write_png(path: &str, size: u32, pixels: &[u32]) -> std::io::Result<()> {
     std::fs::write(path, out)
 }
 
-fn render(file: &str, frame: &str, size: &str, out: &str) -> ExitCode {
+fn render(file: &str, frame: &str, size: &str, out: &str, backend: &str) -> ExitCode {
     let (Ok(frame), Ok(size)) = (frame.parse::<f32>(), size.parse::<u32>()) else {
         eprintln!("bad frame/size");
         return ExitCode::from(2);
@@ -331,9 +348,32 @@ fn render(file: &str, frame: &str, size: &str, out: &str) -> ExitCode {
     };
     let n = (size as usize).saturating_mul(size as usize);
     let mut pixels = vec![0u32; n];
-    if let Err(e) = comp.render_with_options(frame, &mut pixels, size, size, render_options()) {
-        eprintln!("{file}: render error: {e}");
-        return ExitCode::FAILURE;
+    match backend {
+        "cpu" => {
+            if let Err(e) =
+                comp.render_with_options(frame, &mut pixels, size, size, render_options())
+            {
+                eprintln!("{file}: render error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        "vulkan" => {
+            let code = vulkan::render_with_options(
+                &comp,
+                frame,
+                &mut pixels,
+                size,
+                size,
+                render_options(),
+            );
+            if code != ExitCode::SUCCESS {
+                return code;
+            }
+        }
+        _ => {
+            eprintln!("unknown backend: {backend}");
+            return ExitCode::from(2);
+        }
     }
 
     // .png → transparent PNG (straight alpha); anything else → P6 PPM

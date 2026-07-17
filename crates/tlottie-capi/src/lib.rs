@@ -120,6 +120,7 @@ pub unsafe extern "C" fn tlottie_animation_render_argb(
         height,
         RenderOptions {
             antialias: antialias != 0,
+            ..RenderOptions::default()
         },
     ) {
         Ok(()) => 0,

@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/tlottie", "crates/tlottie-cli", "crates/tlottie-capi", "crates/tlottie-wasm"]
+members = [
+    "crates/tlottie",
+    "crates/tlottie-cli",
+    "crates/tlottie-capi",
+    "crates/tlottie-vulkan",
+    "crates/tlottie-wasm",
+]
 
 [workspace.package]
 version = "0.1.0"

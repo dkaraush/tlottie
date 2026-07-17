@@ -1,0 +1,16 @@
+[package]
+name = "tlottie-vulkan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Experimental Vulkan renderer bring-up for tlottie"
+
+[dependencies]
+ash = { version = "0.37.3", default-features = false, features = ["loaded"] }
+tlottie = { path = "../tlottie" }
+
+[build-dependencies]
+naga = { version = "24", features = ["spv-out", "wgsl-in"] }
+
+[lints]
+workspace = true

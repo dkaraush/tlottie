@@ -601,7 +601,7 @@ fn outline_open(
     // the right offsets backward. Join geometry mirrors the piece path:
     // outer side gets miter point / arc / bevel (nothing extra), inner side
     // connects directly (nonzero winding covers the overlap).
-    let mut side_pass = |b: &mut Vec<Vec2>, side: f32| -> Option<()> {
+    let side_pass = |b: &mut Vec<Vec2>, side: f32| -> Option<()> {
         let seg_iter: Box<dyn Iterator<Item = usize>> = if side > 0.0 {
             Box::new(0..n - 1)
         } else {

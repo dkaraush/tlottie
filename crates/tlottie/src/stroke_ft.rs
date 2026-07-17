@@ -260,8 +260,6 @@ pub(crate) fn stroke_outline(
         );
         ring_close(&mut b0.pts, false);
         ring_close(&mut b1.pts, true);
-        debug_dump_long_edges_a(&b0.pts, pts, anchors, hw, true);
-        debug_dump_long_edges_a(&b1.pts, pts, anchors, hw, true);
         // Canonical flip: FT-natural band winding is opposite the legacy
         // normalized() pieces; reverse both rings so bands land at +1.
         b0.pts.reverse();
@@ -334,7 +332,6 @@ pub(crate) fn stroke_outline(
         );
         // Canonical flip (see closed case).
         loop_pts.reverse();
-        debug_dump_long_edges_a(&loop_pts, pts, anchors, hw, false);
         if loop_pts.len() >= 3 {
             out.push(Contour {
                 points: loop_pts,
@@ -573,106 +570,6 @@ fn emit_cap(out: &mut Vec<Vec2>, end: Vec2, d: Vec2, hw: f32, cap: Cap) {
                 out.push(Vec2::new(end.x + hw * a.cos(), end.y + hw * a.sin()));
             }
         }
-    }
-}
-
-/// Dev-only (TLOTTIE_STROKE_DEBUG): flags output contours containing an
-/// edge much longer than any input segment + band width — the "needle /
-/// long chord" artifact detector. Prints the INPUT polyline for repro.
-fn debug_dump_long_edges(border: &[Vec2], input: &[Vec2], hw: f32, closed: bool) {
-    debug_dump_long_edges_a(border, input, &[], hw, closed)
-}
-
-#[allow(dead_code)]
-fn debug_dump_long_edges_a(
-    border: &[Vec2],
-    input: &[Vec2],
-    anchors: &[bool],
-    hw: f32,
-    closed: bool,
-) {
-    if std::env::var_os("TLOTTIE_STROKE_DEBUG").is_none() {
-        return;
-    }
-    let mut max_in = 0.0f32;
-    for w in input.windows(2) {
-        if let [a, b] = w {
-            max_in = max_in.max(((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt());
-        }
-    }
-    let mut max_out = 0.0f32;
-    let mut at = (0usize, Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0));
-    for (i, w) in border.windows(2).enumerate() {
-        if let [a, b] = w {
-            let d = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
-            if d > max_out {
-                max_out = d;
-                at = (i, *a, *b);
-            }
-        }
-    }
-    // BBOX mode: TLOTTIE_STROKE_DEBUG=x0,y0,x1,y1 dumps every output
-    // contour intersecting the box (plus its input) as SVG-ish paths.
-    if let Some(spec) = std::env::var_os("TLOTTIE_STROKE_DEBUG") {
-        if let Some(s) = spec.to_str() {
-            let nums: Vec<f32> = s.split(',').filter_map(|t| t.parse().ok()).collect();
-            if let [bx0, by0, bx1, by1] = nums[..] {
-                let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-                for p in border {
-                    x0 = x0.min(p.x);
-                    y0 = y0.min(p.y);
-                    x1 = x1.max(p.x);
-                    y1 = y1.max(p.y);
-                }
-                if x0 <= bx1 && x1 >= bx0 && y0 <= by1 && y1 >= by0 && !border.is_empty() {
-                    let ring: Vec<String> = border
-                        .iter()
-                        .map(|p| format!("{:.6},{:.6}", p.x, p.y))
-                        .collect();
-                    let inp: Vec<String> = input
-                        .iter()
-                        .map(|p| format!("{:.6},{:.6}", p.x, p.y))
-                        .collect();
-                    eprintln!(
-                        "STROKE_DEBUG ring closed={closed} hw={hw:.2} n={} area_sign={} M {}",
-                        border.len(),
-                        {
-                            let mut a = 0.0f32;
-                            for (i, p) in border.iter().enumerate() {
-                                let q = border
-                                    .get(i + 1)
-                                    .or_else(|| border.first())
-                                    .copied()
-                                    .unwrap_or(*p);
-                                a += p.x * q.y - q.x * p.y;
-                            }
-                            if a >= 0.0 {
-                                "+"
-                            } else {
-                                "-"
-                            }
-                        },
-                        ring.join(" L ")
-                    );
-                    eprintln!("STROKE_DEBUG   input n={}: {}", input.len(), inp.join(" "));
-                    let an: String = anchors.iter().map(|&a| if a { 'A' } else { '.' }).collect();
-                    eprintln!("STROKE_DEBUG   anchors: {an}");
-                }
-                return;
-            }
-        }
-    }
-    if max_out > max_in + 4.0 * hw + 1.0 {
-        eprintln!(
-            "STROKE_DEBUG long edge {max_out:.1} (max_in {max_in:.1}, hw {hw:.2}, closed {closed}) at #{} ({:.1},{:.1})->({:.1},{:.1}) input_n {}",
-            at.0, at.1.x, at.1.y, at.2.x, at.2.y, input.len()
-        );
-        let coords: Vec<String> = input
-            .iter()
-            .take(40)
-            .map(|p| format!("({:.2},{:.2})", p.x, p.y))
-            .collect();
-        eprintln!("STROKE_DEBUG input: {}", coords.join(" "));
     }
 }
 

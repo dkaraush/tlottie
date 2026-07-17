@@ -55,6 +55,7 @@ fn flatten_cubic(
     c1: Vec2,
     c2: Vec2,
     p1: Vec2,
+    tolerance: f32,
 ) {
     // Error-bounded uniform flattening: for n segments the max deviation is
     // <= 3/4 * M / n^2 where M is the largest second-difference norm of the
@@ -65,7 +66,8 @@ fn flatten_cubic(
     let d2a = ((p0.x - 2.0 * c1.x + c2.x).abs()).max((p0.y - 2.0 * c1.y + c2.y).abs());
     let d2b = ((c1.x - 2.0 * c2.x + p1.x).abs()).max((c1.y - 2.0 * c2.y + p1.y).abs());
     let m_norm = d2a.max(d2b);
-    let n = ((m_norm * 15.0).sqrt().ceil() as usize).clamp(2, MAX_SEGS);
+    let coefficient = 0.75 / tolerance.clamp(0.01, 4.0);
+    let n = ((m_norm * coefficient).sqrt().ceil() as usize).clamp(2, MAX_SEGS);
     let step = 1.0 / n as f32;
     let mut t = step;
     for _ in 0..n.saturating_sub(1) {
@@ -95,7 +97,7 @@ pub(crate) fn reverse_path(data: &mut PathData) {
 }
 
 /// Flattens Lottie path data (vertices + relative tangents) under `m`.
-pub(crate) fn flatten_path(data: &PathData, m: &Mat2x3) -> Contour {
+pub(crate) fn flatten_path(data: &PathData, m: &Mat2x3, tolerance: f32) -> Contour {
     let n = data.vertices.len();
     let mut points = Vec::with_capacity(n * 4);
     let mut anchors: Vec<bool> = Vec::with_capacity(n * 4);
@@ -130,7 +132,7 @@ pub(crate) fn flatten_path(data: &PathData, m: &Mat2x3) -> Contour {
             points.push(p1d);
             anchors.push(true);
         } else {
-            flatten_cubic(&mut points, &mut anchors, prev_dev, c1, c2, p1d);
+            flatten_cubic(&mut points, &mut anchors, prev_dev, c1, c2, p1d, tolerance);
         }
         prev_dev = p1d;
     }
@@ -143,7 +145,13 @@ pub(crate) fn flatten_path(data: &PathData, m: &Mat2x3) -> Contour {
 }
 
 /// Ellipse centered at `pos` with `size` (width/height), as 4 cubic arcs.
-pub(crate) fn ellipse_contour(pos: Vec2, size: Vec2, reversed: bool, m: &Mat2x3) -> Contour {
+pub(crate) fn ellipse_contour(
+    pos: Vec2,
+    size: Vec2,
+    reversed: bool,
+    m: &Mat2x3,
+    tolerance: f32,
+) -> Contour {
     let rx = size.x * 0.5;
     let ry = size.y * 0.5;
     let (cx, cy) = (pos.x, pos.y);
@@ -177,7 +185,7 @@ pub(crate) fn ellipse_contour(pos: Vec2, size: Vec2, reversed: bool, m: &Mat2x3)
     if reversed {
         reverse_path(&mut data);
     }
-    flatten_path(&data, m)
+    flatten_path(&data, m, tolerance)
 }
 
 /// Axis-aligned (in local space) rounded rect centered at `pos`.
@@ -187,6 +195,7 @@ pub(crate) fn rect_contour(
     radius: f32,
     reversed: bool,
     m: &Mat2x3,
+    tolerance: f32,
 ) -> Contour {
     let w = size.x.max(0.0);
     let h = size.y.max(0.0);
@@ -255,7 +264,7 @@ pub(crate) fn rect_contour(
     if reversed {
         reverse_path(&mut data);
     }
-    flatten_path(&data, m)
+    flatten_path(&data, m, tolerance)
 }
 
 /// Sutherland–Hodgman clip of a polygon to an arbitrary convex quad
