@@ -561,20 +561,6 @@ impl CovCache {
     /// that always spans a full loop) is renewed; a dead one is cleared
     /// and the cache re-learns from scratch.
     fn frame_tick(&mut self) {
-        static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *PROBE.get_or_init(|| std::env::var_os("TLOTTIE_COV_PROBE").is_some()) {
-            eprintln!(
-                "COVP hits={} inserts={} rotations={} frozen={} era_hits={} young={} old={} ybytes={}",
-                self.hits,
-                self.inserts,
-                self.rotations,
-                self.frozen,
-                self.era_hits,
-                self.young.len(),
-                self.old.len(),
-                self.young_bytes
-            );
-        }
         if self.frozen {
             self.era_frames += 1;
             if self.era_frames >= FREEZE_ERA_FRAMES {
@@ -2542,23 +2528,6 @@ fn build_gradient_lut(
     }
     if merged.is_empty() {
         merged.push((0.0, 1.0, 1.0, 1.0, 1.0));
-    }
-    if std::env::var("TL_GRAD_DEBUG").is_ok() {
-        let cols: Vec<(i32, i32, i32)> = merged
-            .iter()
-            .map(|m| {
-                (
-                    (m.1 * 255.0) as i32,
-                    (m.2 * 255.0) as i32,
-                    (m.3 * 255.0) as i32,
-                )
-            })
-            .collect();
-        let alphas: Vec<i32> = merged.iter().map(|m| (m.4 * 255.0) as i32).collect();
-        eprintln!(
-            "GRAD n={} oas={} opacity={:.3} cols={:?} alphas={:?} raw={:?}",
-            n, oas, opacity, cols, alphas, data
-        );
     }
 
     for (i, slot) in lut.iter_mut().enumerate() {
