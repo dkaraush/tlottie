@@ -18,7 +18,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (entry, stage, file) in [
         ("vs_main", naga::ShaderStage::Vertex, "triangle.vert.spv"),
+        ("vs_cover", naga::ShaderStage::Vertex, "cover.vert.spv"),
         ("fs_main", naga::ShaderStage::Fragment, "triangle.frag.spv"),
+        ("fs_group", naga::ShaderStage::Fragment, "group.frag.spv"),
+        (
+            "fs_stencil",
+            naga::ShaderStage::Fragment,
+            "stencil.frag.spv",
+        ),
     ] {
         let pipeline = naga::back::spv::PipelineOptions {
             shader_stage: stage,

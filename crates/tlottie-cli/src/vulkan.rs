@@ -16,6 +16,8 @@ mod imp {
         queue: vk::Queue,
         command_pool: vk::CommandPool,
         timestamp_period: f32,
+        multi_draw_indirect: bool,
+        raster_order_groups: bool,
     }
 
     impl VkCtx {
@@ -37,12 +39,52 @@ mod imp {
             let instance = unsafe { entry.create_instance(&info, None) }
                 .map_err(|e| format!("vkCreateInstance: {e:?}"))?;
             let picked = pick_device(&instance)?;
+            let supported_features =
+                unsafe { instance.get_physical_device_features(picked.physical_device) };
+            let multi_draw_indirect = supported_features.multi_draw_indirect != 0
+                && supported_features.draw_indirect_first_instance != 0;
+            let extension_properties = unsafe {
+                instance.enumerate_device_extension_properties(picked.physical_device)
+            }
+            .map_err(|e| format!("vkEnumerateDeviceExtensionProperties: {e:?}"))?;
+            let raster_order_groups = std::env::var_os("TLOTTIE_VK_GROUPS").is_some()
+                && extension_properties.iter().any(|extension| {
+                    (unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) })
+                        == vk::ExtRasterizationOrderAttachmentAccessFn::name()
+                });
+            let mut raster_features =
+                vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT::default();
+            let mut features2 = vk::PhysicalDeviceFeatures2::builder()
+                .push_next(&mut raster_features);
+            unsafe {
+                instance.get_physical_device_features2(picked.physical_device, &mut features2)
+            };
+            let raster_order_groups = raster_order_groups
+                && raster_features.rasterization_order_color_attachment_access != 0;
+            let enabled_features = vk::PhysicalDeviceFeatures::builder()
+                .multi_draw_indirect(multi_draw_indirect)
+                .draw_indirect_first_instance(multi_draw_indirect);
             let priorities = [1.0f32];
             let queues = [vk::DeviceQueueCreateInfo::builder()
                 .queue_family_index(picked.queue_family_index)
                 .queue_priorities(&priorities)
                 .build()];
-            let dinfo = vk::DeviceCreateInfo::builder().queue_create_infos(&queues);
+            let mut device_extensions = Vec::new();
+            if raster_order_groups {
+                device_extensions.push(
+                    vk::ExtRasterizationOrderAttachmentAccessFn::name().as_ptr(),
+                );
+            }
+            let mut enabled_raster =
+                vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT::builder()
+                    .rasterization_order_color_attachment_access(raster_order_groups);
+            let mut dinfo = vk::DeviceCreateInfo::builder()
+                .queue_create_infos(&queues)
+                .enabled_extension_names(&device_extensions)
+                .enabled_features(&enabled_features);
+            if raster_order_groups {
+                dinfo = dinfo.push_next(&mut enabled_raster);
+            }
             // SAFETY: picked device/queue family came from this instance.
             let device = unsafe { instance.create_device(picked.physical_device, &dinfo, None) }
                 .map_err(|e| format!("vkCreateDevice: {e:?}"))?;
@@ -65,6 +107,8 @@ mod imp {
                 queue,
                 command_pool,
                 timestamp_period: props.limits.timestamp_period,
+                multi_draw_indirect,
+                raster_order_groups,
             })
         }
     }
@@ -196,9 +240,70 @@ mod imp {
 
     impl RenderImage {
         fn new(ctx: &VkCtx, width: u32, height: u32) -> Result<RenderImage, String> {
+            Self::new_with(
+                ctx,
+                width,
+                height,
+                vk::Format::B8G8R8A8_UNORM,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC,
+                vk::SampleCountFlags::TYPE_1,
+                "render",
+            )
+        }
+
+        fn new_multisample(ctx: &VkCtx, width: u32, height: u32) -> Result<RenderImage, String> {
+            Self::new_with(
+                ctx,
+                width,
+                height,
+                vk::Format::B8G8R8A8_UNORM,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
+                vk::SampleCountFlags::TYPE_4,
+                "multisample color",
+            )
+        }
+
+        fn new_group(ctx: &VkCtx, width: u32, height: u32) -> Result<RenderImage, String> {
+            Self::new_with(
+                ctx,
+                width,
+                height,
+                vk::Format::B8G8R8A8_UNORM,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::INPUT_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
+                vk::SampleCountFlags::TYPE_4,
+                "alpha group color",
+            )
+        }
+
+        fn new_stencil(ctx: &VkCtx, width: u32, height: u32) -> Result<RenderImage, String> {
+            Self::new_with(
+                ctx,
+                width,
+                height,
+                vk::Format::S8_UINT,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
+                vk::SampleCountFlags::TYPE_4,
+                "stencil",
+            )
+        }
+
+        fn new_with(
+            ctx: &VkCtx,
+            width: u32,
+            height: u32,
+            format: vk::Format,
+            usage: vk::ImageUsageFlags,
+            samples: vk::SampleCountFlags,
+            label: &str,
+        ) -> Result<RenderImage, String> {
             let info = vk::ImageCreateInfo::builder()
                 .image_type(vk::ImageType::TYPE_2D)
-                .format(vk::Format::B8G8R8A8_UNORM)
+                .format(format)
                 .extent(vk::Extent3D {
                     width,
                     height,
@@ -206,35 +311,49 @@ mod imp {
                 })
                 .mip_levels(1)
                 .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
+                .samples(samples)
                 .tiling(vk::ImageTiling::OPTIMAL)
-                .usage(
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT
-                        | vk::ImageUsageFlags::TRANSFER_DST
-                        | vk::ImageUsageFlags::TRANSFER_SRC,
-                )
+                .usage(usage)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .initial_layout(vk::ImageLayout::UNDEFINED);
             // SAFETY: device is live.
             let image = unsafe { ctx.device.create_image(&info, None) }
-                .map_err(|e| format!("vkCreateImage(render): {e:?}"))?;
+                .map_err(|e| format!("vkCreateImage({label}): {e:?}"))?;
             // SAFETY: image belongs to this device.
             let req = unsafe { ctx.device.get_image_memory_requirements(image) };
-            let mem_type = memory_type(
-                ctx,
-                req.memory_type_bits,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                "render image",
-            )?;
+            let mem_type = if usage.contains(vk::ImageUsageFlags::TRANSIENT_ATTACHMENT) {
+                memory_type(
+                    ctx,
+                    req.memory_type_bits,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL
+                        | vk::MemoryPropertyFlags::LAZILY_ALLOCATED,
+                    label,
+                )
+                .or_else(|_| {
+                    memory_type(
+                        ctx,
+                        req.memory_type_bits,
+                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                        label,
+                    )
+                })?
+            } else {
+                memory_type(
+                    ctx,
+                    req.memory_type_bits,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    label,
+                )?
+            };
             let alloc = vk::MemoryAllocateInfo::builder()
                 .allocation_size(req.size)
                 .memory_type_index(mem_type);
             // SAFETY: allocation request uses a valid memory type.
             let memory = unsafe { ctx.device.allocate_memory(&alloc, None) }
-                .map_err(|e| format!("vkAllocateMemory(render image): {e:?}"))?;
+                .map_err(|e| format!("vkAllocateMemory({label}): {e:?}"))?;
             // SAFETY: image/memory belong to same device and offset is aligned.
             unsafe { ctx.device.bind_image_memory(image, memory, 0) }
-                .map_err(|e| format!("vkBindImageMemory(render): {e:?}"))?;
+                .map_err(|e| format!("vkBindImageMemory({label}): {e:?}"))?;
             Ok(RenderImage {
                 image,
                 memory,
@@ -306,7 +425,8 @@ mod imp {
             scratch_bytes,
             vk::BufferUsageFlags::TRANSFER_SRC
                 | vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::STORAGE_BUFFER,
+                | vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::INDIRECT_BUFFER,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
             "scratch pixels",
         ) {
@@ -324,6 +444,40 @@ mod imp {
                 return ExitCode::FAILURE;
             }
         };
+        let stencil = match RenderImage::new_stencil(&ctx, width, height) {
+            Ok(image) => image,
+            Err(e) => {
+                image.destroy(&ctx);
+                scratch.destroy(&ctx);
+                eprintln!("vulkan stencil image error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let multisample = match RenderImage::new_multisample(&ctx, width, height) {
+            Ok(image) => image,
+            Err(e) => {
+                image.destroy(&ctx);
+                stencil.destroy(&ctx);
+                scratch.destroy(&ctx);
+                eprintln!("vulkan multisample image error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let group = if ctx.raster_order_groups {
+            match RenderImage::new_group(&ctx, width, height) {
+                Ok(image) => Some(image),
+                Err(e) => {
+                    image.destroy(&ctx);
+                    stencil.destroy(&ctx);
+                    multisample.destroy(&ctx);
+                    scratch.destroy(&ctx);
+                    eprintln!("vulkan alpha-group image error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else {
+            None
+        };
         let staging = match GpuBuffer::new(
             &ctx,
             bytes,
@@ -334,21 +488,32 @@ mod imp {
             Ok(b) => b,
             Err(e) => {
                 image.destroy(&ctx);
+                stencil.destroy(&ctx);
+                multisample.destroy(&ctx);
                 scratch.destroy(&ctx);
                 eprintln!("vulkan staging buffer error: {e}");
                 return ExitCode::FAILURE;
             }
         };
-        let mut renderer = match tlottie_vulkan::Renderer::new(&ctx.device) {
+        let mut renderer = match tlottie_vulkan::Renderer::new_with_raster_order_groups(
+            &ctx.device,
+            ctx.raster_order_groups,
+        ) {
             Ok(renderer) => renderer,
             Err(e) => {
                 staging.destroy(&ctx);
                 image.destroy(&ctx);
+                stencil.destroy(&ctx);
+                multisample.destroy(&ctx);
                 scratch.destroy(&ctx);
                 eprintln!("tlottie-vulkan init error: {e}");
                 return ExitCode::FAILURE;
             }
         };
+        if std::env::var("TLOTTIE_VK_MODE").as_deref() == Ok("stencil") {
+            renderer.set_mode(tlottie_vulkan::RendererMode::StencilCover);
+        }
+        renderer.set_multi_draw_indirect(ctx.multi_draw_indirect);
         let sequence_frames = std::env::var("TLOTTIE_VK_FRAMES")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
@@ -367,6 +532,8 @@ mod imp {
                 drop(renderer);
                 staging.destroy(&ctx);
                 image.destroy(&ctx);
+                stencil.destroy(&ctx);
+                multisample.destroy(&ctx);
                 scratch.destroy(&ctx);
                 return ExitCode::FAILURE;
             }
@@ -378,6 +545,9 @@ mod imp {
                 &ctx,
                 &scratch,
                 &image,
+                &stencil,
+                &multisample,
+                group.as_ref(),
                 &staging,
                 &mut renderer,
                 comp,
@@ -408,6 +578,11 @@ mod imp {
         drop(renderer);
         staging.destroy(&ctx);
         image.destroy(&ctx);
+        stencil.destroy(&ctx);
+        multisample.destroy(&ctx);
+        if let Some(group) = &group {
+            group.destroy(&ctx);
+        }
         scratch.destroy(&ctx);
         code
     }
@@ -424,6 +599,9 @@ mod imp {
         ctx: &VkCtx,
         scratch: &GpuBuffer,
         image: &RenderImage,
+        stencil: &RenderImage,
+        multisample: &RenderImage,
+        group: Option<&RenderImage>,
         staging: &GpuBuffer,
         renderer: &mut tlottie_vulkan::Renderer<'_>,
         comp: &Composition,
@@ -479,6 +657,9 @@ mod imp {
             height: image.height,
             layout: image_layout,
             final_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            stencil_image: Some(stencil.image),
+            multisample_image: Some(multisample.image),
+            group_multisample_image: group.map(|image| image.image),
         };
         // SAFETY: command buffer is recording; scratch buffer and image are
         // transfer resources sized for the full target.

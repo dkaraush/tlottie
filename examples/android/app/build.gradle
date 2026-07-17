@@ -1,0 +1,45 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "com.example.tlottie"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.example.tlottie"
+        minSdk 28
+        targetSdk 35
+        versionCode 1
+        versionName "1.0"
+
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    sourceSets.main.jniLibs.srcDirs = ["src/main/jniLibs"]
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+def rustOutput = file("src/main/jniLibs/arm64-v8a/libtlottie_android.so")
+
+tasks.register("buildRust", Exec) {
+    workingDir rootProject.projectDir
+    commandLine "bash", "build-rust.sh"
+    inputs.files(fileTree(rootProject.file("../../crates")) { include "**/*.rs", "**/Cargo.toml", "**/*.wgsl" })
+    inputs.files(fileTree("../native") { include "Cargo.toml", "Cargo.lock", "src/**/*.rs" })
+    outputs.file(rustOutput)
+}
+
+tasks.named("preBuild").configure { dependsOn("buildRust") }

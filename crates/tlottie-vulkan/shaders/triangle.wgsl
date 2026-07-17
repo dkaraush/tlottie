@@ -20,31 +20,62 @@ var<push_constant> push: PushConstants;
 var<storage, read> point_words: array<u32>;
 
 @vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
-    let triangle = vertex_index / 3u;
-    let corner = vertex_index % 3u;
-    var local_point = triangle + corner;
-    if corner == 0u {
-        local_point = 0u;
+fn vs_main(
+    @builtin(vertex_index) vertex_index: u32,
+    @builtin(instance_index) instance_index: u32,
+) -> @builtin(position) vec4<f32> {
+    var point_offset = push.point_offset;
+    var affine0 = push.affine0;
+    var affine1 = push.affine1;
+    if push.padding != 0u {
+        let draw = push.point_offset + instance_index * 12u;
+        point_offset = point_words[draw];
+        affine0 = vec4<f32>(
+            bitcast<f32>(point_words[draw + 6u]),
+            bitcast<f32>(point_words[draw + 7u]),
+            bitcast<f32>(point_words[draw + 8u]),
+            bitcast<f32>(point_words[draw + 9u]),
+        );
+        affine1 = vec2<f32>(
+            bitcast<f32>(point_words[draw + 10u]),
+            bitcast<f32>(point_words[draw + 11u]),
+        );
     }
-    let word = (push.point_offset + local_point) * 2u;
+    let local_point = vertex_index;
+    let word = (point_offset + local_point) * 2u;
     let base = vec2<f32>(
         bitcast<f32>(point_words[word]),
         bitcast<f32>(point_words[word + 1u]),
     );
-    var point = base + push.affine1;
-    if any(push.affine0 != vec4<f32>(1.0, 0.0, 0.0, 1.0)) {
+    var point = base + affine1;
+    if any(affine0 != vec4<f32>(1.0, 0.0, 0.0, 1.0)) {
         point = vec2<f32>(
-            push.affine0.x * base.x + push.affine0.z * base.y + push.affine1.x,
-            push.affine0.y * base.x + push.affine0.w * base.y + push.affine1.y,
+            affine0.x * base.x + affine0.z * base.y + affine1.x,
+            affine0.y * base.x + affine0.w * base.y + affine1.y,
         );
     }
     let ndc = point / push.viewport * 2.0 - vec2<f32>(1.0, 1.0);
     return vec4<f32>(ndc, 0.0, 1.0);
 }
 
+@vertex
+fn vs_cover(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
+    let corners = array<vec2<f32>, 6>(
+        vec2<f32>(push.affine0.x, push.affine0.y),
+        vec2<f32>(push.affine0.z, push.affine0.y),
+        vec2<f32>(push.affine0.x, push.affine0.w),
+        vec2<f32>(push.affine0.x, push.affine0.w),
+        vec2<f32>(push.affine0.z, push.affine0.y),
+        vec2<f32>(push.affine0.z, push.affine0.w),
+    );
+    let ndc = corners[vertex_index] / push.viewport * 2.0 - vec2<f32>(1.0, 1.0);
+    return vec4<f32>(ndc, 0.0, 1.0);
+}
+
 @fragment
-fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+fn fs_stencil() {}
+
+fn paint_color(position: vec4<f32>) -> vec4<f32> {
     var argb = push.argb;
     if push.paint_kind == 1u {
         let local = vec2<f32>(
@@ -86,4 +117,14 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         f32(argb & 255u) * scale,
         f32((argb >> 24u) & 255u) * scale,
     );
+}
+
+@fragment
+fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    return paint_color(position);
+}
+
+@fragment
+fn fs_group(@builtin(position) position: vec4<f32>) -> @location(1) vec4<f32> {
+    return paint_color(position);
 }

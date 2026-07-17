@@ -88,6 +88,12 @@ pub struct ImageTarget {
     pub layout: vk::ImageLayout,
     /// Layout required when recording ends.
     pub final_layout: vk::ImageLayout,
+    /// Optional S8 image used by the stencil-and-cover profiling path.
+    pub stencil_image: Option<vk::Image>,
+    /// Optional multisampled BGRA color attachment resolved into `image`.
+    pub multisample_image: Option<vk::Image>,
+    /// Optional multisampled tile-local accumulator for isolated alpha groups.
+    pub group_multisample_image: Option<vk::Image>,
 }
 
 /// Timestamp query slots written while recording the compute renderer.
@@ -118,11 +124,17 @@ pub struct Renderer<'a> {
     descriptor_set: vk::DescriptorSet,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    stencil_nonzero_pipeline: vk::Pipeline,
+    stencil_evenodd_pipeline: vk::Pipeline,
+    group_pipeline: vk::Pipeline,
+    group_composite_pipeline: vk::Pipeline,
+    group_sampler: vk::Sampler,
+    raster_order_groups: bool,
     bin_pipeline: vk::Pipeline,
     compute_pipeline: vk::Pipeline,
     simple_compute_pipeline: vk::Pipeline,
-    target_views: Vec<vk::ImageView>,
-    framebuffers: Vec<vk::Framebuffer>,
+    target_framebuffers: Vec<TargetFramebuffer>,
+    multi_draw_indirect: bool,
     mode: RendererMode,
     scene_layout: SceneLayout,
     uploaded_scene: UploadedScene,
@@ -137,6 +149,8 @@ pub enum RendererMode {
     Compute,
     /// Direct triangle decomposition for profiling simple convex content.
     Triangles,
+    /// Hardware stencil winding followed by one paint cover draw.
+    StencilCover,
 }
 
 /// Geometry reuse statistics for the most recently prepared frame.
@@ -182,6 +196,8 @@ pub struct CacheStats {
     pub reused_bins: bool,
     /// Whether the most recent frame used the stack-free compute shader.
     pub simple_compute: bool,
+    /// Whether the most recent frame used hardware stencil winding and cover draws.
+    pub stencil_cover: bool,
 }
 
 impl<'a> Renderer<'a> {
@@ -190,7 +206,17 @@ impl<'a> Renderer<'a> {
     /// The renderer owns pipelines, descriptor state, CPU geometry allocation,
     /// and retained upload plans. Vulkan buffers and images remain host-owned.
     pub fn new(device: &'a ash::Device) -> Result<Renderer<'a>> {
-        let resources = create_triangle_pipeline(device)?;
+        Self::new_with_raster_order_groups(device, false)
+    }
+
+    /// Initializes the renderer with ordered tile-local alpha-group blending.
+    /// The host must enable rasterization-order color attachment access and
+    /// sample-rate shading on the Vulkan device before selecting this path.
+    pub fn new_with_raster_order_groups(
+        device: &'a ash::Device,
+        enabled: bool,
+    ) -> Result<Renderer<'a>> {
+        let resources = create_triangle_pipeline(device, enabled)?;
         let bin_pipeline = match create_bin_pipeline(device, resources.pipeline_layout) {
             Ok(pipeline) => pipeline,
             Err(error) => {
@@ -247,11 +273,17 @@ impl<'a> Renderer<'a> {
             descriptor_set: resources.descriptor_set,
             pipeline_layout: resources.pipeline_layout,
             pipeline: resources.pipeline,
+            stencil_nonzero_pipeline: resources.stencil_nonzero_pipeline,
+            stencil_evenodd_pipeline: resources.stencil_evenodd_pipeline,
+            group_pipeline: resources.group_pipeline,
+            group_composite_pipeline: resources.group_composite_pipeline,
+            group_sampler: resources.group_sampler,
+            raster_order_groups: enabled,
             bin_pipeline,
             compute_pipeline,
             simple_compute_pipeline,
-            target_views: Vec::new(),
-            framebuffers: Vec::new(),
+            target_framebuffers: Vec::new(),
+            multi_draw_indirect: false,
             mode: RendererMode::default(),
             scene_layout: SceneLayout::default(),
             uploaded_scene: UploadedScene::default(),
@@ -267,6 +299,88 @@ impl<'a> Renderer<'a> {
     /// Selects the GPU rasterization path for subsequent recordings.
     pub fn set_mode(&mut self, mode: RendererMode) {
         self.mode = mode;
+    }
+
+    /// Enables multi-draw indirect submission for stencil contours.
+    ///
+    /// The host must enable both `multiDrawIndirect` and
+    /// `drawIndirectFirstInstance` when creating the Vulkan device.
+    pub fn set_multi_draw_indirect(&mut self, enabled: bool) {
+        self.multi_draw_indirect = enabled;
+    }
+
+    fn target_framebuffer(
+        &mut self,
+        target: ImageTarget,
+    ) -> Result<(vk::Framebuffer, vk::Framebuffer, Option<vk::ImageView>)> {
+        let multisample_image = if self.raster_order_groups {
+            vk::Image::null()
+        } else {
+            target.multisample_image.ok_or(Error::BadTarget)?
+        };
+        let stencil_image = target.stencil_image.ok_or(Error::BadTarget)?;
+        let group_image = target.group_multisample_image.unwrap_or(vk::Image::null());
+        if self.raster_order_groups && group_image == vk::Image::null() {
+            return Err(Error::BadTarget);
+        }
+        if let Some(cached) = self.target_framebuffers.iter().find(|cached| {
+            cached.resolve_image == target.image
+                && cached.multisample_image == multisample_image
+                && cached.stencil_image == stencil_image
+                && cached.group_image == group_image
+                && cached.width == target.width
+                && cached.height == target.height
+        }) {
+            return Ok((
+                cached.framebuffer,
+                cached.group_framebuffer,
+                if self.raster_order_groups {
+                    cached.views.get(2).copied()
+                } else {
+                    None
+                },
+            ));
+        }
+        let (views, framebuffer, group_framebuffer) = if self.raster_order_groups {
+            create_raster_order_group_framebuffer(
+                self.device,
+                self.render_pass,
+                target.image,
+                stencil_image,
+                group_image,
+                target.width,
+                target.height,
+            )?
+        } else {
+            let (views, framebuffer) = create_target_framebuffer(
+                self.device,
+                self.render_pass,
+                target.image,
+                multisample_image,
+                stencil_image,
+                None,
+                target.width,
+                target.height,
+            )?;
+            (views, framebuffer, vk::Framebuffer::null())
+        };
+        let group_view = if self.raster_order_groups {
+            views.get(2).copied()
+        } else {
+            None
+        };
+        self.target_framebuffers.push(TargetFramebuffer {
+            resolve_image: target.image,
+            multisample_image,
+            stencil_image,
+            group_image,
+            width: target.width,
+            height: target.height,
+            views,
+            framebuffer,
+            group_framebuffer,
+        });
+        Ok((framebuffer, group_framebuffer, group_view))
     }
 
     /// Records a simple ARGB32 rectangle draw into a host-owned buffer.
@@ -416,13 +530,43 @@ impl<'a> Renderer<'a> {
             tlottie_internal::walk_frame(composition, frame, target.width, target.height, options)?;
         let prepared = self.geometry.prepare(&walked)?;
         self.cache_stats = prepared.stats;
+        let mut group_depth = 0u32;
+        let stencil_compatible = prepared.paints.iter().all(|paint| match paint.paint_kind {
+            0 | 1 => true,
+            2 if self.raster_order_groups && group_depth == 0 => {
+                group_depth = 1;
+                true
+            }
+            3 if self.raster_order_groups && group_depth == 1 => {
+                group_depth = 0;
+                true
+            }
+            _ => false,
+        }) && group_depth == 0;
         // SAFETY: forwarded from this method's caller contract.
         unsafe {
             match self.mode {
                 RendererMode::Compute => {
                     self.record_compute(cmd, scratch, target, &prepared, options.antialias, profile)
                 }
-                RendererMode::Triangles => self.record_triangles(cmd, scratch, target, &prepared),
+                RendererMode::Triangles => {
+                    self.record_triangles(cmd, scratch, target, &prepared, profile)
+                }
+                RendererMode::StencilCover => {
+                    if stencil_compatible {
+                        self.cache_stats.stencil_cover = true;
+                        self.record_triangles(cmd, scratch, target, &prepared, profile)
+                    } else {
+                        self.record_compute(
+                            cmd,
+                            scratch,
+                            target,
+                            &prepared,
+                            options.antialias,
+                            profile,
+                        )
+                    }
+                }
             }
         }
     }
@@ -734,18 +878,56 @@ impl<'a> Renderer<'a> {
         scratch: BufferTarget,
         target: ImageTarget,
         prepared: &PreparedGeometry,
+        profile: Option<ProfileQueries>,
     ) -> Result<()> {
+        if prepared
+            .paints
+            .iter()
+            .any(|paint| paint.paint_kind >= 4 || (paint.paint_kind >= 2 && !self.raster_order_groups))
+        {
+            return Err(Error::BadTarget);
+        }
         let points = &self.geometry.arena.points;
         let point_bytes = point_payload_bytes(points);
         let gradient_bytes = std::mem::size_of_val(prepared.gradient_luts.as_slice());
-        let upload_bytes = point_bytes
+        let use_indirect = self.multi_draw_indirect
+            && prepared
+                .draw_data
+                .windows(2)
+                .any(|draws| draws[0].paint_index == draws[1].paint_index);
+        let draw_bytes = if use_indirect {
+            std::mem::size_of_val(prepared.draw_data.as_slice())
+        } else {
+            0
+        };
+        let indirect_bytes = if use_indirect {
+            std::mem::size_of_val(prepared.fan_indirect.as_slice())
+        } else {
+            0
+        };
+        let gradient_offset = point_bytes;
+        let draw_offset = gradient_offset
             .checked_add(gradient_bytes)
             .ok_or(Error::FrameTooLarge)?;
-        let scratch_bytes = (scratch.width as usize)
-            .checked_mul(scratch.height as usize)
-            .and_then(|pixels| pixels.checked_mul(4))
+        let indirect_offset = draw_offset
+            .checked_add(draw_bytes)
             .ok_or(Error::FrameTooLarge)?;
-        if upload_bytes > scratch_bytes {
+        let upload_bytes = point_bytes
+            .checked_add(gradient_bytes)
+            .and_then(|bytes| bytes.checked_add(draw_bytes))
+            .and_then(|bytes| bytes.checked_add(indirect_bytes))
+            .ok_or(Error::FrameTooLarge)?;
+        self.cache_stats.scene_upload_bytes = upload_bytes as u64;
+        self.cache_stats.scene_upload_ranges = u32::from(point_bytes != 0)
+            .saturating_add(u32::from(gradient_bytes != 0))
+            .saturating_add(u32::from(draw_bytes != 0))
+            .saturating_add(u32::from(indirect_bytes != 0));
+        self.cache_stats.geometry_upload_bytes = point_bytes
+            .saturating_add(draw_bytes)
+            .saturating_add(indirect_bytes) as u64;
+        self.cache_stats.paint_upload_bytes = gradient_bytes as u64;
+        self.cache_stats.bin_upload_bytes = 0;
+        if upload_bytes as vk::DeviceSize > scratch.bytes {
             return Err(Error::FrameTooLarge);
         }
         // SAFETY: GpuPoint is repr(C), contains two initialized f32 values, and
@@ -775,21 +957,41 @@ impl<'a> Renderer<'a> {
                 self.device,
                 cmd,
                 scratch.buffer,
-                point_bytes as vk::DeviceSize,
+                gradient_offset as vk::DeviceSize,
                 gradient_luts,
                 vk::AccessFlags::SHADER_READ,
                 vk::PipelineStageFlags::FRAGMENT_SHADER,
             )?;
         }
-        let (view, framebuffer) = create_target_framebuffer(
-            self.device,
-            self.render_pass,
-            target.image,
-            target.width,
-            target.height,
-        )?;
-        self.target_views.push(view);
-        self.framebuffers.push(framebuffer);
+        let draw_data = unsafe {
+            std::slice::from_raw_parts(prepared.draw_data.as_ptr().cast::<u8>(), draw_bytes)
+        };
+        unsafe {
+            cmd_upload_buffer_bytes(
+                self.device,
+                cmd,
+                scratch.buffer,
+                draw_offset as vk::DeviceSize,
+                draw_data,
+                vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::VERTEX_SHADER,
+            )?;
+        }
+        let indirect = unsafe {
+            std::slice::from_raw_parts(prepared.fan_indirect.as_ptr().cast::<u8>(), indirect_bytes)
+        };
+        unsafe {
+            cmd_upload_buffer_bytes(
+                self.device,
+                cmd,
+                scratch.buffer,
+                indirect_offset as vk::DeviceSize,
+                indirect,
+                vk::AccessFlags::INDIRECT_COMMAND_READ,
+                vk::PipelineStageFlags::DRAW_INDIRECT,
+            )?;
+        }
+        let (framebuffer, group_framebuffer, group_view) = self.target_framebuffer(target)?;
 
         let point_buffer = vk::DescriptorBufferInfo::builder()
             .buffer(scratch.buffer)
@@ -802,16 +1004,130 @@ impl<'a> Renderer<'a> {
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(std::slice::from_ref(&point_buffer))
             .build();
+        let group_descriptor = group_view.map(|view| {
+            vk::DescriptorImageInfo::builder()
+                .sampler(self.group_sampler)
+                .image_view(view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .build()
+        });
+        let group_write = group_descriptor.as_ref().map(|descriptor| {
+            vk::WriteDescriptorSet::builder()
+                .dst_set(self.descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(descriptor))
+                .build()
+        });
+        let mut descriptor_writes = vec![descriptor_write];
+        if let Some(write) = group_write {
+            descriptor_writes.push(write);
+        }
         // SAFETY: descriptor set and buffer belong to this device.
         unsafe {
-            self.device.update_descriptor_sets(&[descriptor_write], &[]);
+            self.device.update_descriptor_sets(&descriptor_writes, &[]);
+            if let Some(profile) = profile {
+                for query in 1..=4 {
+                    self.device.cmd_write_timestamp(
+                        cmd,
+                        vk::PipelineStageFlags::ALL_GRAPHICS,
+                        profile.pool,
+                        profile.first + query,
+                    );
+                }
+            }
         }
 
-        let clear = [vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [0.0, 0.0, 0.0, 0.0],
+        if self.raster_order_groups {
+            let range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            let (src_stage, src_access) = match target.layout {
+                vk::ImageLayout::UNDEFINED => (
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::AccessFlags::empty(),
+                ),
+                vk::ImageLayout::PRESENT_SRC_KHR => (
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::AccessFlags::MEMORY_READ,
+                ),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL => (
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::AccessFlags::TRANSFER_READ,
+                ),
+                _ => return Err(Error::BadTarget),
+            };
+            let to_clear = vk::ImageMemoryBarrier::builder()
+                .src_access_mask(src_access)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(target.layout)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .image(target.image)
+                .subresource_range(range)
+                .build();
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    src_stage,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_clear],
+                );
+                self.device.cmd_clear_color_image(
+                    cmd,
+                    target.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue { float32: [0.0; 4] },
+                    &[range],
+                );
+                let to_color = vk::ImageMemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .image(target.image)
+                    .subresource_range(range)
+                    .build();
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_color],
+                );
+            }
+        }
+
+        let clear = vec![
+            vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 0.0],
+                },
             },
-        }];
+            vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 0.0,
+                    stencil: 0,
+                },
+            },
+        ];
+        let clear = if self.raster_order_groups {
+            clear
+        } else {
+            let mut clear = clear;
+            clear.push(vk::ClearValue {
+                color: vk::ClearColorValue { float32: [0.0; 4] },
+            });
+            clear
+        };
         let begin = vk::RenderPassBeginInfo::builder()
             .render_pass(self.render_pass)
             .framebuffer(framebuffer)
@@ -828,8 +1144,6 @@ impl<'a> Renderer<'a> {
         unsafe {
             self.device
                 .cmd_begin_render_pass(cmd, &begin, vk::SubpassContents::INLINE);
-            self.device
-                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
             self.device.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -863,18 +1177,275 @@ impl<'a> Renderer<'a> {
             );
         }
 
-        for draw in &prepared.draw_data {
-            if draw.point_count < 3 {
+        let lut_word_base = u32::try_from(point_bytes / 4).map_err(|_| Error::FrameTooLarge)?;
+        let draw_word_base = u32::try_from(draw_offset / 4).map_err(|_| Error::FrameTooLarge)?;
+        let indirect_stride = u32::try_from(std::mem::size_of::<vk::DrawIndirectCommand>())
+            .map_err(|_| Error::FrameTooLarge)?;
+        let mut draw_cursor = 0usize;
+        let mut in_group = false;
+        for (paint_index, paint) in prepared.paints.iter().enumerate() {
+            let draw_start = draw_cursor;
+            while prepared
+                .draw_data
+                .get(draw_cursor)
+                .is_some_and(|draw| draw.paint_index as usize == paint_index)
+            {
+                draw_cursor += 1;
+            }
+            let draw_count = draw_cursor.saturating_sub(draw_start);
+            if paint.paint_kind == 2 {
+                let group_image = target.group_multisample_image.ok_or(Error::BadTarget)?;
+                let range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                unsafe {
+                    self.device.cmd_end_render_pass(cmd);
+                    let to_clear = vk::ImageMemoryBarrier::builder()
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .image(group_image)
+                        .subresource_range(range)
+                        .build();
+                    self.device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_clear],
+                    );
+                    self.device.cmd_clear_color_image(
+                        cmd,
+                        group_image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &vk::ClearColorValue { float32: [0.0; 4] },
+                        &[range],
+                    );
+                    let to_color = vk::ImageMemoryBarrier::builder()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .image(group_image)
+                        .subresource_range(range)
+                        .build();
+                    self.device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_color],
+                    );
+                    let group_begin = vk::RenderPassBeginInfo::builder()
+                        .render_pass(self.render_pass)
+                        .framebuffer(group_framebuffer)
+                        .render_area(vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: vk::Extent2D { width: target.width, height: target.height },
+                        })
+                        .clear_values(&clear);
+                    self.device.cmd_begin_render_pass(
+                        cmd,
+                        &group_begin,
+                        vk::SubpassContents::INLINE,
+                    );
+                }
+                in_group = true;
                 continue;
             }
-            let Some(paint) = prepared.paints.get(draw.paint_index as usize) else {
+            if paint.paint_kind == 3 {
+                let group_image = target.group_multisample_image.ok_or(Error::BadTarget)?;
+                let range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                unsafe {
+                    self.device.cmd_end_render_pass(cmd);
+                    let to_sample = vk::ImageMemoryBarrier::builder()
+                        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .image(group_image)
+                        .subresource_range(range)
+                        .build();
+                    self.device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_sample],
+                    );
+                    self.device.cmd_begin_render_pass(
+                        cmd,
+                        &begin,
+                        vk::SubpassContents::INLINE,
+                    );
+                }
+                let composite = TrianglePush {
+                    viewport: [target.width as f32, target.height as f32],
+                    argb: paint.argb,
+                    point_offset: 0,
+                    paint_kind: paint.paint_kind,
+                    gradient_kind: 0,
+                    lut_word_offset: 0,
+                    padding: 0,
+                    inverse0: [0.0; 4],
+                    inverse1: [0.0; 4],
+                    params0: [0.0; 4],
+                    params1: [0.0; 4],
+                    affine0: [0.0, 0.0, target.width as f32, target.height as f32],
+                    affine1: [0.0; 2],
+                };
+                let composite_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        (&composite as *const TrianglePush).cast::<u8>(),
+                        std::mem::size_of::<TrianglePush>(),
+                    )
+                };
+                unsafe {
+                    self.device.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.group_composite_pipeline,
+                    );
+                    self.device.cmd_push_constants(
+                        cmd,
+                        self.pipeline_layout,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        composite_bytes,
+                    );
+                    self.device.cmd_draw(cmd, 6, 1, 0, 0);
+                }
+                in_group = false;
                 continue;
+            }
+            let winding_pipeline = if paint.rule == 0 {
+                self.stencil_nonzero_pipeline
+            } else {
+                self.stencil_evenodd_pipeline
             };
-            let lut_word_base = u32::try_from(point_bytes / 4).map_err(|_| Error::FrameTooLarge)?;
-            let push = TrianglePush {
+            if use_indirect && draw_count > 1 {
+                let stencil = TrianglePush {
+                    viewport: [target.width as f32, target.height as f32],
+                    argb: paint.argb,
+                    point_offset: draw_word_base,
+                    paint_kind: paint.paint_kind,
+                    gradient_kind: paint.gradient_kind,
+                    lut_word_offset: lut_word_base
+                        .checked_add(paint.lut_word_offset)
+                        .ok_or(Error::FrameTooLarge)?,
+                    padding: 1,
+                    inverse0: paint.inverse0,
+                    inverse1: paint.inverse1,
+                    params0: paint.params0,
+                    params1: paint.params1,
+                    affine0: [0.0; 4],
+                    affine1: [0.0; 2],
+                };
+                let stencil_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        (&stencil as *const TrianglePush).cast::<u8>(),
+                        std::mem::size_of::<TrianglePush>(),
+                    )
+                };
+                unsafe {
+                    self.device.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        winding_pipeline,
+                    );
+                    self.device.cmd_push_constants(
+                        cmd,
+                        self.pipeline_layout,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        stencil_bytes,
+                    );
+                    let byte_offset = indirect_offset
+                        .checked_add(
+                            draw_start
+                                .checked_mul(indirect_stride as usize)
+                                .ok_or(Error::FrameTooLarge)?,
+                        )
+                        .ok_or(Error::FrameTooLarge)?;
+                    self.device.cmd_draw_indirect(
+                        cmd,
+                        scratch.buffer,
+                        byte_offset as vk::DeviceSize,
+                        u32::try_from(draw_count).map_err(|_| Error::FrameTooLarge)?,
+                        indirect_stride,
+                    );
+                }
+            } else {
+                unsafe {
+                    self.device.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        winding_pipeline,
+                    );
+                }
+                for draw in &prepared.draw_data[draw_start..draw_cursor] {
+                    let stencil = TrianglePush {
+                        viewport: [target.width as f32, target.height as f32],
+                        argb: paint.argb,
+                        point_offset: draw.point_offset,
+                        paint_kind: paint.paint_kind,
+                        gradient_kind: paint.gradient_kind,
+                        lut_word_offset: lut_word_base
+                            .checked_add(paint.lut_word_offset)
+                            .ok_or(Error::FrameTooLarge)?,
+                        padding: 0,
+                        inverse0: paint.inverse0,
+                        inverse1: paint.inverse1,
+                        params0: paint.params0,
+                        params1: paint.params1,
+                        affine0: [
+                            draw.transform[0],
+                            draw.transform[1],
+                            draw.transform[2],
+                            draw.transform[3],
+                        ],
+                        affine1: [draw.transform[4], draw.transform[5]],
+                    };
+                    let stencil_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            (&stencil as *const TrianglePush).cast::<u8>(),
+                            std::mem::size_of::<TrianglePush>(),
+                        )
+                    };
+                    unsafe {
+                        self.device.cmd_push_constants(
+                            cmd,
+                            self.pipeline_layout,
+                            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            stencil_bytes,
+                        );
+                        self.device.cmd_draw(cmd, draw.point_count, 1, 0, 0);
+                    }
+                }
+            }
+
+            let cover = TrianglePush {
                 viewport: [target.width as f32, target.height as f32],
                 argb: paint.argb,
-                point_offset: draw.point_offset,
+                point_offset: 0,
                 paint_kind: paint.paint_kind,
                 gradient_kind: paint.gradient_kind,
                 lut_word_offset: lut_word_base
@@ -885,36 +1456,80 @@ impl<'a> Renderer<'a> {
                 inverse1: paint.inverse1,
                 params0: paint.params0,
                 params1: paint.params1,
-                affine0: [
-                    draw.transform[0],
-                    draw.transform[1],
-                    draw.transform[2],
-                    draw.transform[3],
-                ],
-                affine1: [draw.transform[4], draw.transform[5]],
+                affine0: paint.bounds,
+                affine1: [0.0; 2],
             };
-            // SAFETY: TrianglePush is repr(C) and fully initialized.
-            let push_bytes = unsafe {
+            let cover_bytes = unsafe {
                 std::slice::from_raw_parts(
-                    (&push as *const TrianglePush).cast::<u8>(),
+                    (&cover as *const TrianglePush).cast::<u8>(),
                     std::mem::size_of::<TrianglePush>(),
                 )
             };
-            // SAFETY: push range matches the pipeline layout; point ranges
-            // were validated while preparing the arena.
             unsafe {
+                self.device
+                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
                 self.device.cmd_push_constants(
                     cmd,
                     self.pipeline_layout,
                     vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                     0,
-                    push_bytes,
+                    cover_bytes,
                 );
-                self.device.cmd_draw(cmd, draw.vertex_count, 1, 0, 0);
+                self.device.cmd_draw(cmd, 6, 1, 0, 0);
             }
         }
         // SAFETY: a render pass is active on this command buffer.
         unsafe { self.device.cmd_end_render_pass(cmd) };
+        if target.final_layout != vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL {
+            let (dst_stage, dst_access) = match target.final_layout {
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL => (
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::AccessFlags::TRANSFER_READ,
+                ),
+                vk::ImageLayout::PRESENT_SRC_KHR => (
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::AccessFlags::empty(),
+                ),
+                _ => return Err(Error::BadTarget),
+            };
+            let barrier = vk::ImageMemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(dst_access)
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(target.final_layout)
+                .image(target.image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .build();
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    dst_stage,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+            }
+        }
+        if let Some(profile) = profile {
+            unsafe {
+                for query in 5..=6 {
+                    self.device.cmd_write_timestamp(
+                        cmd,
+                        vk::PipelineStageFlags::ALL_GRAPHICS,
+                        profile.pool,
+                        profile.first + query,
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -924,13 +1539,23 @@ impl Drop for Renderer<'_> {
         // SAFETY: callers must keep renderer resources alive until recorded
         // commands complete. Renderer owns every handle destroyed here.
         unsafe {
-            for framebuffer in self.framebuffers.drain(..) {
-                self.device.destroy_framebuffer(framebuffer, None);
-            }
-            for view in self.target_views.drain(..) {
-                self.device.destroy_image_view(view, None);
+            for target in self.target_framebuffers.drain(..) {
+                self.device.destroy_framebuffer(target.framebuffer, None);
+                self.device
+                    .destroy_framebuffer(target.group_framebuffer, None);
+                for view in target.views {
+                    self.device.destroy_image_view(view, None);
+                }
             }
             self.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .destroy_pipeline(self.stencil_nonzero_pipeline, None);
+            self.device
+                .destroy_pipeline(self.stencil_evenodd_pipeline, None);
+            self.device.destroy_pipeline(self.group_pipeline, None);
+            self.device
+                .destroy_pipeline(self.group_composite_pipeline, None);
+            self.device.destroy_sampler(self.group_sampler, None);
             self.device.destroy_pipeline(self.bin_pipeline, None);
             self.device.destroy_pipeline(self.compute_pipeline, None);
             self.device
@@ -992,50 +1617,245 @@ struct TrianglePipeline {
     descriptor_set: vk::DescriptorSet,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    stencil_nonzero_pipeline: vk::Pipeline,
+    stencil_evenodd_pipeline: vk::Pipeline,
+    group_pipeline: vk::Pipeline,
+    group_composite_pipeline: vk::Pipeline,
+    group_sampler: vk::Sampler,
 }
 
-fn create_triangle_pipeline(device: &ash::Device) -> Result<TrianglePipeline> {
-    let attachment = vk::AttachmentDescription::builder()
+struct TargetFramebuffer {
+    resolve_image: vk::Image,
+    multisample_image: vk::Image,
+    stencil_image: vk::Image,
+    group_image: vk::Image,
+    width: u32,
+    height: u32,
+    views: Vec<vk::ImageView>,
+    framebuffer: vk::Framebuffer,
+    group_framebuffer: vk::Framebuffer,
+}
+
+fn create_raster_order_group_render_pass(device: &ash::Device) -> Result<vk::RenderPass> {
+    let color = vk::AttachmentDescription2::builder()
         .format(vk::Format::B8G8R8A8_UNORM)
         .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::LOAD)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .build();
+    let stencil = vk::AttachmentDescription2::builder()
+        .format(vk::Format::S8_UINT)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .stencil_load_op(vk::AttachmentLoadOp::CLEAR)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        .build();
+    let main_ref = vk::AttachmentReference2::builder()
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .build();
+    let stencil_ref = vk::AttachmentReference2::builder()
+        .attachment(1)
+        .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        .aspect_mask(vk::ImageAspectFlags::STENCIL)
+        .build();
+    let mut multisampled = vk::MultisampledRenderToSingleSampledInfoEXT::builder()
+        .multisampled_render_to_single_sampled_enable(true)
+        .rasterization_samples(STENCIL_SAMPLE_COUNT);
+    let subpass = vk::SubpassDescription2::builder()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(std::slice::from_ref(&main_ref))
+        .depth_stencil_attachment(&stencil_ref)
+        .push_next(&mut multisampled)
+        .build();
+    let dependency = vk::SubpassDependency2::builder()
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        .dst_subpass(0)
+        .src_stage_mask(vk::PipelineStageFlags::TOP_OF_PIPE)
+        .dst_stage_mask(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+        )
+        .dst_access_mask(
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        )
+        .build();
+    let attachments = [color, stencil];
+    let info = vk::RenderPassCreateInfo2::builder()
+        .attachments(&attachments)
+        .subpasses(std::slice::from_ref(&subpass))
+        .dependencies(std::slice::from_ref(&dependency));
+    unsafe { device.create_render_pass2(&info, None) }
+        .map_err(|e| Error::Vulkan("vkCreateRenderPass2(alpha groups)", e))
+}
+
+fn create_triangle_pipeline(
+    device: &ash::Device,
+    raster_order_groups: bool,
+) -> Result<TrianglePipeline> {
+    let group_sampler = if raster_order_groups {
+        let info = vk::SamplerCreateInfo::builder()
+            .mag_filter(vk::Filter::NEAREST)
+            .min_filter(vk::Filter::NEAREST)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        unsafe { device.create_sampler(&info, None) }
+            .map_err(|e| Error::Vulkan("vkCreateSampler(alpha groups)", e))?
+    } else {
+        vk::Sampler::null()
+    };
+    let color_attachment = vk::AttachmentDescription::builder()
+        .format(vk::Format::B8G8R8A8_UNORM)
+        .samples(STENCIL_SAMPLE_COUNT)
         .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .build();
+    let stencil_attachment = vk::AttachmentDescription::builder()
+        .format(vk::Format::S8_UINT)
+        .samples(STENCIL_SAMPLE_COUNT)
+        .load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .stencil_load_op(vk::AttachmentLoadOp::CLEAR)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        .build();
+    let resolve_attachment = vk::AttachmentDescription::builder()
+        .format(vk::Format::B8G8R8A8_UNORM)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::DONT_CARE)
         .store_op(vk::AttachmentStoreOp::STORE)
         .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
-        .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .build();
+    let group_attachment = vk::AttachmentDescription::builder()
+        .format(vk::Format::B8G8R8A8_UNORM)
+        .samples(STENCIL_SAMPLE_COUNT)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::GENERAL)
         .build();
     let color_ref = vk::AttachmentReference {
         attachment: 0,
         layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
     };
-    let subpass = vk::SubpassDescription::builder()
+    let stencil_ref = vk::AttachmentReference {
+        attachment: 1,
+        layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    };
+    let resolve_ref = vk::AttachmentReference {
+        attachment: 2,
+        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+    };
+    let group_ref = vk::AttachmentReference {
+        attachment: 3,
+        layout: vk::ImageLayout::GENERAL,
+    };
+    let unused_ref = vk::AttachmentReference {
+        attachment: vk::ATTACHMENT_UNUSED,
+        layout: vk::ImageLayout::UNDEFINED,
+    };
+    let color_refs = [color_ref, group_ref];
+    let resolve_refs = [resolve_ref, unused_ref];
+    let mut subpass_builder = vk::SubpassDescription::builder()
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(std::slice::from_ref(&color_ref))
-        .build();
+        .depth_stencil_attachment(&stencil_ref);
+    if raster_order_groups {
+        subpass_builder = subpass_builder
+            .flags(vk::SubpassDescriptionFlags::RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_ARM)
+            .color_attachments(&color_refs)
+            .resolve_attachments(&resolve_refs)
+            .input_attachments(std::slice::from_ref(&group_ref));
+    } else {
+        subpass_builder = subpass_builder
+            .color_attachments(std::slice::from_ref(&color_ref))
+            .resolve_attachments(std::slice::from_ref(&resolve_ref));
+    }
+    let subpass = subpass_builder.build();
     let dependency = vk::SubpassDependency::builder()
         .src_subpass(vk::SUBPASS_EXTERNAL)
         .dst_subpass(0)
         .src_stage_mask(vk::PipelineStageFlags::TOP_OF_PIPE)
-        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+        .dst_stage_mask(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+        )
+        .dst_access_mask(
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        )
         .build();
+    let self_dependency = vk::SubpassDependency::builder()
+        .src_subpass(0)
+        .dst_subpass(0)
+        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+        .dst_access_mask(vk::AccessFlags::INPUT_ATTACHMENT_READ)
+        .dependency_flags(vk::DependencyFlags::BY_REGION)
+        .build();
+    let dependencies = if raster_order_groups {
+        vec![dependency, self_dependency]
+    } else {
+        vec![dependency]
+    };
+    let mut attachments = vec![color_attachment, stencil_attachment, resolve_attachment];
+    if raster_order_groups {
+        attachments.push(group_attachment);
+    }
     let render_pass_info = vk::RenderPassCreateInfo::builder()
-        .attachments(std::slice::from_ref(&attachment))
+        .attachments(&attachments)
         .subpasses(std::slice::from_ref(&subpass))
-        .dependencies(std::slice::from_ref(&dependency));
+        .dependencies(&dependencies);
     // SAFETY: create info references live stack data for this call.
-    let render_pass = unsafe { device.create_render_pass(&render_pass_info, None) }
+    let mut render_pass = unsafe { device.create_render_pass(&render_pass_info, None) }
         .map_err(|e| Error::Vulkan("vkCreateRenderPass", e))?;
+    if raster_order_groups {
+        unsafe { device.destroy_render_pass(render_pass, None) };
+        render_pass = create_raster_order_group_render_pass(device)?;
+    }
 
     let descriptor_binding = vk::DescriptorSetLayoutBinding::builder()
         .binding(0)
         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
         .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::COMPUTE)
+        .stage_flags(
+            vk::ShaderStageFlags::VERTEX
+                | vk::ShaderStageFlags::FRAGMENT
+                | vk::ShaderStageFlags::COMPUTE,
+        )
         .build();
+    let group_binding = vk::DescriptorSetLayoutBinding::builder()
+        .binding(1)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        .build();
+    let mut descriptor_bindings = vec![descriptor_binding];
+    if raster_order_groups {
+        descriptor_bindings.push(group_binding);
+    }
     let descriptor_layout_info = vk::DescriptorSetLayoutCreateInfo::builder()
-        .bindings(std::slice::from_ref(&descriptor_binding));
+        .bindings(&descriptor_bindings);
     // SAFETY: create info references live stack data for this call.
     let descriptor_set_layout =
         match unsafe { device.create_descriptor_set_layout(&descriptor_layout_info, None) } {
@@ -1075,37 +1895,33 @@ fn create_triangle_pipeline(device: &ash::Device) -> Result<TrianglePipeline> {
     let vertex = create_shader_module(
         device,
         include_bytes!(concat!(env!("OUT_DIR"), "/triangle.vert.spv")),
-    );
+    )?;
+    let cover_vertex = create_shader_module(
+        device,
+        include_bytes!(concat!(env!("OUT_DIR"), "/cover.vert.spv")),
+    )?;
     let fragment = create_shader_module(
         device,
         include_bytes!(concat!(env!("OUT_DIR"), "/triangle.frag.spv")),
-    );
-    let (vertex, fragment) = match (vertex, fragment) {
-        (Ok(vertex), Ok(fragment)) => (vertex, fragment),
-        (vertex, fragment) => {
-            if let Ok(module) = vertex {
-                // SAFETY: module belongs to this device and is unused.
-                unsafe { device.destroy_shader_module(module, None) };
-            }
-            if let Ok(module) = fragment {
-                // SAFETY: module belongs to this device and is unused.
-                unsafe { device.destroy_shader_module(module, None) };
-            }
-            // SAFETY: resources belong to this device and are unused.
-            unsafe {
-                device.destroy_pipeline_layout(pipeline_layout, None);
-                device.destroy_descriptor_set_layout(descriptor_set_layout, None);
-                device.destroy_render_pass(render_pass, None);
-            }
-            return Err(Error::FrameTooLarge);
-        }
-    };
+    )?;
+    let group_fragment = create_shader_module(
+        device,
+        include_bytes!(concat!(env!("OUT_DIR"), "/group.frag.spv")),
+    )?;
+    let group_composite_fragment = create_shader_module(
+        device,
+        include_bytes!("../shaders/group-composite.frag.spv"),
+    )?;
+    let stencil_fragment = create_shader_module(
+        device,
+        include_bytes!(concat!(env!("OUT_DIR"), "/stencil.frag.spv")),
+    )?;
 
-    let stages = [
+    let cover_stages = [
         vk::PipelineShaderStageCreateInfo::builder()
             .stage(vk::ShaderStageFlags::VERTEX)
-            .module(vertex)
-            .name(c"vs_main")
+            .module(cover_vertex)
+            .name(c"vs_cover")
             .build(),
         vk::PipelineShaderStageCreateInfo::builder()
             .stage(vk::ShaderStageFlags::FRAGMENT)
@@ -1113,9 +1929,47 @@ fn create_triangle_pipeline(device: &ash::Device) -> Result<TrianglePipeline> {
             .name(c"fs_main")
             .build(),
     ];
+    let stencil_stages = [
+        vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vertex)
+            .name(c"vs_main")
+            .build(),
+        vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(stencil_fragment)
+            .name(c"fs_stencil")
+            .build(),
+    ];
+    let group_stages = [
+        vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(cover_vertex)
+            .name(c"vs_cover")
+            .build(),
+        vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(group_fragment)
+            .name(c"fs_group")
+            .build(),
+    ];
+    let group_composite_stages = [
+        vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(cover_vertex)
+            .name(c"vs_cover")
+            .build(),
+        vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(group_composite_fragment)
+            .name(c"main")
+            .build(),
+    ];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder();
-    let assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
+    let cover_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let winding_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
+        .topology(vk::PrimitiveTopology::TRIANGLE_FAN);
     let viewport = vk::PipelineViewportStateCreateInfo::builder()
         .viewport_count(1)
         .scissor_count(1);
@@ -1125,7 +1979,7 @@ fn create_triangle_pipeline(device: &ash::Device) -> Result<TrianglePipeline> {
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .line_width(1.0);
     let multisample = vk::PipelineMultisampleStateCreateInfo::builder()
-        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        .rasterization_samples(STENCIL_SAMPLE_COUNT);
     let blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
         .blend_enable(true)
         .src_color_blend_factor(vk::BlendFactor::ONE)
@@ -1136,33 +1990,161 @@ fn create_triangle_pipeline(device: &ash::Device) -> Result<TrianglePipeline> {
         .alpha_blend_op(vk::BlendOp::ADD)
         .color_write_mask(vk::ColorComponentFlags::RGBA)
         .build();
+    let no_color_attachment = vk::PipelineColorBlendAttachmentState::builder()
+        .color_write_mask(vk::ColorComponentFlags::empty())
+        .build();
+    let main_blends = [blend_attachment, no_color_attachment];
+    let group_blends = [no_color_attachment, blend_attachment];
+    let no_blends = [no_color_attachment, no_color_attachment];
     let blend = vk::PipelineColorBlendStateCreateInfo::builder()
-        .attachments(std::slice::from_ref(&blend_attachment));
+        .attachments(&main_blends[..1]);
+    let no_color = vk::PipelineColorBlendStateCreateInfo::builder()
+        .attachments(&no_blends[..1]);
+    let cover_stencil = vk::StencilOpState::builder()
+        .fail_op(vk::StencilOp::KEEP)
+        .pass_op(vk::StencilOp::ZERO)
+        .depth_fail_op(vk::StencilOp::KEEP)
+        .compare_op(vk::CompareOp::NOT_EQUAL)
+        .compare_mask(0xff)
+        .write_mask(0xff)
+        .reference(0)
+        .build();
+    let cover_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::builder()
+        .stencil_test_enable(true)
+        .front(cover_stencil)
+        .back(cover_stencil);
+    let winding_front = vk::StencilOpState::builder()
+        .fail_op(vk::StencilOp::KEEP)
+        .pass_op(vk::StencilOp::INCREMENT_AND_WRAP)
+        .depth_fail_op(vk::StencilOp::KEEP)
+        .compare_op(vk::CompareOp::ALWAYS)
+        .compare_mask(0xff)
+        .write_mask(0xff)
+        .build();
+    let winding_back = vk::StencilOpState {
+        pass_op: vk::StencilOp::DECREMENT_AND_WRAP,
+        ..winding_front
+    };
+    let winding_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::builder()
+        .stencil_test_enable(true)
+        .front(winding_front)
+        .back(winding_back);
+    let parity = vk::StencilOpState {
+        pass_op: vk::StencilOp::INVERT,
+        ..winding_front
+    };
+    let parity_depth_stencil = vk::PipelineDepthStencilStateCreateInfo::builder()
+        .stencil_test_enable(true)
+        .front(parity)
+        .back(parity);
     let dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder().dynamic_states(&dynamic);
-    let info = vk::GraphicsPipelineCreateInfo::builder()
-        .stages(&stages)
+    let cover_info = vk::GraphicsPipelineCreateInfo::builder()
+        .stages(&cover_stages)
         .vertex_input_state(&vertex_input)
-        .input_assembly_state(&assembly)
+        .input_assembly_state(&cover_assembly)
         .viewport_state(&viewport)
         .rasterization_state(&raster)
         .multisample_state(&multisample)
+        .depth_stencil_state(&cover_depth_stencil)
         .color_blend_state(&blend)
         .dynamic_state(&dynamic_state)
         .layout(pipeline_layout)
         .render_pass(render_pass)
         .subpass(0)
         .build();
+    let winding_base = || {
+        vk::GraphicsPipelineCreateInfo::builder()
+            .stages(&stencil_stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&winding_assembly)
+            .viewport_state(&viewport)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .color_blend_state(&no_color)
+            .dynamic_state(&dynamic_state)
+            .layout(pipeline_layout)
+            .render_pass(render_pass)
+            .subpass(0)
+    };
+    let winding_info = winding_base()
+        .depth_stencil_state(&winding_depth_stencil)
+        .build();
+    let parity_info = winding_base()
+        .depth_stencil_state(&parity_depth_stencil)
+        .build();
+    let mut infos = vec![cover_info, winding_info, parity_info];
+    if raster_order_groups {
+        infos.push(
+            vk::GraphicsPipelineCreateInfo::builder()
+                .stages(&group_composite_stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&cover_assembly)
+                .viewport_state(&viewport)
+                .rasterization_state(&raster)
+                .multisample_state(&multisample)
+                .color_blend_state(&blend)
+                .dynamic_state(&dynamic_state)
+                .layout(pipeline_layout)
+                .render_pass(render_pass)
+                .subpass(0)
+                .build(),
+        );
+    }
     // SAFETY: all pipeline state and shader modules are valid for this device.
-    let pipelines =
-        unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) };
+    #[cfg(target_os = "android")]
+    eprintln!("TLottieVulkan: creating base raster-order pipelines");
+    let pipelines = match unsafe {
+        device.create_graphics_pipelines(vk::PipelineCache::null(), &infos[..3], None)
+    } {
+        Ok(mut base) if raster_order_groups => {
+            #[cfg(target_os = "android")]
+            eprintln!("TLottieVulkan: creating alpha-group pipelines");
+            match unsafe {
+            device.create_graphics_pipelines(vk::PipelineCache::null(), &infos[3..], None)
+        } {
+            Ok(mut groups) => {
+                base.append(&mut groups);
+                Ok(base)
+            }
+            Err(error) => {
+                unsafe {
+                    for pipeline in base {
+                        device.destroy_pipeline(pipeline, None);
+                    }
+                }
+                Err(error)
+            }
+        }
+        },
+        other => other,
+    };
     // SAFETY: pipeline compilation has consumed both modules.
     unsafe {
         device.destroy_shader_module(vertex, None);
+        device.destroy_shader_module(cover_vertex, None);
         device.destroy_shader_module(fragment, None);
+        device.destroy_shader_module(group_fragment, None);
+        device.destroy_shader_module(group_composite_fragment, None);
+        device.destroy_shader_module(stencil_fragment, None);
     }
+    let expected_pipeline_count = if raster_order_groups { 4 } else { 3 };
     let pipeline = match pipelines {
-        Ok(pipelines) => pipelines.first().copied().ok_or(Error::FrameTooLarge),
+        Ok(pipelines) if pipelines.len() == expected_pipeline_count => Ok((
+            pipelines[0],
+            pipelines[1],
+            pipelines[2],
+            vk::Pipeline::null(),
+            pipelines.get(3).copied().unwrap_or(vk::Pipeline::null()),
+        )),
+        Ok(pipelines) => {
+            unsafe {
+                for pipeline in pipelines {
+                    device.destroy_pipeline(pipeline, None);
+                }
+            }
+            Err(Error::FrameTooLarge)
+        }
         Err((partial, e)) => {
             // SAFETY: destroy any partially created pipelines.
             unsafe {
@@ -1174,14 +2156,26 @@ fn create_triangle_pipeline(device: &ash::Device) -> Result<TrianglePipeline> {
         }
     };
     match pipeline {
-        Ok(pipeline) => {
-            let pool_size = vk::DescriptorPoolSize {
+        Ok((
+            pipeline,
+            stencil_nonzero_pipeline,
+            stencil_evenodd_pipeline,
+            group_pipeline,
+            group_composite_pipeline,
+        )) => {
+            let mut pool_sizes = vec![vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
                 descriptor_count: 1,
-            };
+            }];
+            if raster_order_groups {
+                pool_sizes.push(vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    descriptor_count: 1,
+                });
+            }
             let pool_info = vk::DescriptorPoolCreateInfo::builder()
                 .max_sets(1)
-                .pool_sizes(std::slice::from_ref(&pool_size));
+                .pool_sizes(&pool_sizes);
             // SAFETY: descriptor pool create info is valid.
             let descriptor_pool = match unsafe { device.create_descriptor_pool(&pool_info, None) } {
                 Ok(pool) => pool,
@@ -1189,6 +2183,10 @@ fn create_triangle_pipeline(device: &ash::Device) -> Result<TrianglePipeline> {
                     // SAFETY: resources belong to this device and are unused.
                     unsafe {
                         device.destroy_pipeline(pipeline, None);
+                        device.destroy_pipeline(stencil_nonzero_pipeline, None);
+                        device.destroy_pipeline(stencil_evenodd_pipeline, None);
+                        device.destroy_pipeline(group_pipeline, None);
+                        device.destroy_pipeline(group_composite_pipeline, None);
                         device.destroy_pipeline_layout(pipeline_layout, None);
                         device.destroy_descriptor_set_layout(descriptor_set_layout, None);
                         device.destroy_render_pass(render_pass, None);
@@ -1208,6 +2206,10 @@ fn create_triangle_pipeline(device: &ash::Device) -> Result<TrianglePipeline> {
                         unsafe {
                             device.destroy_descriptor_pool(descriptor_pool, None);
                             device.destroy_pipeline(pipeline, None);
+                            device.destroy_pipeline(stencil_nonzero_pipeline, None);
+                            device.destroy_pipeline(stencil_evenodd_pipeline, None);
+                            device.destroy_pipeline(group_pipeline, None);
+                            device.destroy_pipeline(group_composite_pipeline, None);
                             device.destroy_pipeline_layout(pipeline_layout, None);
                             device.destroy_descriptor_set_layout(descriptor_set_layout, None);
                             device.destroy_render_pass(render_pass, None);
@@ -1220,6 +2222,10 @@ fn create_triangle_pipeline(device: &ash::Device) -> Result<TrianglePipeline> {
                     unsafe {
                         device.destroy_descriptor_pool(descriptor_pool, None);
                         device.destroy_pipeline(pipeline, None);
+                        device.destroy_pipeline(stencil_nonzero_pipeline, None);
+                        device.destroy_pipeline(stencil_evenodd_pipeline, None);
+                        device.destroy_pipeline(group_pipeline, None);
+                        device.destroy_pipeline(group_composite_pipeline, None);
                         device.destroy_pipeline_layout(pipeline_layout, None);
                         device.destroy_descriptor_set_layout(descriptor_set_layout, None);
                         device.destroy_render_pass(render_pass, None);
@@ -1234,6 +2240,11 @@ fn create_triangle_pipeline(device: &ash::Device) -> Result<TrianglePipeline> {
                 descriptor_set,
                 pipeline_layout,
                 pipeline,
+                stencil_nonzero_pipeline,
+                stencil_evenodd_pipeline,
+                group_pipeline,
+                group_composite_pipeline,
+                group_sampler,
             })
         }
         Err(e) => {
@@ -1328,15 +2339,112 @@ fn create_shader_module(device: &ash::Device, bytes: &[u8]) -> Result<vk::Shader
         .map_err(|e| Error::Vulkan("vkCreateShaderModule", e))
 }
 
+fn create_raster_order_group_framebuffer(
+    device: &ash::Device,
+    render_pass: vk::RenderPass,
+    color_image: vk::Image,
+    stencil_image: vk::Image,
+    group_image: vk::Image,
+    width: u32,
+    height: u32,
+) -> Result<(Vec<vk::ImageView>, vk::Framebuffer, vk::Framebuffer)> {
+    let make_view = |image, format, aspect| {
+        let info = vk::ImageViewCreateInfo::builder()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: aspect,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        unsafe { device.create_image_view(&info, None) }
+            .map_err(|e| Error::Vulkan("vkCreateImageView(alpha groups)", e))
+    };
+    let mut views = Vec::with_capacity(3);
+    for (image, format, aspect) in [
+        (
+            color_image,
+            vk::Format::B8G8R8A8_UNORM,
+            vk::ImageAspectFlags::COLOR,
+        ),
+        (
+            stencil_image,
+            vk::Format::S8_UINT,
+            vk::ImageAspectFlags::STENCIL,
+        ),
+        (
+            group_image,
+            vk::Format::B8G8R8A8_UNORM,
+            vk::ImageAspectFlags::COLOR,
+        ),
+    ] {
+        match make_view(image, format, aspect) {
+            Ok(view) => views.push(view),
+            Err(error) => {
+                unsafe {
+                    for view in views {
+                        device.destroy_image_view(view, None);
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+    let main_attachments = [views[0], views[1]];
+    let info = vk::FramebufferCreateInfo::builder()
+        .render_pass(render_pass)
+        .attachments(&main_attachments)
+        .width(width)
+        .height(height)
+        .layers(1);
+    match unsafe { device.create_framebuffer(&info, None) } {
+        Ok(framebuffer) => {
+            let group_attachments = [views[2], views[1]];
+            let group_info = vk::FramebufferCreateInfo::builder()
+                .render_pass(render_pass)
+                .attachments(&group_attachments)
+                .width(width)
+                .height(height)
+                .layers(1);
+            match unsafe { device.create_framebuffer(&group_info, None) } {
+                Ok(group_framebuffer) => Ok((views, framebuffer, group_framebuffer)),
+                Err(e) => {
+                    unsafe {
+                        device.destroy_framebuffer(framebuffer, None);
+                        for view in views {
+                            device.destroy_image_view(view, None);
+                        }
+                    }
+                    Err(Error::Vulkan("vkCreateFramebuffer(alpha group)", e))
+                }
+            }
+        }
+        Err(e) => {
+            unsafe {
+                for view in views {
+                    device.destroy_image_view(view, None);
+                }
+            }
+            Err(Error::Vulkan("vkCreateFramebuffer(alpha groups)", e))
+        }
+    }
+}
+
 fn create_target_framebuffer(
     device: &ash::Device,
     render_pass: vk::RenderPass,
-    image: vk::Image,
+    resolve_image: vk::Image,
+    multisample_image: vk::Image,
+    stencil_image: vk::Image,
+    group_image: Option<vk::Image>,
     width: u32,
     height: u32,
-) -> Result<(vk::ImageView, vk::Framebuffer)> {
+) -> Result<(Vec<vk::ImageView>, vk::Framebuffer)> {
     let view_info = vk::ImageViewCreateInfo::builder()
-        .image(image)
+        .image(multisample_image)
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(vk::Format::B8G8R8A8_UNORM)
         .subresource_range(vk::ImageSubresourceRange {
@@ -1347,20 +2455,88 @@ fn create_target_framebuffer(
             layer_count: 1,
         });
     // SAFETY: image belongs to this device and has a compatible format.
-    let view = unsafe { device.create_image_view(&view_info, None) }
+    let multisample_view = unsafe { device.create_image_view(&view_info, None) }
         .map_err(|e| Error::Vulkan("vkCreateImageView", e))?;
+    let stencil_view_info = vk::ImageViewCreateInfo::builder()
+        .image(stencil_image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(vk::Format::S8_UINT)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::STENCIL,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let stencil_view = match unsafe { device.create_image_view(&stencil_view_info, None) } {
+        Ok(view) => view,
+        Err(e) => {
+            unsafe { device.destroy_image_view(multisample_view, None) };
+            return Err(Error::Vulkan("vkCreateImageView(stencil)", e));
+        }
+    };
+    let resolve_view_info = vk::ImageViewCreateInfo::builder()
+        .image(resolve_image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(vk::Format::B8G8R8A8_UNORM)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let resolve_view = match unsafe { device.create_image_view(&resolve_view_info, None) } {
+        Ok(view) => view,
+        Err(e) => {
+            unsafe {
+                device.destroy_image_view(multisample_view, None);
+                device.destroy_image_view(stencil_view, None);
+            }
+            return Err(Error::Vulkan("vkCreateImageView(resolve)", e));
+        }
+    };
+    let mut attachments = vec![multisample_view, stencil_view, resolve_view];
+    if let Some(group_image) = group_image {
+        let group_view_info = vk::ImageViewCreateInfo::builder()
+            .image(group_image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::B8G8R8A8_UNORM)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        match unsafe { device.create_image_view(&group_view_info, None) } {
+            Ok(view) => attachments.push(view),
+            Err(e) => {
+                unsafe {
+                    device.destroy_image_view(multisample_view, None);
+                    device.destroy_image_view(stencil_view, None);
+                    device.destroy_image_view(resolve_view, None);
+                }
+                return Err(Error::Vulkan("vkCreateImageView(group)", e));
+            }
+        }
+    }
     let framebuffer_info = vk::FramebufferCreateInfo::builder()
         .render_pass(render_pass)
-        .attachments(std::slice::from_ref(&view))
+        .attachments(&attachments)
         .width(width)
         .height(height)
         .layers(1);
     // SAFETY: image view and render pass are compatible and live.
     match unsafe { device.create_framebuffer(&framebuffer_info, None) } {
-        Ok(framebuffer) => Ok((view, framebuffer)),
+        Ok(framebuffer) => Ok((attachments, framebuffer)),
         Err(e) => {
             // SAFETY: view belongs to this device and is unused.
-            unsafe { device.destroy_image_view(view, None) };
+            unsafe {
+                for view in attachments {
+                    device.destroy_image_view(view, None);
+                }
+            }
             Err(Error::Vulkan("vkCreateFramebuffer", e))
         }
     }
@@ -1545,6 +2721,7 @@ struct PreparedGeometry {
     paints: Vec<PreparedPaint>,
     gradient_luts: Vec<u32>,
     indirect: Vec<vk::DrawIndirectCommand>,
+    fan_indirect: Vec<vk::DrawIndirectCommand>,
     stats: CacheStats,
 }
 
@@ -2385,6 +3562,12 @@ impl GeometryCache {
                 });
                 prepared.indirect.push(vk::DrawIndirectCommand {
                     vertex_count,
+                    instance_count: 1,
+                    first_vertex: 0,
+                    first_instance: draw_index,
+                });
+                prepared.fan_indirect.push(vk::DrawIndirectCommand {
+                    vertex_count: contour.range.count,
                     instance_count: 1,
                     first_vertex: 0,
                     first_instance: draw_index,
@@ -3289,3 +4472,4 @@ mod tests {
         Ok(())
     }
 }
+const STENCIL_SAMPLE_COUNT: vk::SampleCountFlags = vk::SampleCountFlags::TYPE_4;

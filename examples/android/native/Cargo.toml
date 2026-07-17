@@ -1,0 +1,17 @@
+[package]
+name = "tlottie-android"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ash = { version = "0.37.3", default-features = false, features = ["loaded"] }
+jni = { version = "0.21", default-features = false }
+libloading = "0.8"
+tlottie = { path = "../../../crates/tlottie" }
+tlottie-vulkan = { path = "../../../crates/tlottie-vulkan" }
+
+[workspace]

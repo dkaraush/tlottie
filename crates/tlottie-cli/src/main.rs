@@ -17,7 +17,7 @@ fn render_options() -> RenderOptions {
     let curve_tolerance = std::env::var("TLOTTIE_CURVE_TOLERANCE")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(0.05);
+        .unwrap_or(0.5);
     RenderOptions {
         antialias,
         curve_tolerance,
