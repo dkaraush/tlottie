@@ -94,6 +94,7 @@ fn learning_old_hits_are_in_place() {
   }
   assert_eq!(c.rotations, 1);
   assert!(!c.frozen);
+  assert!(c.young.capacity() >= c.old.capacity(), "tiny-entry successor inherits proven table capacity");
   let yb = c.young_bytes;
   let olen = c.old.len();
   for _ in 0..3 {

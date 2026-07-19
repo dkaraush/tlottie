@@ -393,6 +393,14 @@ impl CovCache {
         self.era_hits = 0;
       } else {
         self.old = core::mem::take(&mut self.young);
+        // Tiny-entry canvases normally grow the next generation to roughly
+        // the same entry count. Seed it with the capacity the first one
+        // already proved useful, avoiding a second allocate-and-rehash ladder
+        // during first playback. Large canvases keep gradual growth: their
+        // fewer, bigger entries did not repay the eager table allocation.
+        if !self.shrink_entries {
+          self.young = std::collections::HashMap::with_capacity(self.old.capacity());
+        }
         self.young_bytes = 0;
       }
     }
