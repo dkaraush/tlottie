@@ -36,6 +36,9 @@ const EPS_TURN: f32 = 1e-6;
 /// undercuts by 0.015*hw (0.5px at hw=32), so the step shrinks with hw.
 const ARC_TOL: f32 = 0.05;
 
+/// Do not retain pathological stroke-segment buffers between calls.
+const SEGMENT_REUSE_CAP: usize = 512;
+
 struct Border {
   pts: Vec<Vec2>,
   /// FT `movable` (VFT:392-423): the last point is a straight-segment
@@ -86,7 +89,7 @@ impl Border {
 }
 
 /// One cleaned polyline segment.
-struct Seg {
+pub(crate) struct StrokeSegment {
   /// Segment start point.
   p: Vec2,
   /// Unit direction.
@@ -111,7 +114,18 @@ struct Seg {
 /// after its sanitizer). Appends 1 contour (open) or up to 2 rings
 /// (closed) to `out`. Winding: bands +1, closed inner rings -1.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn stroke_outline(pts: &[Vec2], anchors: &[bool], closed: bool, hw: f32, cap: Cap, join: Join, miter_limit: f32, pool: &mut Vec<Vec<Vec2>>, out: &mut Vec<Contour>) {
+pub(crate) fn stroke_outline(
+  pts: &[Vec2],
+  anchors: &[bool],
+  closed: bool,
+  hw: f32,
+  cap: Cap,
+  join: Join,
+  miter_limit: f32,
+  pool: &mut Vec<Vec<Vec2>>,
+  segments: &mut Vec<StrokeSegment>,
+  out: &mut Vec<Contour>,
+) {
   let ml = if miter_limit.is_finite() { miter_limit.max(1.0) } else { 4.0 };
   let anchor_at = |i: usize| anchors.get(i).copied().unwrap_or(true);
 
@@ -119,7 +133,8 @@ pub(crate) fn stroke_outline(pts: &[Vec2], anchors: &[bool], closed: bool, hw: f
   // dropped, merging their neighbors.
   let n = pts.len();
   let seg_count = if closed { n } else { n.saturating_sub(1) };
-  let mut segs: Vec<Seg> = Vec::with_capacity(seg_count);
+  segments.clear();
+  segments.reserve(seg_count);
   let mut dropped_gap = false;
   for s in 0..seg_count {
     let Some(&p0) = pts.get(s) else { continue };
@@ -136,7 +151,7 @@ pub(crate) fn stroke_outline(pts: &[Vec2], anchors: &[bool], closed: bool, hw: f
       dropped_gap = true;
       continue;
     }
-    segs.push(Seg {
+    segments.push(StrokeSegment {
       p: p0,
       d: Vec2::new(dx / len, dy / len),
       len,
@@ -147,8 +162,8 @@ pub(crate) fn stroke_outline(pts: &[Vec2], anchors: &[bool], closed: bool, hw: f
   }
   // Trailing drops wrap onto the closed seam (or are absorbed by the
   // open end cap).
-  let seam_gap = dropped_gap || segs.first().is_some_and(|s| s.gap_before);
-  if segs.is_empty() {
+  let seam_gap = dropped_gap || segments.first().is_some_and(|s| s.gap_before);
+  if segments.is_empty() {
     return;
   }
 
@@ -157,11 +172,11 @@ pub(crate) fn stroke_outline(pts: &[Vec2], anchors: &[bool], closed: bool, hw: f
   b0.pts.clear();
   b1.pts.clear();
   let cap_pts = 2 + (core::f32::consts::PI / 0.0655) as usize;
-  b0.pts.reserve(2 * segs.len() + cap_pts + 8);
-  b1.pts.reserve(2 * segs.len() + 8);
+  b0.pts.reserve(2 * segments.len() + cap_pts + 8);
+  b1.pts.reserve(2 * segments.len() + 8);
 
   // Subpath start: moveto on each border (movable = false).
-  let (first_d, first_p) = match segs.first() {
+  let (first_d, first_p) = match segments.first() {
     Some(s) => (s.d, s.p),
     None => return,
   };
@@ -170,9 +185,9 @@ pub(crate) fn stroke_outline(pts: &[Vec2], anchors: &[bool], closed: bool, hw: f
   b1.pts.push(Vec2::new(first_p.x - n0.x, first_p.y - n0.y));
 
   let mut prev_d = first_d;
-  let mut prev_len = segs.first().map_or(0.0, |s| if s.is_line { s.len } else { 0.0 });
-  let mut prev_raw = segs.first().map_or(0.0, |s| s.len);
-  for (i, seg) in segs.iter().enumerate() {
+  let mut prev_len = segments.first().map_or(0.0, |s| if s.is_line { s.len } else { 0.0 });
+  let mut prev_raw = segments.first().map_or(0.0, |s| s.len);
+  for (i, seg) in segments.iter().enumerate() {
     if i > 0 {
       let cur_len = if seg.is_line { seg.len } else { 0.0 };
       let vertex_anchor = anchors.get(seg.start_idx).copied().unwrap_or(true);
@@ -207,8 +222,8 @@ pub(crate) fn stroke_outline(pts: &[Vec2], anchors: &[bool], closed: bool, hw: f
   if closed {
     // Seam corner back into the first segment (VFT:1640-1660), then
     // close border 0 unreversed / border 1 reversed (VFT:1663-1664).
-    let first_len = segs.first().map_or(0.0, |s| if s.is_line { s.len } else { 0.0 });
-    let first_raw = segs.first().map_or(0.0, |s| s.len);
+    let first_len = segments.first().map_or(0.0, |s| if s.is_line { s.len } else { 0.0 });
+    let first_raw = segments.first().map_or(0.0, |s| s.len);
     process_corner(
       &mut b0,
       &mut b1,
@@ -271,7 +286,7 @@ pub(crate) fn stroke_outline(pts: &[Vec2], anchors: &[bool], closed: bool, hw: f
   } else {
     // Open assembly (VFT:1602-1628): border0 forward, end cap, border1
     // reversed, start cap — one closed loop.
-    let last = match segs.last() {
+    let last = match segments.last() {
       Some(s) => s,
       None => return,
     };
@@ -504,7 +519,19 @@ fn angle_delta(a: f32, b: f32) -> f32 {
 
 /// Sanitizes and strokes a flattened polyline.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn stroke_polyline(points: &[Vec2], point_anchors: &[bool], closed: bool, hw: f32, cap: Cap, join: Join, miter_limit: f32, pool: &mut Vec<Vec<Vec2>>, out: &mut Vec<Contour>, _solo: bool) {
+pub(crate) fn stroke_polyline(
+  points: &[Vec2],
+  point_anchors: &[bool],
+  closed: bool,
+  hw: f32,
+  cap: Cap,
+  join: Join,
+  miter_limit: f32,
+  pool: &mut Vec<Vec<Vec2>>,
+  segments: &mut Vec<StrokeSegment>,
+  out: &mut Vec<Contour>,
+  _solo: bool,
+) {
   if !(hw > 0.0) || !hw.is_finite() {
     return;
   }
@@ -542,7 +569,10 @@ pub(crate) fn stroke_polyline(points: &[Vec2], point_anchors: &[bool], closed: b
     return;
   }
 
-  stroke_outline(&pts, &anchors, closed, hw, cap, join, miter_limit, pool, out);
+  stroke_outline(&pts, &anchors, closed, hw, cap, join, miter_limit, pool, segments, out);
+  if segments.capacity() > SEGMENT_REUSE_CAP {
+    *segments = Vec::new();
+  }
   pts.clear();
   pool.push(pts);
 }

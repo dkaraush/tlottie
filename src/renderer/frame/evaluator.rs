@@ -241,10 +241,34 @@ impl ShapeWalker<'_> {
           {
             let target = if skip_clip { &mut contours } else { &mut pieces };
             if pattern.is_empty() {
-              stroke_polyline(&contour.points, &contour.anchors, *closed, *hw, *cap, *join, *miter_limit, &mut self.scratch.pts_pool, target, solo);
+              stroke_polyline(
+                &contour.points,
+                &contour.anchors,
+                *closed,
+                *hw,
+                *cap,
+                *join,
+                *miter_limit,
+                &mut self.scratch.pts_pool,
+                &mut self.scratch.stroke_segments,
+                target,
+                solo,
+              );
             } else {
               for (piece, piece_anchors) in dash_polyline(&contour.points, &contour.anchors, *closed, pattern, *dash_offset) {
-                stroke_polyline(&piece, &piece_anchors, false, *hw, *cap, *join, *miter_limit, &mut self.scratch.pts_pool, target, false);
+                stroke_polyline(
+                  &piece,
+                  &piece_anchors,
+                  false,
+                  *hw,
+                  *cap,
+                  *join,
+                  *miter_limit,
+                  &mut self.scratch.pts_pool,
+                  &mut self.scratch.stroke_segments,
+                  target,
+                  false,
+                );
               }
             }
           }

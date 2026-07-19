@@ -4,8 +4,9 @@ fn stroke(pts: &[(f32, f32)], closed: bool, hw: f32, cap: Cap, join: Join, ml: f
   let v: Vec<Vec2> = pts.iter().map(|&(x, y)| Vec2::new(x, y)).collect();
   let anchors = vec![true; v.len()];
   let mut pool = Vec::new();
+  let mut segments = Vec::new();
   let mut out = Vec::new();
-  stroke_outline(&v, &anchors, closed, hw, cap, join, ml, &mut pool, &mut out);
+  stroke_outline(&v, &anchors, closed, hw, cap, join, ml, &mut pool, &mut segments, &mut out);
   out
 }
 
@@ -76,9 +77,10 @@ fn no_panic_garbage() {
     let v: Vec<Vec2> = pts.iter().map(|&(x, y)| Vec2::new(x, y)).collect();
     let anchors = vec![true; v.len()];
     let mut pool = Vec::new();
+    let mut segments = Vec::new();
     let mut out = Vec::new();
     for closed in [false, true] {
-      stroke_outline(&v, &anchors, closed, 2.0, Cap::Round, Join::Round, 4.0, &mut pool, &mut out);
+      stroke_outline(&v, &anchors, closed, 2.0, Cap::Round, Join::Round, 4.0, &mut pool, &mut segments, &mut out);
     }
   }
 }

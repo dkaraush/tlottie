@@ -16,7 +16,7 @@ use crate::model::LayerKind;
 use crate::model::{Composition, DashElement, FillRule, FloatList, GradientKind, Layer, Shape, Transform, TrimMode};
 use crate::raster::Rasterizer;
 use crate::renderer::frame::renderer::GRADIENT_LUT_SIZE;
-use crate::stroke::stroke_polyline;
+use crate::stroke::{stroke_polyline, StrokeSegment};
 
 /// Maximum group recursion while rendering (matches parse-side bound).
 const MAX_RENDER_DEPTH: usize = 40;
@@ -51,6 +51,8 @@ pub(crate) struct RenderScratch {
   /// from here and return after their paint executes (measured: 2,683
   /// piece allocations per 64px frame on stroke-heavy files).
   pts_pool: Vec<Vec<Vec2>>,
+  /// Reused normalized stroke segments; stroke calls execute serially.
+  stroke_segments: Vec<StrokeSegment>,
   /// Memoized per-layer staticness (keyed by the Layer's stable address
   /// inside the Arc'd Composition).
   #[cfg(test)]
