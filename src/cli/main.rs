@@ -1,5 +1,6 @@
 //! `tlottie-cli info <file.json>...` — parse and print header metadata.
 //! `tlottie-cli render [options] <file.json> <frame> <size> <out.png>` — render frame to png file
+//! `tlottie-cli bench <file.json> <size> <frames>` — native CPU timing harness
 
 use std::process::ExitCode;
 
@@ -71,6 +72,7 @@ fn main() -> ExitCode {
   match args.split_first() {
     Some((cmd, files)) if cmd == "info" && !files.is_empty() => info(files),
     Some((cmd, rest)) if cmd == "render" => render_cmd(rest),
+    Some((cmd, rest)) if cmd == "bench" => bench_cmd(rest),
     _ => usage(),
   }
 }
@@ -78,7 +80,59 @@ fn main() -> ExitCode {
 fn usage() -> ExitCode {
   eprintln!("usage: tlottie-cli info <file.json>...");
   eprintln!("       tlottie-cli render [--backend cpu|vulkan] [--curve-tolerance <pixels>] <file.json> <frame> <size> <out.png>");
+  eprintln!("       tlottie-cli bench <file.json> <size> <frames>");
   ExitCode::from(2)
+}
+
+fn bench_cmd(args: &[String]) -> ExitCode {
+  let [file, size, frames] = args else {
+    return usage();
+  };
+  let (Ok(size), Ok(frames)) = (size.parse::<u32>(), frames.parse::<usize>()) else {
+    eprintln!("bench: size and frames must be positive integers");
+    return ExitCode::from(2);
+  };
+  if size == 0 || frames == 0 {
+    eprintln!("bench: size and frames must be positive integers");
+    return ExitCode::from(2);
+  }
+
+  let fms_started = std::time::Instant::now();
+  let bytes = match std::fs::read(file) {
+    Ok(bytes) => bytes,
+    Err(error) => {
+      eprintln!("bench: {file}: {error}");
+      return ExitCode::FAILURE;
+    }
+  };
+  let composition = match Composition::parse(&bytes, &Limits::default()) {
+    Ok(composition) => composition,
+    Err(error) => {
+      eprintln!("bench: {file}: parse error: {error}");
+      return ExitCode::FAILURE;
+    }
+  };
+  let frame_count = composition.frame_count().max(1) as usize;
+  let mut renderer = CPURenderer::new(composition);
+  let Some(pixel_count) = (size as usize).checked_mul(size as usize) else {
+    eprintln!("bench: dimensions overflow");
+    return ExitCode::FAILURE;
+  };
+  let mut pixels = vec![0u32; pixel_count];
+  let options = RenderOptions::default();
+  for index in 0..frames {
+    let started = std::time::Instant::now();
+    if let Err(error) = renderer.render((index % frame_count) as f32, &mut pixels, size, size, options) {
+      eprintln!("bench: render {index}: {error}");
+      return ExitCode::FAILURE;
+    }
+    println!("F {index} {}", started.elapsed().as_nanos());
+    if index == 0 {
+      println!("FMS {:.6}", fms_started.elapsed().as_secs_f64() * 1000.0);
+    }
+  }
+  println!("T {frame_count}");
+  ExitCode::SUCCESS
 }
 
 fn render_cmd(args: &[String]) -> ExitCode {
