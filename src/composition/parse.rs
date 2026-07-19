@@ -482,6 +482,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
   let mut it_pos: Option<usize> = None;
   let mut parsed_group: Option<(Vec<Shape>, Option<Transform>)> = None;
   let mut ks_pos: Option<usize> = None;
+  let mut parsed_path: Option<Property<PathData>> = None;
   let mut p_pos: Option<usize> = None;
   let mut s_pos: Option<usize> = None;
   let mut r_pos: Option<usize> = None;
@@ -550,8 +551,14 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
         }
       }
       b"ks" => {
-        ks_pos = Some(c.pos());
-        c.skip_value()
+        if ty == Some(*b"sh") {
+          parsed_path = Some(parse_property(c, limits, parse_path_value)?);
+          ks_pos = None;
+          Ok(())
+        } else {
+          ks_pos = Some(c.pos());
+          c.skip_value()
+        }
       }
       b"p" => {
         p_pos = Some(c.pos());
@@ -702,11 +709,16 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
       }))))
     }
     b"sh" => {
-      let ks_pos = ks_pos.ok_or(Error::InvalidLottie {
-        offset: obj_start,
-        what: "path shape missing ks",
-      })?;
-      let path = parse_property(&mut c.fork_at(ks_pos), limits, parse_path_value)?;
+      let path = match parsed_path {
+        Some(path) => path,
+        None => {
+          let ks_pos = ks_pos.ok_or(Error::InvalidLottie {
+            offset: obj_start,
+            what: "path shape missing ks",
+          })?;
+          parse_property(&mut c.fork_at(ks_pos), limits, parse_path_value)?
+        }
+      };
       Ok(ParsedItem::Shape(Shape::Path(PathShape { path })))
     }
     b"rc" => Ok(ParsedItem::Shape(Shape::Rect(RectShape {
