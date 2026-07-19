@@ -241,7 +241,11 @@ fn composite_over_box(destination: &mut [u32], source: &[u32], width: usize, bou
   }
   for y in y0..y1 {
     let row = y * width;
-    crate::simd::composite_over_span(&mut destination[row + x0..row + x1], &source[row + x0..row + x1], u32::from(opacity));
+    let src_row = &source[row + x0..row + x1];
+    if src_row.iter().all(|&pixel| pixel == 0) {
+      continue;
+    }
+    crate::simd::composite_over_span(&mut destination[row + x0..row + x1], src_row, u32::from(opacity));
   }
 }
 
