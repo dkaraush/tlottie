@@ -194,11 +194,13 @@ impl Rasterizer {
       if pts.len() < 3 {
         continue;
       }
-      for (i, cur) in pts.iter().enumerate() {
-        let next = pts.get(i + 1).or_else(|| pts.first());
-        if let Some(next) = next {
+      for pair in pts.windows(2) {
+        if let [cur, next] = pair {
           self.draw_line(cur.x, cur.y, next.x, next.y);
         }
+      }
+      if let (Some(last), Some(first)) = (pts.last(), pts.first()) {
+        self.draw_line(last.x, last.y, first.x, first.y);
       }
     }
   }
