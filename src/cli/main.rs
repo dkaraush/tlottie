@@ -1,6 +1,6 @@
 //! `tlottie-cli info <file.json>...` — parse and print header metadata.
 //! `tlottie-cli render [options] <file.json> <frame> <size> <out.png>` — render frame to png file
-//! `tlottie-cli bench <file.json> <size> <frames>` — native CPU timing harness
+//! `tlottie-cli bench [options] <file.json> <size> <frames>` — native CPU timing harness
 
 use std::process::ExitCode;
 
@@ -80,12 +80,39 @@ fn main() -> ExitCode {
 fn usage() -> ExitCode {
   eprintln!("usage: tlottie-cli info <file.json>...");
   eprintln!("       tlottie-cli render [--backend cpu|vulkan] [--curve-tolerance <pixels>] <file.json> <frame> <size> <out.png>");
-  eprintln!("       tlottie-cli bench <file.json> <size> <frames>");
+  eprintln!("       tlottie-cli bench [--curve-tolerance <pixels>] <file.json> <size> <frames>");
   ExitCode::from(2)
 }
 
 fn bench_cmd(args: &[String]) -> ExitCode {
-  let [file, size, frames] = args else {
+  let mut options = RenderOptions::default();
+  let mut positional = Vec::with_capacity(3);
+  let mut args = args.iter();
+  while let Some(arg) = args.next() {
+    match arg.as_str() {
+      "--curve-tolerance" => {
+        let Some(value) = args.next() else {
+          eprintln!("bench: --curve-tolerance requires a positive number");
+          return ExitCode::from(2);
+        };
+        let Ok(value) = value.parse::<f32>() else {
+          eprintln!("bench: --curve-tolerance requires a positive number");
+          return ExitCode::from(2);
+        };
+        if !value.is_finite() || value <= 0.0 {
+          eprintln!("bench: --curve-tolerance requires a positive number");
+          return ExitCode::from(2);
+        }
+        options.curve_tolerance = value;
+      }
+      option if option.starts_with("--") => {
+        eprintln!("bench: unknown option: {option}");
+        return ExitCode::from(2);
+      }
+      value => positional.push(value),
+    }
+  }
+  let [file, size, frames] = positional.as_slice() else {
     return usage();
   };
   let (Ok(size), Ok(frames)) = (size.parse::<u32>(), frames.parse::<usize>()) else {
@@ -119,7 +146,6 @@ fn bench_cmd(args: &[String]) -> ExitCode {
     return ExitCode::FAILURE;
   };
   let mut pixels = vec![0u32; pixel_count];
-  let options = RenderOptions::default();
   for index in 0..frames {
     let started = std::time::Instant::now();
     if let Err(error) = renderer.render((index % frame_count) as f32, &mut pixels, size, size, options) {
@@ -259,13 +285,13 @@ mod tests {
   }
 
   #[test]
-  fn render_options_use_accurate_defaults() {
+  fn render_options_use_default_curve_tolerance() {
     let values = args(&["animation.json", "0", "256", "out.png"]);
     let parsed = parse_render_args(&values).unwrap();
 
     assert_eq!(parsed.backend, "cpu");
     assert!(parsed.options.antialias);
-    assert_eq!(parsed.options.curve_tolerance, 0.05);
+    assert_eq!(parsed.options.curve_tolerance, 0.5);
   }
 
   #[test]

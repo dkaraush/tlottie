@@ -9,8 +9,9 @@ pub struct RenderOptions {
   pub antialias: bool,
   /// Maximum device-space curve-flattening error in pixels.
   ///
-  /// The accurate default is `0.05`. Larger values reduce contour points
-  /// and GPU edge work at the cost of geometric accuracy.
+  /// The default is `0.5`, which keeps flattening error below one output
+  /// pixel while substantially reducing contour work. Smaller values improve
+  /// geometric accuracy at a performance cost.
   pub curve_tolerance: f32,
 
   /// Reserved for a future single-color rendering override.
@@ -23,7 +24,7 @@ impl Default for RenderOptions {
   fn default() -> Self {
     Self {
       antialias: true,
-      curve_tolerance: 0.05,
+      curve_tolerance: 0.5,
       single_color: false,
     }
   }
