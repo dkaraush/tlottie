@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -106,7 +107,10 @@ def frame_count(file: Path) -> int:
 def renderer_command(renderer: str, device_file: str, size: int, frames: int) -> str:
     binary = ANDROID_RENDERERS[renderer]
     if renderer == "tlottie":
-        args = [binary, "bench", device_file, str(size), str(frames)]
+        args = [binary, "bench"]
+        if renderer_command.curve_tolerance is not None:
+            args.extend(("--curve-tolerance", renderer_command.curve_tolerance))
+        args.extend((device_file, str(size), str(frames)))
     else:
         count = frame_count(Path(renderer_command.host_file))
         sequence = ",".join(str(index % count) for index in range(frames))
@@ -115,6 +119,7 @@ def renderer_command(renderer: str, device_file: str, size: int, frames: int) ->
 
 
 renderer_command.host_file = Path()  # type: ignore[attr-defined]
+renderer_command.curve_tolerance = None  # type: ignore[attr-defined]
 
 
 def make_script(
@@ -188,10 +193,14 @@ def main() -> int:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--renderers", default=",".join(ANDROID_RENDERERS))
     parser.add_argument("--core-mask", default="80", help="taskset mask; 80 pins CPU 7 on the reference device")
+    parser.add_argument("--curve-tolerance", type=float, help="override tlottie's device-space curve tolerance")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--no-open", action="store_true")
     parser.add_argument("--write-raw", action="store_true")
     args = parser.parse_args()
+    if args.curve_tolerance is not None and (not math.isfinite(args.curve_tolerance) or args.curve_tolerance <= 0):
+        raise SystemExit("--curve-tolerance must be a positive finite number")
+    renderer_command.curve_tolerance = None if args.curve_tolerance is None else str(args.curve_tolerance)
     args.serial = connected_serial(args.serial)
     if args.frames < 2 or args.reps < 1:
         raise SystemExit("--frames must be >=2 and --reps must be positive")
