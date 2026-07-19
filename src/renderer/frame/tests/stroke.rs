@@ -20,6 +20,16 @@ fn shoelace(pts: &[Vec2]) -> f32 {
 }
 
 #[test]
+fn one_step_arc_uses_known_outgoing_normal() {
+  let start = Vec2::new(1.0, 0.0);
+  let end = Vec2::new(0.96, 0.28);
+  let mut border = Border::new(vec![start]);
+  border.arc_to(Vec2::new(0.0, 0.0), 1.0, start, end, 0.283_794_1);
+  assert_eq!(border.pts.len(), 2);
+  assert_eq!(border.pts[1], end);
+}
+
+#[test]
 fn straight_band_area_and_sign() {
   let out = stroke(&[(0.0, 0.0), (10.0, 0.0)], false, 2.0, Cap::Butt, Join::Miter, 4.0);
   assert_eq!(out.len(), 1);

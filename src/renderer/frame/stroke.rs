@@ -73,14 +73,19 @@ impl Border {
     self.movable = movable;
   }
 
-  /// Polygonal arc around `center`, radius `r`, from `a0` sweeping
-  /// `sweep` radians; the start point is assumed already present (it is
-  /// the incoming segment's end offset), so emission starts at step 1.
-  fn arc_to(&mut self, center: Vec2, r: f32, a0: f32, sweep: f32) {
+  /// Polygonal arc around `center`, radius `r`, from unit vector `start`
+  /// to unit vector `end` while sweeping `sweep` radians. The start point
+  /// is already present, so emission starts at step 1.
+  fn arc_to(&mut self, center: Vec2, r: f32, start: Vec2, end: Vec2, sweep: f32) {
     self.movable = false;
     let step = (8.0 * ARC_TOL / r.max(1e-3)).sqrt().clamp(0.0655, 0.35);
     let steps = ((sweep.abs() / step).ceil() as usize).clamp(1, 48);
     self.pts.reserve(steps);
+    if steps == 1 {
+      self.pts.push(Vec2::new(center.x + r * end.x, center.y + r * end.y));
+      return;
+    }
+    let a0 = start.y.atan2(start.x);
     for i in 1..=steps {
       let a = a0 + sweep * (i as f32 / steps as f32);
       self.pts.push(Vec2::new(center.x + r * a.cos(), center.y + r * a.sin()));
@@ -399,7 +404,7 @@ fn process_corner(
     match eff_join {
       Join::Round => {
         let start = Vec2::new(so * n_in.x, so * n_in.y);
-        let a0 = start.y.atan2(start.x);
+        let end = Vec2::new(so * n_out.x, so * n_out.y);
         let sweep = if reversal {
           // VFT:776 — turn == pi resolves to -rotate*2 of the
           // outside side; in vector terms the semicircle bulges
@@ -408,7 +413,7 @@ fn process_corner(
         } else {
           cross.atan2(dot)
         };
-        bo.arc_to(p, hw, a0, sweep);
+        bo.arc_to(p, hw, start, end, sweep);
       }
       Join::Bevel | Join::Miter => {
         let denom = 1.0 + dot;
