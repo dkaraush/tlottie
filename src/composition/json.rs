@@ -99,7 +99,8 @@ impl<'a> Cursor<'a> {
   /// replace it later behind the same signature.
   pub fn parse_f64(&mut self) -> Result<f64> {
     let start = self.pos;
-    if self.peek() == Some(b'-') {
+    let negative = self.peek() == Some(b'-');
+    if negative {
       self.pos += 1;
     }
     let mut saw_digit = false;
@@ -107,7 +108,9 @@ impl<'a> Cursor<'a> {
       self.pos += 1;
       saw_digit = true;
     }
+    let mut integer_token = true;
     if self.peek() == Some(b'.') {
+      integer_token = false;
       self.pos += 1;
       while matches!(self.peek(), Some(b'0'..=b'9')) {
         self.pos += 1;
@@ -118,6 +121,7 @@ impl<'a> Cursor<'a> {
       return Err(self.err(JsonErrorKind::BadNumber));
     }
     if matches!(self.peek(), Some(b'e' | b'E')) {
+      integer_token = false;
       self.pos += 1;
       if matches!(self.peek(), Some(b'+' | b'-')) {
         self.pos += 1;
@@ -132,6 +136,22 @@ impl<'a> Cursor<'a> {
       }
     }
     let token = self.bytes.get(start..self.pos).ok_or_else(|| self.err(JsonErrorKind::BadNumber))?;
+    if integer_token {
+      let digits = if negative { token.get(1..).unwrap_or(&[]) } else { token };
+      let mut value = 0u64;
+      let mut exact = true;
+      for &digit in digits {
+        let Some(next) = value.checked_mul(10).and_then(|v| v.checked_add(u64::from(digit - b'0'))) else {
+          exact = false;
+          break;
+        };
+        value = next;
+      }
+      if exact && value <= (1u64 << 53) {
+        let value = value as f64;
+        return Ok(if negative { -value } else { value });
+      }
+    }
     core::str::from_utf8(token)
       .ok()
       .and_then(|s| s.parse::<f64>().ok())
@@ -195,6 +215,21 @@ impl<'a> Cursor<'a> {
       Some(b'-' | b'0'..=b'9') => self.parse_f64().map(|_| ()),
       Some(b) => Err(self.err(JsonErrorKind::UnexpectedByte(b))),
       None => Err(self.err(JsonErrorKind::UnexpectedEof)),
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::Cursor;
+
+  #[test]
+  fn integer_fast_path_matches_general_f64_edges() {
+    for token in ["0", "-0", "42", "-42", "9007199254740992", "9007199254740993", "1.25", "1e3"] {
+      let mut cursor = Cursor::new(token.as_bytes(), 8);
+      let parsed = cursor.parse_f64().expect("valid number");
+      let expected = token.parse::<f64>().expect("valid number");
+      assert_eq!(parsed.to_bits(), expected.to_bits(), "{token}");
     }
   }
 }
