@@ -323,10 +323,17 @@ impl ShapeWalker<'_> {
     for pj in pending.iter().rev() {
       match self.materialize(pj, arena, &|key| renderer.retains_geometry(key)) {
         DrawJob::Solid {
-          key, contours, rule, color, opacity, ..
+          key,
+          contours,
+          borrowed,
+          rule,
+          color,
+          opacity,
+          ..
         } => {
+          let geometry = borrowed.and_then(|index| arena.get(index).map(|(contour, _)| core::slice::from_ref(contour))).unwrap_or(&contours);
           renderer.draw(
-            Geometry::new(&contours, key),
+            Geometry::new(geometry, key),
             Paint::Solid(SolidPaint {
               rule: rule_of(rule),
               argb: premul_argb(color, opacity),
@@ -342,11 +349,13 @@ impl ShapeWalker<'_> {
           key,
           src_key,
           contours,
+          borrowed,
           rule,
           lut,
           map,
           ..
         } => {
+          let geometry = borrowed.and_then(|index| arena.get(index).map(|(contour, _)| core::slice::from_ref(contour))).unwrap_or(&contours);
           let gradient = GradientPaint {
             rule: rule_of(rule),
             lut,
@@ -365,7 +374,7 @@ impl ShapeWalker<'_> {
             },
             source_key: src_key,
           };
-          renderer.draw(Geometry::new(&contours, key), Paint::Gradient(&gradient));
+          renderer.draw(Geometry::new(geometry, key), Paint::Gradient(&gradient));
           for c in contours {
             self.scratch.put_pts(c.points);
           }

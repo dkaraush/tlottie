@@ -53,6 +53,7 @@ pub(crate) enum DrawJob {
   Solid {
     key: u128,
     contours: Vec<Contour>,
+    borrowed: Option<usize>,
     rule: FillRule,
     color: Color,
     opacity: f32,
@@ -61,6 +62,7 @@ pub(crate) enum DrawJob {
     key: u128,
     src_key: u128,
     contours: Vec<Contour>,
+    borrowed: Option<usize>,
     rule: FillRule,
     lut: std::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
     map: GradientMap,
@@ -83,8 +85,16 @@ impl ShapeWalker<'_> {
     // the next — nothing forces all jobs' contours to coexist.
     for pj in pending.iter().rev() {
       let contours = match self.materialize(pj, arena, &|_| false) {
-        DrawJob::Solid { key, contours, rule, color, opacity } => {
-          canvas.fill::<false>(&mut self.scratch.cov_cache, key, &contours, rule, color, opacity);
+        DrawJob::Solid {
+          key,
+          contours,
+          borrowed,
+          rule,
+          color,
+          opacity,
+        } => {
+          let geometry = borrowed.and_then(|index| arena.get(index).map(|(contour, _)| core::slice::from_ref(contour))).unwrap_or(&contours);
+          canvas.fill::<false>(&mut self.scratch.cov_cache, key, geometry, rule, color, opacity);
           if let Some(rec) = record.as_deref_mut() {
             rec.push(ReplayJob::Solid { key, rule, color, opacity });
           }
@@ -94,11 +104,13 @@ impl ShapeWalker<'_> {
           key,
           src_key,
           contours,
+          borrowed,
           rule,
           lut,
           map,
         } => {
-          canvas.fill_gradient::<false>(&mut self.scratch.cov_cache, key, src_key, &contours, rule, &lut, &map);
+          let geometry = borrowed.and_then(|index| arena.get(index).map(|(contour, _)| core::slice::from_ref(contour))).unwrap_or(&contours);
+          canvas.fill_gradient::<false>(&mut self.scratch.cov_cache, key, src_key, geometry, rule, &lut, &map);
           if let Some(rec) = record.as_deref_mut() {
             rec.push(ReplayJob::Gradient {
               key,
@@ -150,9 +162,11 @@ impl ShapeWalker<'_> {
     match &pj.paint {
       PendingPaint::Solid { rule, color, opacity } => {
         let key = self.fill_key(slice, *rule);
+        let hit = retained(key);
+        let borrowed = (!hit && slice.len() == 1 && self.clip_is_noop(&slice[0].0)).then_some(pj.start);
         DrawJob::Solid {
           key,
-          contours: if retained(key) {
+          contours: if hit || borrowed.is_some() {
             Vec::new() // hit: coverage replays, geometry unneeded
           } else {
             let mut v = Vec::with_capacity(slice.len());
@@ -162,6 +176,7 @@ impl ShapeWalker<'_> {
             }
             v
           },
+          borrowed,
           rule: *rule,
           color: *color,
           opacity: *opacity,
@@ -170,10 +185,12 @@ impl ShapeWalker<'_> {
       PendingPaint::Gradient { rule, lut, lut_id, map } => {
         let key = self.fill_key(slice, *rule);
         let src_key = Self::src_key_of(key, *lut_id, map);
+        let hit = retained(key);
+        let borrowed = (!hit && slice.len() == 1 && self.clip_is_noop(&slice[0].0)).then_some(pj.start);
         DrawJob::Gradient {
           key,
           src_key,
-          contours: if retained(key) {
+          contours: if hit || borrowed.is_some() {
             Vec::new()
           } else {
             let mut v = Vec::with_capacity(slice.len());
@@ -183,6 +200,7 @@ impl ShapeWalker<'_> {
             }
             v
           },
+          borrowed,
           rule: *rule,
           lut: lut.clone(),
           map: map.clone(),
@@ -212,6 +230,7 @@ impl ShapeWalker<'_> {
               key: stroke_key,
               src_key: gradient_keys.unwrap_or(stroke_key),
               contours: Vec::new(),
+              borrowed: None,
               rule: FillRule::NonZero,
               lut: lut.clone(),
               map: map.clone(),
@@ -219,6 +238,7 @@ impl ShapeWalker<'_> {
             None => DrawJob::Solid {
               key: stroke_key,
               contours: Vec::new(),
+              borrowed: None,
               rule: FillRule::NonZero,
               color: color.unwrap_or(Color::BLACK),
               opacity: *opacity,
@@ -284,6 +304,7 @@ impl ShapeWalker<'_> {
             key: stroke_key,
             src_key: gradient_keys.unwrap_or(stroke_key),
             contours,
+            borrowed: None,
             rule: FillRule::NonZero,
             lut: lut.clone(),
             map: map.clone(),
@@ -291,6 +312,7 @@ impl ShapeWalker<'_> {
           None => DrawJob::Solid {
             key: stroke_key,
             contours,
+            borrowed: None,
             rule: FillRule::NonZero,
             color: color.unwrap_or(Color::BLACK),
             opacity: *opacity,
