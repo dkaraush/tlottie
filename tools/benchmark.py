@@ -213,6 +213,40 @@ def pack_of(root: Path, file: Path) -> str:
     return rel.parts[0] if len(rel.parts) > 1 else "."
 
 
+def select_packs(all_packs: list[str], selector: str) -> list[str]:
+    """Select packs by exact name, count, or inclusive 1-based range."""
+    selector = selector.strip()
+    if not selector:
+        raise SystemExit("--packs must not be empty")
+
+    if "," in selector:
+        parts = [part.strip() for part in selector.split(",")]
+        if len(parts) != 2:
+            raise SystemExit("--packs range must be START,END")
+        try:
+            start, end = (int(part) for part in parts)
+        except ValueError:
+            raise SystemExit("--packs range must use integer positions: START,END") from None
+        if start <= 0 or end <= 0:
+            raise SystemExit("--packs range positions must be positive")
+        if start > end:
+            raise SystemExit("--packs range START must not exceed END")
+        return all_packs[start - 1 : end]
+
+    try:
+        count = int(selector)
+    except ValueError:
+        if selector not in all_packs:
+            raise SystemExit(f"unknown pack: {selector}") from None
+        return [selector]
+
+    if count == 0:
+        raise SystemExit("--packs count must not be zero")
+    if count > 0:
+        return all_packs[:count]
+    return all_packs[count:]
+
+
 _RUSAGE_INFO_V2 = 2
 
 
@@ -2100,8 +2134,10 @@ def main() -> int:
     ap.add_argument("--limit", type=int)
     ap.add_argument(
         "--packs",
-        type=int,
-        help="benchmark only the first N packs (sorted by name) instead of all",
+        help=(
+            "select packs by exact name, first N, inclusive 1-based range START,END, "
+            "or last N with -N (packs are sorted by name)"
+        ),
     )
     ap.add_argument("--renderers", default=",".join(DEFAULT_RENDERERS))
     ap.add_argument("--skip-build", action="store_true")
@@ -2123,8 +2159,6 @@ def main() -> int:
         raise SystemExit("--accuracy-diff-threshold must be non-negative")
     if args.save_diffs < 0:
         raise SystemExit("--save-diffs must be non-negative")
-    if args.packs is not None and args.packs <= 0:
-        raise SystemExit("--packs must be positive")
     if args.no_accuracy and args.save_diffs:
         raise SystemExit("--save-diffs requires accuracy; remove --no-accuracy")
     ensure_builds(args.skip_build)
@@ -2133,17 +2167,14 @@ def main() -> int:
             raise SystemExit(f"missing {r} library: {LIBS[r]}")
 
     files = discover(args.input, args.limit)
-    if args.packs:
-        all_packs: list[str] = []
-        for file in files:
-            pack = pack_of(args.input, file)
-            if pack not in all_packs:
-                all_packs.append(pack)
-        keep = set(all_packs[: args.packs])
+    if args.packs is not None:
+        all_packs = sorted({pack_of(args.input, file) for file in files})
+        selected_packs = select_packs(all_packs, args.packs)
+        keep = set(selected_packs)
         files = [f for f in files if pack_of(args.input, f) in keep]
         print(
             f"== packs limited to {len(keep)}/{len(all_packs)}: "
-            + ", ".join(sorted(keep)),
+            + ", ".join(selected_packs),
             flush=True,
         )
     if not files:

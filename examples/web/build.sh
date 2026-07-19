@@ -5,7 +5,7 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 target=wasm32-unknown-unknown
-profile=release-size
+profile=release
 rustup_toolchain=
 
 if command -v rustup >/dev/null 2>&1; then
