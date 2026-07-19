@@ -509,7 +509,9 @@ pub(crate) fn stroke_polyline(points: &[Vec2], point_anchors: &[bool], closed: b
     return Vec::new();
   }
 
-  let mut pts = Vec::with_capacity(points.len());
+  let mut pts = pool.pop().unwrap_or_default();
+  pts.clear();
+  pts.reserve(points.len());
   let mut anchors = Vec::with_capacity(points.len());
   for (index, point) in points.iter().enumerate() {
     if !(point.x.is_finite() && point.y.is_finite()) {
@@ -536,11 +538,14 @@ pub(crate) fn stroke_polyline(points: &[Vec2], point_anchors: &[bool], closed: b
   }
 
   if pts.len() < 2 {
+    pool.push(pts);
     return Vec::new();
   }
 
   let mut out = Vec::new();
   stroke_outline(&pts, &anchors, closed, hw, cap, join, miter_limit, pool, &mut out);
+  pts.clear();
+  pool.push(pts);
   out
 }
 
