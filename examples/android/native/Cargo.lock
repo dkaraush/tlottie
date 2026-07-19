@@ -347,6 +347,10 @@ dependencies = [
 [[package]]
 name = "tlottie"
 version = "0.1.0"
+dependencies = [
+ "ash",
+ "naga",
+]
 
 [[package]]
 name = "tlottie-android"
@@ -355,16 +359,6 @@ dependencies = [
  "ash",
  "jni",
  "libloading 0.8.9",
- "tlottie",
- "tlottie-vulkan",
-]
-
-[[package]]
-name = "tlottie-vulkan"
-version = "0.1.0"
-dependencies = [
- "ash",
- "naga",
  "tlottie",
 ]
 

@@ -559,7 +559,7 @@ fn create_swapchain(
 }
 
 struct FrameSlot {
-    renderer: Option<tlottie_vulkan::Renderer<'static>>,
+    renderer: Option<tlottie::vulkan::VulkanRenderer<'static>>,
     scratch: Buffer,
     offscreen: Image,
     multisample: Option<Image>,
@@ -626,7 +626,7 @@ impl GpuRenderer {
             .map_err(|error| format!("vkCreateQueryPool(timestamp): {error:?}"))?;
 
         // Context is boxed, so its ash::Device has a stable address. Drop
-        // destroys Renderer before Context, making this extended borrow sound.
+        // destroys VulkanRenderer before Context, making this extended borrow sound.
         let device: &'static ash::Device = unsafe { &*(&context.device as *const ash::Device) };
         let mut slots = Vec::with_capacity(frame_slot_count);
         for command in commands {
@@ -660,11 +660,11 @@ impl GpuRenderer {
             let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
             let frame_fence = unsafe { context.device.create_fence(&fence_info, None) }
                 .map_err(|error| format!("vkCreateFence: {error:?}"))?;
-            let mut renderer = tlottie_vulkan::Renderer::new_with_raster_order_groups(
+            let mut renderer = tlottie::vulkan::VulkanRenderer::new_with_raster_order_groups(
                 device,
                 context.raster_order_groups,
             )
-                .map_err(|error| format!("initialize tlottie-vulkan: {error}"))?;
+                .map_err(|error| format!("initialize tlottie Vulkan renderer: {error}"))?;
             renderer.set_multi_draw_indirect(context.multi_draw_indirect);
             slots.push(FrameSlot {
                 renderer: Some(renderer),
@@ -792,14 +792,14 @@ impl GpuRenderer {
             .get(index)
             .ok_or_else(|| "swapchain layout state is missing".to_string())?;
         let extent = self.swapchain.extent;
-        let scratch = tlottie_vulkan::BufferTarget {
+        let scratch = tlottie::vulkan::BufferTarget {
             buffer: slot.scratch.buffer,
             width: extent.width,
             height: extent.height,
             bytes: slot.scratch.bytes,
         };
         let direct_present = self.swapchain.direct_resolve;
-        let target = tlottie_vulkan::ImageTarget {
+        let target = tlottie::vulkan::ImageTarget {
             image: if direct_present {
                 swapchain_image
             } else {
@@ -834,9 +834,9 @@ impl GpuRenderer {
             .renderer
             .as_mut()
             .ok_or_else(|| "Vulkan renderer was already destroyed".to_string())?;
-        renderer.set_mode(tlottie_vulkan::RendererMode::StencilCover);
+        renderer.set_mode(tlottie::vulkan::RendererMode::StencilCover);
         // SAFETY: command, scratch, and acquired swapchain image all belong to
-        // the same device and match tlottie-vulkan's target contract.
+        // the same device and match tlottie's Vulkan target contract.
         unsafe {
             renderer.record_profiled(
                 slot.command,
@@ -845,7 +845,7 @@ impl GpuRenderer {
                 composition,
                 frame,
                 options,
-                tlottie_vulkan::ProfileQueries {
+                tlottie::vulkan::ProfileQueries {
                     pool: self.timestamp_queries,
                     first: query_first,
                 },
@@ -934,7 +934,7 @@ impl GpuRenderer {
             .first_mut()
             .ok_or_else(|| "Vulkan benchmark frame slot is missing".to_string())?;
         let extent = self.swapchain.extent;
-        let scratch = tlottie_vulkan::BufferTarget {
+        let scratch = tlottie::vulkan::BufferTarget {
             buffer: slot.scratch.buffer,
             width: extent.width,
             height: extent.height,
@@ -985,7 +985,7 @@ impl GpuRenderer {
                 );
             }
 
-            let target = tlottie_vulkan::ImageTarget {
+            let target = tlottie::vulkan::ImageTarget {
                 image: slot.offscreen.image,
                 format: vk::Format::B8G8R8A8_UNORM,
                 width: extent.width,
@@ -1005,7 +1005,7 @@ impl GpuRenderer {
                 .renderer
                 .as_mut()
                 .ok_or_else(|| "Vulkan renderer was already destroyed".to_string())?;
-            renderer.set_mode(tlottie_vulkan::RendererMode::StencilCover);
+            renderer.set_mode(tlottie::vulkan::RendererMode::StencilCover);
             unsafe {
                 renderer.record_profiled(
                     slot.command,
@@ -1014,7 +1014,7 @@ impl GpuRenderer {
                     composition,
                     (index % frame_count) as f32,
                     options,
-                    tlottie_vulkan::ProfileQueries {
+                    tlottie::vulkan::ProfileQueries {
                         pool: self.timestamp_queries,
                         first: 0,
                     },

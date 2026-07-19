@@ -5,8 +5,8 @@ Android document picker, or a fixture from the device corpus at
 `/storage/emulated/0/Android/data/com.example.tlottie/files/tgs_dump`. The fixture selector first chooses a pack and then
 an animation.
 
-The backend button switches between tlottie's CPU renderer and
-`tlottie-vulkan`. Vulkan renders directly into a `SurfaceView` swapchain through
+The backend button switches between tlottie's CPU renderer and its `vulkan`
+feature. Vulkan renders directly into a `SurfaceView` swapchain through
 `ANativeWindow`; there is no GPU readback or Android `Bitmap` on that path. The
 CPU comparison path writes an Android `Bitmap` displayed by a regular `View`.
 If the surface does not expose `B8G8R8A8_UNORM`, the Vulkan path keeps tlottie's

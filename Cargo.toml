@@ -1,22 +1,41 @@
-[workspace]
-resolver = "2"
-members = [
-    "crates/tlottie",
-    "crates/tlottie-cli",
-    "crates/tlottie-capi",
-    "crates/tlottie-vulkan",
-    "crates/tlottie-wasm",
-]
-
-[workspace.package]
+[package]
+name = "tlottie"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
-# The no-panic wall. The core crate must never reach a panic path; these lints
-# make the panic-prone constructs compile errors. Tests are exempted via
-# clippy.toml (allow-*-in-tests). See GOALS.md "Safety contract".
-[workspace.lints.clippy]
+[lib]
+name = "tlottie"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "tlottie-cli"
+path = "src/cli/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cpu"]
+cpu = []
+vulkan = ["cpu", "dep:ash", "dep:naga"]
+opengl = ["cpu", "dep:glow"]
+webgl = ["opengl", "wasm", "dep:wasm-bindgen", "dep:web-sys"]
+cli = ["cpu"]
+c-api = ["cpu"]
+wasm = ["cpu"]
+stats = []
+
+[dependencies]
+ash = { version = "0.37.3", default-features = false, features = ["loaded"], optional = true }
+glow = { version = "0.18", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { version = "0.2.126", optional = true }
+web-sys = { version = "0.3.103", features = ["HtmlCanvasElement", "WebGl2RenderingContext"], optional = true }
+
+[build-dependencies]
+naga = { version = "24", features = ["spv-out", "wgsl-in"], optional = true }
+
+[lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
@@ -27,17 +46,14 @@ string_slice = "deny"
 fallible_impl_from = "deny"
 unreachable = "deny"
 
-[workspace.lints.rust]
+[lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
 [profile.release]
 opt-level = 3
-debug = true  # symbols for profiling; stripped in release-size
+debug = false
 lto = "fat"
 codegen-units = 1
-# panic stays "unwind": the FFI boundary uses catch_unwind as the last-resort
-# backstop; the real contract is that no panic path exists (checked by the
-# absence of core::panicking symbols in the release artifact).
 
 [profile.release-size]
 inherits = "release"

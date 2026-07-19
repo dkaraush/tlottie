@@ -7,10 +7,9 @@ uses many worker processes, and each worker loads the native library once.
 
 Energy: on Linux, RAPL package energy is read around the batch and prorated per
 row by measured time. On macOS (Apple Silicon), per-task consumed energy
-(task_info TASK_POWER_INFO_V2.task_energy, the Activity Monitor source — same
-as the tlottie dump tools' E footer) is sampled around each renderer run inside
-the worker, giving direct per-row attribution. Memory on macOS is sampled via
-proc_pid_rusage resident size, the live counterpart of ru_maxrss.
+(task_info TASK_POWER_INFO_V2.task_energy, the Activity Monitor source) is
+sampled around each renderer run inside the worker, giving direct per-row
+attribution. Memory on macOS is sampled via proc_pid_rusage resident size.
 """
 
 from __future__ import annotations
@@ -52,7 +51,7 @@ PROJECT_DIRS = {
 LIB_SUFFIX = ".dylib" if platform.system() == "Darwin" else ".so"
 
 LIBS = {
-    "tlottie": ROOT / "target" / "release" / f"libtlottie_capi{LIB_SUFFIX}",
+    "tlottie": ROOT / "target" / "release" / f"libtlottie{LIB_SUFFIX}",
     "rlottie": PROJECT_DIRS["rlottie"] / "build-release" / "src" / f"librlottie{LIB_SUFFIX}",
     "rlottie_2019": PROJECT_DIRS["rlottie_2019"]
     / "build-release"
@@ -79,9 +78,17 @@ def ensure_builds(skip: bool) -> None:
         return
     env = os.environ.copy()
     env["RUSTFLAGS"] = env.get("RUSTFLAGS", "-C target-cpu=native")
-    run(["cargo", "build", "-p", "tlottie-capi", "--release"], ROOT, env)
+    run(["cargo", "build", "--release", "--lib", "--features", "c-api"], ROOT, env)
     run(
-        ["cargo", "build", "-p", "tlottie-cli", "--release", "--features", "vulkan"],
+        [
+            "cargo",
+            "build",
+            "--release",
+            "--bin",
+            "tlottie-cli",
+            "--features",
+            "cli,vulkan",
+        ],
         ROOT,
         env,
     )
@@ -344,12 +351,12 @@ class EnergySampler:
 class Tlottie:
     def __init__(self, path: Path) -> None:
         self.lib = C.CDLL(str(path))
-        self.lib.tlottie_animation_new.argtypes = [C.c_void_p, C.c_size_t]
-        self.lib.tlottie_animation_new.restype = C.c_void_p
-        self.lib.tlottie_animation_drop.argtypes = [C.c_void_p]
-        self.lib.tlottie_animation_frame_count.argtypes = [C.c_void_p]
-        self.lib.tlottie_animation_frame_count.restype = C.c_uint32
-        self.lib.tlottie_animation_render_argb.argtypes = [
+        self.lib.tlottie_new.argtypes = [C.c_void_p, C.c_size_t]
+        self.lib.tlottie_new.restype = C.c_void_p
+        self.lib.tlottie_drop.argtypes = [C.c_void_p]
+        self.lib.tlottie_frame_count.argtypes = [C.c_void_p]
+        self.lib.tlottie_frame_count.restype = C.c_uint32
+        self.lib.tlottie_render.argtypes = [
             C.c_void_p,
             C.c_float,
             C.c_uint32,
@@ -358,7 +365,7 @@ class Tlottie:
             C.c_size_t,
             C.c_uint32,
         ]
-        self.lib.tlottie_animation_render_argb.restype = C.c_int
+        self.lib.tlottie_render.restype = C.c_int
 
     def measure(
         self, file: Path, size: int, frames: int
@@ -366,15 +373,15 @@ class Tlottie:
         t0 = time.perf_counter_ns()
         data = file.read_bytes()
         buf = C.create_string_buffer(data)
-        anim = self.lib.tlottie_animation_new(buf, len(data))
+        anim = self.lib.tlottie_new(buf, len(data))
         if not anim:
             return False, 0.0, None, 0, rss_mb(), rss_mb(), "parse"
         pixels = (C.c_uint32 * (size * size))()
         try:
-            count = max(1, int(self.lib.tlottie_animation_frame_count(anim)))
+            count = max(1, int(self.lib.tlottie_frame_count(anim)))
             frames = count if frames <= 0 else frames
             rss_samples: list[float] = []
-            rc = self.lib.tlottie_animation_render_argb(
+            rc = self.lib.tlottie_render(
                 anim, 0.0, size, size, pixels, size * size, 1
             )
             first_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
@@ -388,12 +395,12 @@ class Tlottie:
                 frame = float(i % count)
                 t1 = time.perf_counter_ns()
                 if i % count == 0:
-                    self.lib.tlottie_animation_drop(anim)
-                    anim = self.lib.tlottie_animation_new(buf, len(data))
+                    self.lib.tlottie_drop(anim)
+                    anim = self.lib.tlottie_new(buf, len(data))
                     if not anim:
                         render_ns += time.perf_counter_ns() - t1
                         return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "parse"
-                rc = self.lib.tlottie_animation_render_argb(
+                rc = self.lib.tlottie_render(
                     anim, frame, size, size, pixels, size * size, 1
                 )
                 render_ns += time.perf_counter_ns() - t1
@@ -405,18 +412,18 @@ class Tlottie:
             return True, first_ms, other_ms, other_frames, avg(rss_samples), max(rss_samples), ""
         finally:
             if anim:
-                self.lib.tlottie_animation_drop(anim)
+                self.lib.tlottie_drop(anim)
 
     def render_argb(self, file: Path, size: int, frame: int) -> tuple[bool, list[int], str]:
         data = file.read_bytes()
         buf = C.create_string_buffer(data)
-        anim = self.lib.tlottie_animation_new(buf, len(data))
+        anim = self.lib.tlottie_new(buf, len(data))
         if not anim:
             return False, [], "parse"
         pixels = (C.c_uint32 * (size * size))()
         try:
-            count = max(1, int(self.lib.tlottie_animation_frame_count(anim)))
-            rc = self.lib.tlottie_animation_render_argb(
+            count = max(1, int(self.lib.tlottie_frame_count(anim)))
+            rc = self.lib.tlottie_render(
                 anim, float(frame % count), size, size, pixels, size * size, 1
             )
             if rc != 0:
@@ -424,20 +431,20 @@ class Tlottie:
             return True, list(pixels), ""
         finally:
             if anim:
-                self.lib.tlottie_animation_drop(anim)
+                self.lib.tlottie_drop(anim)
 
     def render_frames_argb(self, file: Path, size: int) -> tuple[bool, list[list[int]], int, str]:
         data = file.read_bytes()
         buf = C.create_string_buffer(data)
-        anim = self.lib.tlottie_animation_new(buf, len(data))
+        anim = self.lib.tlottie_new(buf, len(data))
         if not anim:
             return False, [], 0, "parse"
         pixels = (C.c_uint32 * (size * size))()
         try:
-            count = max(1, int(self.lib.tlottie_animation_frame_count(anim)))
+            count = max(1, int(self.lib.tlottie_frame_count(anim)))
             frames = []
             for frame in range(count):
-                rc = self.lib.tlottie_animation_render_argb(
+                rc = self.lib.tlottie_render(
                     anim, float(frame), size, size, pixels, size * size, 1
                 )
                 if rc != 0:
@@ -445,7 +452,7 @@ class Tlottie:
                 frames.append(list(pixels))
             return True, frames, count, ""
         finally:
-            self.lib.tlottie_animation_drop(anim)
+            self.lib.tlottie_drop(anim)
 
     def measure_frames_argb(
         self, file: Path, size: int, frames: int
@@ -453,16 +460,16 @@ class Tlottie:
         t0 = time.perf_counter_ns()
         data = file.read_bytes()
         buf = C.create_string_buffer(data)
-        anim = self.lib.tlottie_animation_new(buf, len(data))
+        anim = self.lib.tlottie_new(buf, len(data))
         if not anim:
             return False, 0.0, None, 0, rss_mb(), rss_mb(), "parse", [], 0
         pixels = (C.c_uint32 * (size * size))()
         try:
-            count = max(1, int(self.lib.tlottie_animation_frame_count(anim)))
+            count = max(1, int(self.lib.tlottie_frame_count(anim)))
             frames = count if frames <= 0 else frames
             rss_samples: list[float] = []
             out_frames: list[list[int]] = []
-            rc = self.lib.tlottie_animation_render_argb(
+            rc = self.lib.tlottie_render(
                 anim, 0.0, size, size, pixels, size * size, 1
             )
             first_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
@@ -476,12 +483,12 @@ class Tlottie:
                     continue
                 t1 = time.perf_counter_ns()
                 if i % count == 0:
-                    self.lib.tlottie_animation_drop(anim)
-                    anim = self.lib.tlottie_animation_new(buf, len(data))
+                    self.lib.tlottie_drop(anim)
+                    anim = self.lib.tlottie_new(buf, len(data))
                     if not anim:
                         render_ns += time.perf_counter_ns() - t1
                         return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "parse", [], count
-                rc = self.lib.tlottie_animation_render_argb(
+                rc = self.lib.tlottie_render(
                     anim, float(i % count), size, size, pixels, size * size, 1
                 )
                 render_ns += time.perf_counter_ns() - t1
@@ -503,7 +510,7 @@ class Tlottie:
                 count,
             )
         finally:
-            self.lib.tlottie_animation_drop(anim)
+            self.lib.tlottie_drop(anim)
 
 
 class TlottieVulkan:
@@ -585,7 +592,6 @@ class TlottieVulkan:
         self, file: Path, size: int, start: int, frames: int, capture: bool
     ) -> tuple[bool, list[float], list[list[int]], str]:
         env = os.environ.copy()
-        env["TLOTTIE_AA"] = "1"
         env["TLOTTIE_VK_FRAMES"] = str(frames)
         with tempfile.TemporaryDirectory(prefix="tlottie-vulkan-") as temp:
             directory = Path(temp)
@@ -599,6 +605,7 @@ class TlottieVulkan:
                     "render",
                     "--backend",
                     "vulkan",
+                    "--antialias",
                     str(file),
                     str(start),
                     str(size),
@@ -1136,34 +1143,15 @@ def worker_measure(file_s: str) -> tuple[list[dict[str, Any]], dict[str, Any] | 
             # tlottie-vulkan renders in a child process, whose energy is not
             # visible in this task's counter — leave its energy_j unset.
             energy_before = None if renderer == "tlottie-vulkan" else task_energy_nj()
-            if capture_accuracy and rep == 0 and renderer in capture_renderers:
-                (
-                    ok,
-                    first_frame_ms,
-                    frame_ms,
-                    other_frames,
-                    mem_avg,
-                    mem_max,
-                    err,
-                    frames,
-                    count,
-                ) = _WORKER_RENDERERS[renderer].measure_frames_argb(
-                    file, _WORKER_SIZE, _WORKER_FRAMES
-                )
-                captured[renderer] = frames
-                counts[renderer] = count
-                if not ok:
-                    accuracy_errors.append(f"{renderer}:{err}")
-            else:
-                (
-                    ok,
-                    first_frame_ms,
-                    frame_ms,
-                    other_frames,
-                    mem_avg,
-                    mem_max,
-                    err,
-                ) = _WORKER_RENDERERS[renderer].measure(file, _WORKER_SIZE, _WORKER_FRAMES)
+            (
+                ok,
+                first_frame_ms,
+                frame_ms,
+                other_frames,
+                mem_avg,
+                mem_max,
+                err,
+            ) = _WORKER_RENDERERS[renderer].measure(file, _WORKER_SIZE, _WORKER_FRAMES)
             energy_j = None
             if energy_before is not None:
                 energy_after = task_energy_nj()
@@ -1188,6 +1176,28 @@ def worker_measure(file_s: str) -> tuple[list[dict[str, Any]], dict[str, Any] | 
                     "error": err,
                 }
             )
+    # Accuracy capture is deliberately separate from timed repetitions.
+    # Materializing Python pixel arrays creates substantial memory pressure at
+    # 720px and must not distort or erase the subsequent-frame measurements.
+    if capture_accuracy:
+        for renderer in capture_renderers:
+            (
+                ok,
+                _first_frame_ms,
+                _frame_ms,
+                _other_frames,
+                _mem_avg,
+                _mem_max,
+                err,
+                frames,
+                count,
+            ) = _WORKER_RENDERERS[renderer].measure_frames_argb(
+                file, _WORKER_SIZE, _WORKER_FRAMES
+            )
+            captured[renderer] = frames
+            counts[renderer] = count
+            if not ok:
+                accuracy_errors.append(f"{renderer}:{err}")
     accuracy_row = None
     if capture_accuracy:
         accuracy_row = make_accuracy_row(

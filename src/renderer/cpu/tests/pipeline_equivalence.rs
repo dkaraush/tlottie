@@ -1,0 +1,143 @@
+use crate::renderer::cpu::executor::{render_pooled, RenderScratch};
+use crate::renderer::frame::FrameRenderer;
+use crate::{Composition, Limits, RenderOptions};
+
+fn empty_renderer() -> crate::CPURenderer {
+  let composition = Composition::parse(br#"{"fr":30,"ip":0,"op":1,"w":2,"h":2,"layers":[]}"#, &Limits::default()).unwrap();
+  crate::CPURenderer::new(composition)
+}
+
+#[test]
+fn bitmap_binding_rejects_nested_targets() {
+  let mut renderer = empty_renderer();
+  let mut outer = [0u32; 4];
+  let mut inner = [0u32; 4];
+  let result = renderer.with_bitmap(&mut outer, 2, 2, RenderOptions::default(), |renderer| {
+    renderer.with_bitmap(&mut inner, 2, 2, RenderOptions::default(), |_| Ok(()))
+  });
+  assert!(result.is_err());
+  assert!(renderer.bitmap.is_none());
+}
+
+#[test]
+fn bitmap_binding_recycles_unfinished_frame_state_on_error() {
+  let mut renderer = empty_renderer();
+  let mut pixels = [0u32; 4];
+  let result = renderer.with_bitmap(&mut pixels, 2, 2, RenderOptions::default(), |renderer| {
+    renderer.save_layer();
+    Err::<(), _>(crate::Error::InvalidLottie { offset: 0, what: "test error" })
+  });
+  assert!(result.is_err());
+  assert!(renderer.bitmap.is_none());
+  assert!(renderer.surfaces.is_empty());
+  assert!(renderer.surface_dirty.is_empty());
+  assert!(renderer.mask_accumulator.is_none());
+}
+
+#[test]
+fn faint_shape_opacity_is_truncated_to_a_byte() {
+  let composition = Composition::parse(
+    br#"{"fr":30,"ip":0,"op":1,"w":2,"h":2,"layers":[{"ty":4,"ind":1,"ip":0,"op":1,"st":0,"ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]}},"shapes":[{"ty":"gr","it":[{"ty":"rc","p":{"a":0,"k":[1,1]},"s":{"a":0,"k":[2,2]},"r":{"a":0,"k":0}},{"ty":"fl","c":{"a":0,"k":[1,1,1,1]},"o":{"a":0,"k":100},"r":1},{"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0},"o":{"a":0,"k":0.68}}]}]}]}"#,
+    &Limits::default(),
+  )
+  .unwrap();
+  let mut renderer = crate::CPURenderer::new(composition);
+  let mut pixels = [0u32; 4];
+  renderer.render(0.0, &mut pixels, 2, 2, RenderOptions::default()).unwrap();
+  assert_eq!(pixels[0] >> 24, 1);
+}
+
+#[test]
+fn shape_layer_opacity_is_applied_after_paints_are_flattened() {
+  let composition = Composition::parse(
+    br#"{"fr":30,"ip":0,"op":1,"w":4,"h":4,"layers":[{"ty":4,"ind":1,"ip":0,"op":1,"st":0,"ks":{"o":{"a":0,"k":50},"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]}},"shapes":[{"ty":"gr","it":[{"ty":"rc","p":{"a":0,"k":[2,2]},"s":{"a":0,"k":[4,4]},"r":{"a":0,"k":0}},{"ty":"fl","c":{"a":0,"k":[1,1,1,1]},"o":{"a":0,"k":100},"r":1}]},{"ty":"gr","it":[{"ty":"rc","p":{"a":0,"k":[2,2]},"s":{"a":0,"k":[4,4]},"r":{"a":0,"k":0}},{"ty":"fl","c":{"a":0,"k":[1,1,1,1]},"o":{"a":0,"k":100},"r":1}]}]}]}"#,
+    &Limits::default(),
+  )
+  .unwrap();
+  let mut renderer = crate::CPURenderer::new(composition);
+  let mut pixels = [0u32; 16];
+  renderer.render(0.0, &mut pixels, 4, 4, RenderOptions::default()).unwrap();
+  assert_eq!(pixels[5] >> 24, 127);
+}
+
+fn assert_matches_direct(json: &[u8]) {
+  let composition = Composition::parse(json, &Limits::default()).unwrap();
+  let mut direct = vec![0u32; 64 * 64];
+  let mut streamed = vec![0u32; 64 * 64];
+  let mut direct_scratch = RenderScratch::default();
+  render_pooled(&composition, &mut direct_scratch, 0.0, &mut direct, 64, 64, RenderOptions::default()).unwrap();
+  let mut renderer = crate::CPURenderer::new(composition);
+  renderer.render(0.0, &mut streamed, 64, 64, RenderOptions::default()).unwrap();
+  assert_eq!(streamed, direct);
+}
+
+#[test]
+fn streamed_cpu_matches_direct_for_masked_shape() {
+  assert_matches_direct(
+    br##"{"fr":30,"ip":0,"op":30,"w":64,"h":64,"layers":[
+      {"ty":4,"ind":1,"ip":0,"op":30,"st":0,
+       "ks":{"o":{"a":0,"k":75},"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}},
+       "masksProperties":[{"mode":"a","inv":false,"o":{"a":0,"k":100},"pt":{"a":0,"k":{"c":true,"v":[[8,8],[40,8],[40,40],[8,40]],"i":[[0,0],[0,0],[0,0],[0,0]],"o":[[0,0],[0,0],[0,0],[0,0]]}}}],
+       "shapes":[{"ty":"gr","it":[
+         {"ty":"rc","p":{"a":0,"k":[32,32]},"s":{"a":0,"k":[48,48]},"r":{"a":0,"k":0}},
+         {"ty":"fl","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"r":1}
+       ]}]}
+    ]}"##,
+  );
+}
+
+#[test]
+fn streamed_cpu_matches_direct_for_gradient() {
+  assert_matches_direct(
+    br#"{"fr":30,"ip":0,"op":30,"w":64,"h":64,"layers":[
+      {"ty":4,"ind":1,"ip":0,"op":30,"st":0,
+       "ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}},
+       "shapes":[{"ty":"gr","it":[
+         {"ty":"rc","p":{"a":0,"k":[32,32]},"s":{"a":0,"k":[48,48]},"r":{"a":0,"k":4}},
+         {"ty":"gf","o":{"a":0,"k":80},"r":2,"g":{"p":2,"k":{"a":0,"k":[0,1,0,0,1,0,0,1]}},"s":{"a":0,"k":[8,8]},"e":{"a":0,"k":[56,56]},"t":1}
+       ]}]}
+    ]}"#,
+  );
+}
+
+#[test]
+fn streamed_cpu_composites_gradient_over_existing_content() {
+  assert_matches_direct(
+    br##"{"fr":30,"ip":0,"op":30,"w":64,"h":64,"layers":[
+      {"ty":4,"ind":1,"ip":0,"op":30,"st":0,
+       "ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}},
+       "shapes":[{"ty":"gr","it":[
+         {"ty":"rc","p":{"a":0,"k":[32,32]},"s":{"a":0,"k":[40,40]},"r":{"a":0,"k":0}},
+         {"ty":"gf","o":{"a":0,"k":50},"r":1,"g":{"p":2,"k":{"a":0,"k":[0,0,0,1,1,0,1,0]}},"s":{"a":0,"k":[12,12]},"e":{"a":0,"k":[52,52]},"t":1}
+       ]}]},
+      {"ty":1,"ind":2,"sw":64,"sh":64,"sc":"#ff0000","ip":0,"op":30,"st":0,
+       "ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[32,32]},"a":{"a":0,"k":[32,32]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}}}
+    ]}"##,
+  );
+}
+
+#[test]
+fn streamed_cpu_matches_direct_for_matte() {
+  assert_matches_direct(
+    br##"{"fr":30,"ip":0,"op":30,"w":64,"h":64,"layers":[
+      {"ty":1,"ind":1,"td":1,"sw":32,"sh":64,"sc":"#ffffff","ip":0,"op":30,"st":0,
+       "ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[32,32]},"a":{"a":0,"k":[16,32]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}}},
+      {"ty":1,"ind":2,"tt":1,"sw":64,"sh":64,"sc":"#00ff00","ip":0,"op":30,"st":0,
+       "ks":{"o":{"a":0,"k":65},"p":{"a":0,"k":[32,32]},"a":{"a":0,"k":[32,32]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}}}
+    ]}"##,
+  );
+}
+
+#[test]
+fn streamed_cpu_matches_direct_for_precomp_group_opacity() {
+  assert_matches_direct(
+    br##"{"fr":30,"ip":0,"op":30,"w":64,"h":64,
+      "assets":[{"id":"nested","w":64,"h":64,"layers":[
+        {"ty":1,"ind":1,"sw":40,"sh":40,"sc":"#ff0000","ip":0,"op":30,"st":0,"ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[24,32]},"a":{"a":0,"k":[20,20]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}}},
+        {"ty":1,"ind":2,"sw":40,"sh":40,"sc":"#0000ff","ip":0,"op":30,"st":0,"ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[40,32]},"a":{"a":0,"k":[20,20]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}}}
+      ]}],
+      "layers":[{"ty":0,"ind":1,"refId":"nested","w":64,"h":64,"ip":0,"op":30,"st":0,
+        "ks":{"o":{"a":0,"k":50},"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}}}]
+    }"##,
+  );
+}

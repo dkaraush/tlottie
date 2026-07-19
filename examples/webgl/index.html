@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>tlottie WebGL2</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { margin: 2rem; display: grid; place-items: center; gap: 1rem; }
+    canvas { max-width: min(90vw, 900px); max-height: 75vh; background: #0000; }
+    #status { min-height: 1.4em; }
+  </style>
+</head>
+<body>
+  <input id="file" type="file" accept=".json,application/json">
+  <canvas id="canvas"></canvas>
+  <div id="status">Choose a Lottie JSON file.</div>
+  <script type="module">
+    import init, { WebGlRenderer } from './pkg/tlottie.js';
+
+    await init();
+    const canvas = document.querySelector('#canvas');
+    const status = document.querySelector('#status');
+    let renderer = null;
+    let animationFrame = 0;
+
+    document.querySelector('#file').addEventListener('change', async (event) => {
+      cancelAnimationFrame(animationFrame);
+      renderer?.free();
+      renderer = null;
+
+      const file = event.target.files[0];
+      if (!file) return;
+      try {
+        renderer = new WebGlRenderer(new Uint8Array(await file.arrayBuffer()), canvas);
+        const scale = Math.min(1, 900 / Math.max(renderer.width, renderer.height));
+        const width = Math.max(1, Math.round(renderer.width * scale));
+        const height = Math.max(1, Math.round(renderer.height * scale));
+        const started = performance.now();
+        const draw = (now) => {
+          if (!renderer) return;
+          const frame = ((now - started) / 1000 * renderer.frameRate) % renderer.frameCount;
+          renderer.render(frame, width, height, true);
+          animationFrame = requestAnimationFrame(draw);
+        };
+        status.textContent = `${file.name} — ${renderer.width}×${renderer.height} @ ${renderer.frameRate} fps`;
+        animationFrame = requestAnimationFrame(draw);
+      } catch (error) {
+        status.textContent = String(error);
+      }
+    });
+  </script>
+</body>
+</html>

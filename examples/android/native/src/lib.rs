@@ -8,12 +8,12 @@ use std::sync::Arc;
 use jni::objects::{JByteArray, JClass, JIntArray, JObject};
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring};
 use jni::JNIEnv;
-use tlottie::{Animation, Composition, Limits, RenderOptions};
+use tlottie::{CPURenderer, Composition, Limits, RenderOptions};
 
 struct State {
     json: Vec<u8>,
     composition: Arc<Composition>,
-    cpu: Animation,
+    cpu: CPURenderer,
     gpu: Option<vulkan::GpuRenderer>,
     pixels: Vec<u32>,
     rlottie: [Option<rlottie::Rlottie>; 3],
@@ -91,7 +91,7 @@ pub extern "system" fn Java_com_example_tlottie_NativeBridge_create(
         Ok(composition) => Arc::new(composition),
         Err(_) => return 0,
     };
-    let cpu = Animation::from_shared(Arc::clone(&composition));
+    let cpu = CPURenderer::from_shared(Arc::clone(&composition));
     Box::into_raw(Box::new(State {
         json: bytes,
         composition,
@@ -387,6 +387,7 @@ pub extern "system" fn Java_com_example_tlottie_NativeBridge_renderVulkan(
             RenderOptions {
                 antialias: antialias != 0,
                 curve_tolerance,
+                ..RenderOptions::default()
             },
         )
     })();
@@ -481,6 +482,7 @@ pub extern "system" fn Java_com_example_tlottie_NativeBridge_benchmarkVulkan(
             RenderOptions {
                 antialias: antialias != 0,
                 curve_tolerance,
+                ..RenderOptions::default()
             },
         )?;
         Ok(benchmark.summary(antialias != 0, curve_tolerance))
