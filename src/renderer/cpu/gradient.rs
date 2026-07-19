@@ -375,7 +375,15 @@ impl Canvas<'_> {
     self.raster.reset();
     self.raster.fill_contours(contours);
     let capture = cache.capture_enabled();
-    let mut entry = CovEntry::default();
+    let mut entry = if capture && w.saturating_mul(self.h) <= 160 * 160 {
+      let (row_cap, data_cap) = self.raster.capture_capacities();
+      CovEntry {
+        rows: Vec::with_capacity(row_cap),
+        data: PlaneData::Cov(Vec::with_capacity(data_cap)),
+      }
+    } else {
+      CovEntry::default()
+    };
     // Fresh rasterization: do NOT capture the source plane here — most
     // fresh geometry is animated and never repeats, and the capture
     // (resize + per-pixel src writes) measured 13.6% of gradient-heavy

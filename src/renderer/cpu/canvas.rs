@@ -194,7 +194,15 @@ impl Canvas<'_> {
     self.raster.reset();
     self.raster.fill_contours(contours);
     let capture = cache.capture_enabled();
-    let mut entry = CovEntry::default();
+    let mut entry = if capture && w.saturating_mul(self.h) <= 160 * 160 {
+      let (row_cap, data_cap) = self.raster.capture_capacities();
+      CovEntry {
+        rows: Vec::with_capacity(row_cap),
+        data: PlaneData::Cov(Vec::with_capacity(data_cap)),
+      }
+    } else {
+      CovEntry::default()
+    };
     self.raster.sweep(rule, antialias, |y, x0, cov_row| {
       let lo = y.saturating_mul(w).saturating_add(x0);
       let hi = lo.saturating_add(cov_row.len());

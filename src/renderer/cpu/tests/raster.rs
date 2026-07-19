@@ -87,3 +87,22 @@ fn half_covered_pixel_antialiases() {
   // Triangle area = 2 px → ~510.
   assert!((total as i64 - 510).abs() < 60, "total={total}");
 }
+
+#[test]
+fn capture_capacity_hint_matches_incremental_growth() {
+  let mut r = Rasterizer::new(64, 64);
+  let shape = Contour {
+    points: vec![Vec2::new(2.25, 3.5), Vec2::new(47.75, 8.25), Vec2::new(34.5, 51.75), Vec2::new(6.0, 39.25)],
+    anchors: Vec::new(),
+    ..Default::default()
+  };
+  r.fill_contours(&[shape]);
+  let expected = r.capture_capacities();
+  let mut rows = Vec::new();
+  let mut data = Vec::new();
+  r.sweep(FillRule::NonZero, true, |y, x0, row| {
+    rows.push((y, x0, row.len()));
+    data.extend_from_slice(row);
+  });
+  assert_eq!(expected, (rows.capacity(), data.capacity()));
+}

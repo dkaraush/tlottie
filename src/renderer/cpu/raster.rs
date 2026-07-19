@@ -205,6 +205,41 @@ impl Rasterizer {
     }
   }
 
+  /// Returns the capacities incremental coverage capture would grow to.
+  /// The row metadata is already hot after deposition; one cheap pass here
+  /// avoids repeated allocation and copying while preserving cache sizing.
+  pub fn capture_capacities(&self) -> (usize, usize) {
+    if self.min_y > self.max_y {
+      return (0, 0);
+    }
+    let mut row_len = 0usize;
+    let mut row_cap = 0usize;
+    let mut data_len = 0usize;
+    let mut data_cap = 0usize;
+    for y in self.min_y..=self.max_y.min(self.h.saturating_sub(1)) {
+      let Some(&(rx0, rx1)) = self.rows.get(y) else {
+        continue;
+      };
+      if rx0 == ROW_EMPTY.0 {
+        continue;
+      }
+      let x0 = (rx0 as usize).min(self.w.saturating_sub(1));
+      let x1 = (rx1 as usize + 1).min(self.w);
+      if x1 <= x0 {
+        continue;
+      }
+      row_len += 1;
+      if row_len > row_cap {
+        row_cap = (row_cap.saturating_mul(2)).max(row_len).max(4);
+      }
+      data_len = data_len.saturating_add(x1 - x0);
+      if data_len > data_cap {
+        data_cap = (data_cap.saturating_mul(2)).max(data_len).max(8);
+      }
+    }
+    (row_cap, data_cap)
+  }
+
   /// Runs the per-row prefix sum over the touched bounding box and hands
   /// (row, first_column, coverage slice) to `f`. Coverage values 0..=255;
   /// columns outside the slice have zero coverage.
