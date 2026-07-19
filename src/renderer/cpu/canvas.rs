@@ -166,7 +166,7 @@ impl Canvas<'_> {
             if TRACK_ROWS {
               mark_row_bounds(&mut self.dirty_rows, y, x0, x0 + len);
             }
-            crate::simd::fill_span_solid(dst_row, cov_row, sr, sg, sb, sa);
+            crate::simd::fill_span_solid(dst_row, cov_row, sr, sg, sb, sa, w > 128);
             off += len;
           }
         }
@@ -269,7 +269,7 @@ impl Canvas<'_> {
           d.extend_from_slice(cov_row);
         }
       }
-      crate::simd::fill_span_solid(dst_row, cov_row, sr, sg, sb, sa);
+      crate::simd::fill_span_solid(dst_row, cov_row, sr, sg, sb, sa, w > 128);
     });
     if capture {
       cache.insert(key, entry);

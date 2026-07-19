@@ -320,7 +320,8 @@ impl ShapeWalker<'_> {
         Shape::Path(p) => {
           let data = p.path.eval(self.frame);
           let closed = data.closed;
-          arena.push((flatten_path(&data, &m, self.curve_tolerance), closed));
+          let contour = self.scratch.take_contour();
+          arena.push((flatten_path_reusing(&data, &m, self.curve_tolerance, contour), closed));
         }
         Shape::Rect(r) => {
           let pos = r.position.eval(self.frame);
@@ -345,7 +346,8 @@ impl ShapeWalker<'_> {
             ps.inner_roundness.eval(self.frame),
             ps.outer_roundness.eval(self.frame),
           );
-          arena.push((flatten_path(&data, &m, self.curve_tolerance), true));
+          let contour = self.scratch.take_contour();
+          arena.push((flatten_path_reusing(&data, &m, self.curve_tolerance, contour), true));
         }
         Shape::RoundCorners(rc) => {
           let radius = rc.radius.eval(self.frame);

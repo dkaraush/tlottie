@@ -4,7 +4,7 @@
 
 use core::arch::aarch64::{
   uint16x8_t, uint32x4_t, uint8x8x4_t, vabsq_f32, vaddq_f32, vaddq_u16, vandq_u32, vbslq_u32, vcgeq_f32, vcltq_f32, vcvtq_u32_f32, vdupq_n_f32, vdupq_n_u16, vdupq_n_u32, vgetq_lane_u32, vld1_u8,
-  vld1q_f32, vld4_u8, vmaxq_f32, vminq_f32, vminq_u16, vmovl_u8, vmovn_u16, vmulq_f32, vmulq_u16, vnegq_f32, vshrq_n_u16, vsqrtq_f32, vst4_u8, vsubq_f32, vsubq_u16,
+  vld1q_f32, vld4_u8, vmaxq_f32, vminq_f32, vminq_u16, vminv_u8, vmovl_u8, vmovn_u16, vmulq_f32, vmulq_u16, vnegq_f32, vshrq_n_u16, vsqrtq_f32, vst1q_u32, vst4_u8, vsubq_f32, vsubq_u16,
 };
 
 /// Exact `(n + 127) / 255` on u16 lanes (n <= 65025).
@@ -197,6 +197,25 @@ pub(super) fn fill_span_solid_neon(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32
     unsafe {
       vst4_u8(dpx.as_mut_ptr().cast::<u8>(), out)
     };
+  }
+}
+
+#[target_feature(enable = "neon")]
+pub(super) fn fill_span_opaque_neon(dst: &mut [u32], cov: &[u8], color: u32, sr: u32, sg: u32, sb: u32) {
+  let color4 = vdupq_n_u32(color);
+  for (dpx, cpx) in dst.chunks_exact_mut(8).zip(cov.chunks_exact(8)) {
+    // SAFETY: both chunks have the exact sizes used by these loads/stores.
+    #[allow(unsafe_code)]
+    let c = unsafe { vld1_u8(cpx.as_ptr()) };
+    if vminv_u8(c) == 255 {
+      #[allow(unsafe_code)]
+      unsafe {
+        vst1q_u32(dpx.as_mut_ptr(), color4);
+        vst1q_u32(dpx.as_mut_ptr().add(4), color4);
+      }
+    } else {
+      fill_span_solid_neon(dpx, cpx, sr, sg, sb, 255);
+    }
   }
 }
 

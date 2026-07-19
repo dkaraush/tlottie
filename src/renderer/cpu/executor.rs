@@ -5,7 +5,11 @@ use crate::cells::CellRaster;
 #[cfg(test)]
 use crate::error::Error;
 use crate::error::Result;
-use crate::geometry::{clip_contour, clip_to_quad, dash_polyline, ellipse_contour, extract_by_length, flatten_path, polystar_path, quad_contains_box, rect_contour, round_polyline_corners, Contour};
+#[cfg(test)]
+use crate::geometry::flatten_path;
+use crate::geometry::{
+  clip_contour, clip_to_quad, dash_polyline, ellipse_contour, extract_by_length, flatten_path_reusing, polystar_path, quad_contains_box, rect_contour, round_polyline_corners, Contour,
+};
 #[cfg(test)]
 use crate::limits::Limits;
 use crate::math::{Color, Mat2x3, Vec2};
@@ -51,6 +55,11 @@ pub(crate) struct RenderScratch {
   /// from here and return after their paint executes (measured: 2,683
   /// piece allocations per 64px frame on stroke-heavy files).
   pts_pool: Vec<Vec<Vec2>>,
+  /// Recycled source contours (points + anchor provenance) produced while
+  /// evaluating authored paths. Unlike paint snapshots, these need their
+  /// anchor flags for trim/dash/stroke processing, so retain the complete
+  /// contour between frames instead of allocating two vectors per path.
+  contour_pool: Vec<Contour>,
   /// Reused normalized stroke segments; stroke calls execute serially.
   stroke_segments: Vec<StrokeSegment>,
   /// Memoized per-layer staticness (keyed by the Layer's stable address
@@ -81,6 +90,9 @@ use coverage::*;
 
 /// Bound on recycled point buffers (each typically 4-26 points).
 const PTS_POOL_CAP: usize = 4096;
+/// Do not pin exceptionally large authored paths in a renderer for its whole
+/// lifetime. Ordinary sticker contours are far below this bound.
+const CONTOUR_REUSE_POINT_CAP: usize = 4096;
 
 /// One recorded paint of a static layer: everything the fused execute loop
 /// needs except geometry (which replays from the coverage cache by key).
@@ -223,6 +235,19 @@ impl RenderScratch {
     if self.pts_pool.len() < PTS_POOL_CAP {
       v.clear();
       self.pts_pool.push(v);
+    }
+  }
+
+  pub(crate) fn take_contour(&mut self) -> Contour {
+    self.contour_pool.pop().unwrap_or_default()
+  }
+
+  pub(crate) fn put_contour(&mut self, mut contour: Contour) {
+    if self.contour_pool.len() < PTS_POOL_CAP && contour.points.capacity() <= CONTOUR_REUSE_POINT_CAP && contour.anchors.capacity() <= CONTOUR_REUSE_POINT_CAP {
+      contour.points.clear();
+      contour.anchors.clear();
+      contour.inv_lin = None;
+      self.contour_pool.push(contour);
     }
   }
 

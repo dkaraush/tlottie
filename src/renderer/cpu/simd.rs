@@ -21,17 +21,32 @@
 
 /// Minimum span length for the vector path.
 const SIMD_MIN_SPAN: usize = 16;
-
 /// Coverage-modulated solid source-over: for each pixel,
 /// `ca = (cov*sa+127)/255`, source channels scaled by `ca`, then
 /// premultiplied source-over into `dst`. `sr/sg/sb/sa` are 0..=255.
 /// Mirrors (and on NEON must match bit-for-bit) the scalar loop.
-pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb: u32, sa: u32) {
+pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb: u32, sa: u32, large_canvas: bool) {
   // Opaque source: full-coverage pixels are EXACTLY the source color
   // (ca=255 -> s_x=x, inv=0 -> o=s), so interior runs become plain stores
   // — large fills are memory-bound and interiors dominate at 320/720px.
   if sa == 255 {
     let color = (255u32 << 24) | (sr << 16) | (sg << 8) | sb;
+    #[cfg(target_arch = "aarch64")]
+    if large_canvas && dst.len() >= SIMD_MIN_SPAN {
+      let n = dst.len().min(cov.len());
+      let full = n - n % 8;
+      let (dst_v, dst_tail) = dst.split_at_mut(full);
+      let (cov_v, cov_tail) = cov.split_at(full);
+      // SAFETY: NEON is mandatory on aarch64. The kernel stores opaque
+      // 8-pixel interiors directly and falls back to the exact general
+      // blend only for chunks containing AA edges.
+      #[allow(unsafe_code)]
+      unsafe {
+        neon::fill_span_opaque_neon(dst_v, cov_v, color, sr, sg, sb)
+      };
+      fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
+      return;
+    }
     let n = dst.len().min(cov.len());
     let mut i = 0usize;
     while i < n {

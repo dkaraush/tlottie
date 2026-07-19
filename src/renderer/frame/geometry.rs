@@ -87,12 +87,23 @@ pub(crate) fn reverse_path(data: &mut PathData) {
 
 /// Flattens Lottie path data (vertices + relative tangents) under `m`.
 pub(crate) fn flatten_path(data: &PathData, m: &Mat2x3, tolerance: f32) -> Contour {
+  flatten_path_reusing(data, m, tolerance, Contour::default())
+}
+
+/// Flattens into a recycled contour, retaining its point and anchor vector
+/// capacities across frames. The output is identical to [`flatten_path`].
+pub(crate) fn flatten_path_reusing(data: &PathData, m: &Mat2x3, tolerance: f32, mut contour: Contour) -> Contour {
   let n = data.vertices.len();
-  let mut points = Vec::with_capacity(n * 4);
-  let mut anchors: Vec<bool> = Vec::with_capacity(n * 4);
+  contour.points.clear();
+  contour.anchors.clear();
+  contour.inv_lin = None;
+  contour.points.reserve(n * 4);
+  contour.anchors.reserve(n * 4);
   if n == 0 {
-    return Contour { points, anchors, inv_lin: None };
+    return contour;
   }
+  let points = &mut contour.points;
+  let anchors = &mut contour.anchors;
   let vert = |i: usize| -> Vec2 { data.vertices.get(i).copied().unwrap_or(Vec2::ZERO) };
   let tan_in = |i: usize| -> Vec2 { data.in_tangents.get(i).copied().unwrap_or(Vec2::ZERO) };
   let tan_out = |i: usize| -> Vec2 { data.out_tangents.get(i).copied().unwrap_or(Vec2::ZERO) };
@@ -117,16 +128,13 @@ pub(crate) fn flatten_path(data: &PathData, m: &Mat2x3, tolerance: f32) -> Conto
       points.push(p1d);
       anchors.push(true);
     } else {
-      flatten_cubic(&mut points, &mut anchors, prev_dev, c1, c2, p1d, tolerance);
+      flatten_cubic(points, anchors, prev_dev, c1, c2, p1d, tolerance);
     }
     prev_dev = p1d;
   }
   let inv = m.inverse();
-  Contour {
-    points,
-    anchors,
-    inv_lin: Some([inv.a, inv.b, inv.c, inv.d]),
-  }
+  contour.inv_lin = Some([inv.a, inv.b, inv.c, inv.d]);
+  contour
 }
 
 /// Ellipse centered at `pos` with `size` (width/height), as 4 cubic arcs.

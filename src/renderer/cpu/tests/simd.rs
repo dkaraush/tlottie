@@ -23,9 +23,12 @@ fn fill_span_solid_neon_matches_scalar() {
       let (sr, sg, sb, sa) = (rng.next() as u32 & 0xff, rng.next() as u32 & 0xff, rng.next() as u32 & 0xff, rng.next() as u32 & 0xff);
       let mut a = base.clone();
       let mut b = base.clone();
-      fill_span_solid(&mut a, &cov, sr, sg, sb, sa);
+      let mut c = base.clone();
+      fill_span_solid(&mut a, &cov, sr, sg, sb, sa, true);
+      fill_span_solid(&mut c, &cov, sr, sg, sb, sa, false);
       fill_span_solid_scalar(&mut b, &cov, sr, sg, sb, sa);
       assert_eq!(a, b, "len={len} sr={sr} sg={sg} sb={sb} sa={sa}");
+      assert_eq!(c, b, "scalar gate: len={len} sr={sr} sg={sg} sb={sb} sa={sa}");
     }
   }
 }

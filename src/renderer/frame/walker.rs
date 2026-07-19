@@ -233,6 +233,9 @@ impl RenderCtx<'_> {
         };
         let (arena, pending) = walker.walk_shapes(&layer.shapes, m, content_opacity, 0)?;
         walker.collect_shape_jobs(&arena, &pending, renderer);
+        for (contour, _) in arena {
+          walker.scratch.put_contour(contour);
+        }
       }
       LayerKind::Solid => {
         if let Some((sw, sh, color)) = layer.solid {
