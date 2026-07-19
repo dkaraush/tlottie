@@ -95,6 +95,7 @@ impl Rasterizer {
 
   /// Accumulates one edge. Coordinates must already be clipped to the
   /// viewport (clip_contour); small excursions are tolerated via clamping.
+  #[inline(always)]
   fn draw_line(&mut self, x0f: f32, y0f: f32, x1f: f32, y1f: f32) {
     if !(y0f.is_finite() && y1f.is_finite() && x0f.is_finite() && x1f.is_finite()) {
       return;
