@@ -171,17 +171,32 @@ impl Canvas<'_> {
           }
         }
         PlaneData::Spans(spans) => {
-          for &s in spans {
-            let (y, x0, len, cov) = unpack_span(s);
-            let lo = y.saturating_mul(w).saturating_add(x0);
-            let Some(dst_row) = self.pixels.get_mut(lo..lo.saturating_add(len)) else {
-              break;
-            };
-            self.dirty.mark_row(y, x0, x0 + len);
-            if TRACK_ROWS {
-              mark_row_bounds(&mut self.dirty_rows, y, x0, x0 + len);
+          if sa == 255 {
+            for &s in spans {
+              let (y, x0, len, cov) = unpack_span(s);
+              let lo = y.saturating_mul(w).saturating_add(x0);
+              let Some(dst_row) = self.pixels.get_mut(lo..lo.saturating_add(len)) else {
+                break;
+              };
+              self.dirty.mark_row(y, x0, x0 + len);
+              if TRACK_ROWS {
+                mark_row_bounds(&mut self.dirty_rows, y, x0, x0 + len);
+              }
+              crate::simd::fill_span_uniform_opaque(dst_row, cov, sr, sg, sb);
             }
-            crate::simd::fill_span_uniform(dst_row, cov, sr, sg, sb, sa);
+          } else {
+            for &s in spans {
+              let (y, x0, len, cov) = unpack_span(s);
+              let lo = y.saturating_mul(w).saturating_add(x0);
+              let Some(dst_row) = self.pixels.get_mut(lo..lo.saturating_add(len)) else {
+                break;
+              };
+              self.dirty.mark_row(y, x0, x0 + len);
+              if TRACK_ROWS {
+                mark_row_bounds(&mut self.dirty_rows, y, x0, x0 + len);
+              }
+              crate::simd::fill_span_uniform(dst_row, cov, sr, sg, sb, sa);
+            }
           }
         }
         PlaneData::Src(_) => {}
@@ -203,7 +218,7 @@ impl Canvas<'_> {
       spans.clear();
       let mut px_total = 0usize;
       let mut overflow = false;
-      self.cells.sweep_spans(rule, antialias, |y, x0, len, cov| {
+      let mut render_span = |y: usize, x0: usize, len: usize, cov: u8, opaque: bool| {
         let lo = y.saturating_mul(w).saturating_add(x0);
         let Some(dst_row) = pixels.get_mut(lo..lo.saturating_add(len)) else {
           return;
@@ -220,8 +235,17 @@ impl Canvas<'_> {
             overflow = true;
           }
         }
-        crate::simd::fill_span_uniform(dst_row, cov, sr, sg, sb, sa);
-      });
+        if opaque {
+          crate::simd::fill_span_uniform_opaque(dst_row, cov, sr, sg, sb);
+        } else {
+          crate::simd::fill_span_uniform(dst_row, cov, sr, sg, sb, sa);
+        }
+      };
+      if sa == 255 {
+        self.cells.sweep_spans(rule, antialias, |y, x0, len, cov| render_span(y, x0, len, cov, true));
+      } else {
+        self.cells.sweep_spans(rule, antialias, |y, x0, len, cov| render_span(y, x0, len, cov, false));
+      }
       // Chunky span lists cache as spans (denser, uniform replay);
       // fragmented ones as rows (fast row replay).
       if overflow || !capture {

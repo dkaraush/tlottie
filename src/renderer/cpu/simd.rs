@@ -129,6 +129,25 @@ fn fill_span_solid_scalar(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb: u32
 /// [`fill_span_solid`] over a constant coverage row: the source pixel and
 /// blend factor are computed ONCE; interiors (cov 255, sa 255) collapse to
 /// a plain store.
+pub(crate) fn fill_span_uniform_opaque(dst: &mut [u32], cov: u8, sr: u32, sg: u32, sb: u32) {
+  if cov == 0 {
+    return;
+  }
+  if cov == 255 {
+    dst.fill((255u32 << 24) | (sr << 16) | (sg << 8) | sb);
+    return;
+  }
+  let ca = u32::from(cov);
+  let s_r = (sr * ca + 127) / 255;
+  let s_g = (sg * ca + 127) / 255;
+  let s_b = (sb * ca + 127) / 255;
+  if let [dst] = dst {
+    fill_one_uniform(dst, ca, s_r, s_g, s_b);
+    return;
+  }
+  fill_span_uniform_scalar(dst, ca, s_r, s_g, s_b);
+}
+
 pub(crate) fn fill_span_uniform(dst: &mut [u32], cov: u8, sr: u32, sg: u32, sb: u32, sa: u32) {
   if cov == 0 {
     return;
@@ -143,6 +162,10 @@ pub(crate) fn fill_span_uniform(dst: &mut [u32], cov: u8, sr: u32, sg: u32, sb: 
   if ca == 255 {
     // Fully opaque source: over() degenerates to the source itself.
     dst.fill((255u32 << 24) | (s_r << 16) | (s_g << 8) | s_b);
+    return;
+  }
+  if let [dst] = dst {
+    fill_one_uniform(dst, ca, s_r, s_g, s_b);
     return;
   }
   #[cfg(target_arch = "aarch64")]
@@ -170,6 +193,17 @@ pub(crate) fn fill_span_uniform(dst: &mut [u32], cov: u8, sr: u32, sg: u32, sb: 
     }
   }
   fill_span_uniform_scalar(dst, ca, s_r, s_g, s_b);
+}
+
+#[inline]
+fn fill_one_uniform(dst: &mut u32, ca: u32, s_r: u32, s_g: u32, s_b: u32) {
+  let value = *dst;
+  let inv = 256 - ca;
+  let o_a = ca + (((value >> 24) & 0xff) * inv >> 8);
+  let o_r = s_r + (((value >> 16) & 0xff) * inv >> 8);
+  let o_g = s_g + (((value >> 8) & 0xff) * inv >> 8);
+  let o_b = s_b + ((value & 0xff) * inv >> 8);
+  *dst = (o_a.min(255) << 24) | (o_r.min(255) << 16) | (o_g.min(255) << 8) | o_b.min(255);
 }
 
 fn fill_span_uniform_scalar(dst: &mut [u32], ca: u32, s_r: u32, s_g: u32, s_b: u32) {
