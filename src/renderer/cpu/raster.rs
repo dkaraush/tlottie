@@ -228,16 +228,21 @@ impl Rasterizer {
         continue;
       }
       let lo = y.saturating_mul(stride).saturating_add(x0);
-      let hi = lo.saturating_add(x1 - x0).min(self.acc.len());
-      let Some(row) = self.acc.get(lo..hi) else {
+      let clear_x1 = (rx1 as usize + 2).min(stride);
+      let clear_hi = y.saturating_mul(stride).saturating_add(clear_x1).min(self.acc.len());
+      let Some(acc_row) = self.acc.get_mut(lo..clear_hi) else {
         continue;
       };
+      let coverage_len = x1 - x0;
+      let (row, spill) = acc_row.split_at_mut(coverage_len.min(acc_row.len()));
       let Some(cov_slice) = cov.get_mut(..row.len()) else {
         continue;
       };
       let mut sum = 0.0f32;
-      for (dst, src) in cov_slice.iter_mut().zip(row.iter()) {
-        sum += *src;
+      for (dst, src) in cov_slice.iter_mut().zip(row.iter_mut()) {
+        let delta = *src;
+        *src = 0.0;
+        sum += delta;
         let c = match rule {
           FillRule::NonZero => sum.abs().min(1.0),
           FillRule::EvenOdd => {
@@ -257,10 +262,16 @@ impl Rasterizer {
           0
         };
       }
+      spill.fill(0.0);
       let filled = cov_slice.len();
       f(y, x0, cov.get(..filled).unwrap_or(&[]));
+      if let Some(slot) = self.rows.get_mut(y) {
+        *slot = ROW_EMPTY;
+      }
     }
     self.cov = cov;
+    self.min_y = usize::MAX;
+    self.max_y = 0;
   }
 }
 
