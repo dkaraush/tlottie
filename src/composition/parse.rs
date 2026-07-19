@@ -1002,7 +1002,7 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
   let mut start_time = 0.0f32;
   let mut time_stretch = 1.0f32;
   let mut hidden = false;
-  let mut ks_pos: Option<usize> = None;
+  let mut transform = Transform::identity();
   let mut shapes_pos: Option<usize> = None;
   let mut ref_id: Option<String> = None;
   let mut layer_w: Option<f32> = None;
@@ -1062,8 +1062,7 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
         solid_color = parse_hex_color(raw);
       }
       b"ks" => {
-        ks_pos = Some(c.pos());
-        c.skip_value()?;
+        transform = parse_transform(c, limits)?;
       }
       b"shapes" => {
         shapes_pos = Some(c.pos());
@@ -1080,10 +1079,6 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
     0 => LayerKind::Precomp,
     1 => LayerKind::Solid,
     other => LayerKind::Other(other),
-  };
-  let transform = match ks_pos {
-    Some(pos) => parse_transform(&mut c.fork_at(pos), limits)?,
-    None => Transform::identity(),
   };
   let mut shapes = Vec::new();
   if kind == LayerKind::Shape {
