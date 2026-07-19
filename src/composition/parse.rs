@@ -1004,6 +1004,7 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
   let mut hidden = false;
   let mut transform = Transform::identity();
   let mut shapes_pos: Option<usize> = None;
+  let mut parsed_shapes: Option<Vec<Shape>> = None;
   let mut ref_id: Option<String> = None;
   let mut layer_w: Option<f32> = None;
   let mut layer_h: Option<f32> = None;
@@ -1065,8 +1066,15 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
         transform = parse_transform(c, limits)?;
       }
       b"shapes" => {
-        shapes_pos = Some(c.pos());
-        c.skip_value()?;
+        if ty == 4 {
+          let mut count = 0usize;
+          let (list, _) = parse_shape_list(c, limits, 0, &mut count)?;
+          parsed_shapes = Some(list);
+          shapes_pos = None;
+        } else {
+          shapes_pos = Some(c.pos());
+          c.skip_value()?;
+        }
       }
       _ => c.skip_value()?,
     }
@@ -1080,8 +1088,8 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
     1 => LayerKind::Solid,
     other => LayerKind::Other(other),
   };
-  let mut shapes = Vec::new();
-  if kind == LayerKind::Shape {
+  let mut shapes = parsed_shapes.unwrap_or_default();
+  if kind == LayerKind::Shape && shapes_pos.is_some() {
     if let Some(pos) = shapes_pos {
       let mut count = 0usize;
       let (list, _) = parse_shape_list(&mut c.fork_at(pos), limits, 0, &mut count)?;
