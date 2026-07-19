@@ -238,26 +238,17 @@ impl ShapeWalker<'_> {
           let margin = hw * miter_limit.max(1.5);
           let skip_clip = self.contour_clip_is_noop_inflated(contour, margin);
           pieces.clear();
-          if pattern.is_empty() {
-            pieces.extend(stroke_polyline(
-              &contour.points,
-              &contour.anchors,
-              *closed,
-              *hw,
-              *cap,
-              *join,
-              *miter_limit,
-              &mut self.scratch.pts_pool,
-              solo,
-            ));
-          } else {
-            for (piece, piece_anchors) in dash_polyline(&contour.points, &contour.anchors, *closed, pattern, *dash_offset) {
-              pieces.extend(stroke_polyline(&piece, &piece_anchors, false, *hw, *cap, *join, *miter_limit, &mut self.scratch.pts_pool, false));
+          {
+            let target = if skip_clip { &mut contours } else { &mut pieces };
+            if pattern.is_empty() {
+              stroke_polyline(&contour.points, &contour.anchors, *closed, *hw, *cap, *join, *miter_limit, &mut self.scratch.pts_pool, target, solo);
+            } else {
+              for (piece, piece_anchors) in dash_polyline(&contour.points, &contour.anchors, *closed, pattern, *dash_offset) {
+                stroke_polyline(&piece, &piece_anchors, false, *hw, *cap, *join, *miter_limit, &mut self.scratch.pts_pool, target, false);
+              }
             }
           }
-          if skip_clip {
-            contours.append(&mut pieces);
-          } else {
+          if !skip_clip {
             for p in pieces.drain(..) {
               let clipped = self.clip_all_owned(p);
               contours.push(clipped);

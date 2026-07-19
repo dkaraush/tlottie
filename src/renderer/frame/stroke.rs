@@ -504,9 +504,9 @@ fn angle_delta(a: f32, b: f32) -> f32 {
 
 /// Sanitizes and strokes a flattened polyline.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn stroke_polyline(points: &[Vec2], point_anchors: &[bool], closed: bool, hw: f32, cap: Cap, join: Join, miter_limit: f32, pool: &mut Vec<Vec<Vec2>>, _solo: bool) -> Vec<Contour> {
+pub(crate) fn stroke_polyline(points: &[Vec2], point_anchors: &[bool], closed: bool, hw: f32, cap: Cap, join: Join, miter_limit: f32, pool: &mut Vec<Vec<Vec2>>, out: &mut Vec<Contour>, _solo: bool) {
   if !(hw > 0.0) || !hw.is_finite() {
-    return Vec::new();
+    return;
   }
 
   let mut pts = pool.pop().unwrap_or_default();
@@ -539,14 +539,12 @@ pub(crate) fn stroke_polyline(points: &[Vec2], point_anchors: &[bool], closed: b
 
   if pts.len() < 2 {
     pool.push(pts);
-    return Vec::new();
+    return;
   }
 
-  let mut out = Vec::new();
-  stroke_outline(&pts, &anchors, closed, hw, cap, join, miter_limit, pool, &mut out);
+  stroke_outline(&pts, &anchors, closed, hw, cap, join, miter_limit, pool, out);
   pts.clear();
   pool.push(pts);
-  out
 }
 
 #[cfg(test)]
