@@ -22,7 +22,6 @@ webgl = ["opengl", "wasm", "dep:wasm-bindgen", "dep:web-sys"]
 cli = ["cpu"]
 c-api = ["cpu"]
 wasm = ["cpu"]
-stats = []
 
 [dependencies]
 ash = { version = "0.37.3", default-features = false, features = ["loaded"], optional = true }

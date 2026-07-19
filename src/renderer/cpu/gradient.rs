@@ -388,7 +388,6 @@ impl Canvas<'_> {
         return;
       };
       dirty.mark_row(y, x0, x0 + cov_row.len());
-      px_stat(3, cov_row.len());
       if capture {
         entry.rows.push((y as u32, x0 as u32, cov_row.len() as u32));
         if let PlaneData::Cov(d) = &mut entry.data {
@@ -449,7 +448,6 @@ fn gradient_srcs(srcs: &mut [u32], cov_row: &[u8], y: usize, x0: usize, lut: &[u
   match &map.kind {
     GradientMapKind::Linear { sx, sy, dx, dy, inv_len_sq } => {
       let n = srcs.len().min(cov_row.len());
-      grad_stat(0, n);
       let row_base = ((lx0 - sx) * dx + (ly0 - sy) * dy) * inv_len_sq;
       let dt = (inv.a * dx + inv.b * dy) * inv_len_sq;
       // Run-batched like the radial/focal arms; `row_base + X·dt` form
@@ -459,7 +457,6 @@ fn gradient_srcs(srcs: &mut [u32], cov_row: &[u8], y: usize, x0: usize, lut: &[u
         let run = cov_row.get(i..).map(|c| c.iter().take_while(|&&v| v == 255).count()).unwrap_or(0);
         if run >= 16 {
           if let Some(out) = srcs.get_mut(i..i + run) {
-            grad_stat(3, run);
             crate::simd::linear_lut_fill(out, lut, row_base, dt, (x0 + i) as f32);
           }
           i += run;
@@ -489,13 +486,11 @@ fn gradient_srcs(srcs: &mut [u32], cov_row: &[u8], y: usize, x0: usize, lut: &[u
       // different from the historical loop, corpus-gated like round 2.
       let (dd0x, dd0y) = (lx0 - sx, ly0 - sy);
       let n = srcs.len().min(cov_row.len());
-      grad_stat(1, n);
       let mut i = 0usize;
       while i < n {
         let run = cov_row.get(i..).map(|c| c.iter().take_while(|&&v| v == 255).count()).unwrap_or(0);
         if run >= 16 {
           if let Some(out) = srcs.get_mut(i..i + run) {
-            grad_stat(3, run);
             crate::simd::radial_lut_fill(out, lut, dd0x, dd0y, inv.a, inv.b, *inv_r, (x0 + i) as f32);
           }
           i += run;
@@ -528,13 +523,11 @@ fn gradient_srcs(srcs: &mut [u32], cov_row: &[u8], y: usize, x0: usize, lut: &[u
       // `g0 + X·step` form at absolute column X (corpus-gated).
       let (g0x, g0y) = (lx0 - fx, ly0 - fy);
       let n = srcs.len().min(cov_row.len());
-      grad_stat(2, n);
       let mut i = 0usize;
       while i < n {
         let run = cov_row.get(i..).map(|c| c.iter().take_while(|&&v| v == 255).count()).unwrap_or(0);
         if run >= 16 {
           if let Some(out) = srcs.get_mut(i..i + run) {
-            grad_stat(4, run);
             crate::simd::focal_lut_fill(out, lut, g0x, g0y, inv.a, inv.b, *dx, *dy, *a, inv2a, *r, (x0 + i) as f32);
           }
           i += run;
@@ -625,12 +618,9 @@ fn gradient_span_uniform(dst_row: &mut [u32], cov: u8, y: usize, x0: usize, lut:
   let ly0 = inv.b * 0.5 + inv.d * yf + inv.ty;
   match &map.kind {
     GradientMapKind::Linear { sx, sy, dx, dy, inv_len_sq } => {
-      let n = dst_row.len();
-      grad_stat(0, n);
       let row_base = ((lx0 - sx) * dx + (ly0 - sy) * dy) * inv_len_sq;
       let dt = (inv.a * dx + inv.b * dy) * inv_len_sq;
       if cov == 255 {
-        grad_stat(3, n);
         crate::simd::linear_lut_over(dst_row, lut, row_base, dt, x0 as f32);
         return;
       }
@@ -640,11 +630,8 @@ fn gradient_span_uniform(dst_row: &mut [u32], cov: u8, y: usize, x0: usize, lut:
       }
     }
     GradientMapKind::Radial { sx, sy, inv_r } => {
-      let n = dst_row.len();
-      grad_stat(1, n);
       let (dd0x, dd0y) = (lx0 - sx, ly0 - sy);
       if cov == 255 {
-        grad_stat(3, n);
         crate::simd::radial_lut_over(dst_row, lut, dd0x, dd0y, inv.a, inv.b, *inv_r, x0 as f32);
         return;
       }
@@ -660,12 +647,9 @@ fn gradient_span_uniform(dst_row: &mut [u32], cov: u8, y: usize, x0: usize, lut:
       if a.abs() < 1e-9 {
         return;
       }
-      let n = dst_row.len();
-      grad_stat(2, n);
       let inv2a = 1.0 / (2.0 * a);
       let (g0x, g0y) = (lx0 - fx, ly0 - fy);
       if cov == 255 {
-        grad_stat(4, n);
         crate::simd::focal_lut_over(dst_row, lut, g0x, g0y, inv.a, inv.b, *dx, *dy, *a, inv2a, *r, x0 as f32);
         return;
       }
@@ -702,8 +686,6 @@ fn gradient_span_uniform_clear(dst_row: &mut [u32], cov: u8, y: usize, x0: usize
         let ly0 = inv.b * 0.5 + inv.d * yf + inv.ty;
         let row_base = ((lx0 - sx) * dx + (ly0 - sy) * dy) * inv_len_sq;
         let dt = (inv.a * dx + inv.b * dy) * inv_len_sq;
-        grad_stat(0, dst_row.len());
-        grad_stat(3, dst_row.len());
         crate::simd::linear_lut_fill(dst_row, lut, row_base, dt, x0 as f32);
       }
       GradientMapKind::Radial { sx, sy, inv_r } => {
@@ -712,8 +694,6 @@ fn gradient_span_uniform_clear(dst_row: &mut [u32], cov: u8, y: usize, x0: usize
         let lx0 = inv.a * 0.5 + inv.c * yf + inv.tx;
         let ly0 = inv.b * 0.5 + inv.d * yf + inv.ty;
         let (dd0x, dd0y) = (lx0 - sx, ly0 - sy);
-        grad_stat(1, dst_row.len());
-        grad_stat(3, dst_row.len());
         crate::simd::radial_lut_fill(dst_row, lut, dd0x, dd0y, inv.a, inv.b, *inv_r, x0 as f32);
       }
       GradientMapKind::Focal { fx, fy, dx, dy, a, r } => {
@@ -726,8 +706,6 @@ fn gradient_span_uniform_clear(dst_row: &mut [u32], cov: u8, y: usize, x0: usize
         let ly0 = inv.b * 0.5 + inv.d * yf + inv.ty;
         let inv2a = 1.0 / (2.0 * a);
         let (g0x, g0y) = (lx0 - fx, ly0 - fy);
-        grad_stat(2, dst_row.len());
-        grad_stat(4, dst_row.len());
         crate::simd::focal_lut_fill(dst_row, lut, g0x, g0y, inv.a, inv.b, *dx, *dy, *a, inv2a, *r, x0 as f32);
       }
     }
@@ -763,7 +741,6 @@ fn gradient_over(dst_row: &mut [u32], cov_row: &[u8], y: usize, x0: usize, lut: 
   match &map.kind {
     GradientMapKind::Linear { sx, sy, dx, dy, inv_len_sq } => {
       let n = dst_row.len().min(cov_row.len());
-      grad_stat(0, n);
       let row_base = ((lx0 - sx) * dx + (ly0 - sy) * dy) * inv_len_sq;
       let dt = (inv.a * dx + inv.b * dy) * inv_len_sq;
       let mut i = 0usize;
@@ -771,7 +748,6 @@ fn gradient_over(dst_row: &mut [u32], cov_row: &[u8], y: usize, x0: usize, lut: 
         let run = cov_row.get(i..).map(|c| c.iter().take_while(|&&v| v == 255).count()).unwrap_or(0);
         if run >= 16 {
           if let Some(out) = dst_row.get_mut(i..i + run) {
-            grad_stat(3, run);
             crate::simd::linear_lut_over(out, lut, row_base, dt, (x0 + i) as f32);
           }
           i += run;
@@ -789,13 +765,11 @@ fn gradient_over(dst_row: &mut [u32], cov_row: &[u8], y: usize, x0: usize, lut: 
     GradientMapKind::Radial { sx, sy, inv_r } => {
       let (dd0x, dd0y) = (lx0 - sx, ly0 - sy);
       let n = dst_row.len().min(cov_row.len());
-      grad_stat(1, n);
       let mut i = 0usize;
       while i < n {
         let run = cov_row.get(i..).map(|c| c.iter().take_while(|&&v| v == 255).count()).unwrap_or(0);
         if run >= 16 {
           if let Some(out) = dst_row.get_mut(i..i + run) {
-            grad_stat(3, run);
             crate::simd::radial_lut_over(out, lut, dd0x, dd0y, inv.a, inv.b, *inv_r, (x0 + i) as f32);
           }
           i += run;
@@ -820,13 +794,11 @@ fn gradient_over(dst_row: &mut [u32], cov_row: &[u8], y: usize, x0: usize, lut: 
       let inv2a = 1.0 / (2.0 * a);
       let (g0x, g0y) = (lx0 - fx, ly0 - fy);
       let n = dst_row.len().min(cov_row.len());
-      grad_stat(2, n);
       let mut i = 0usize;
       while i < n {
         let run = cov_row.get(i..).map(|c| c.iter().take_while(|&&v| v == 255).count()).unwrap_or(0);
         if run >= 16 {
           if let Some(out) = dst_row.get_mut(i..i + run) {
-            grad_stat(4, run);
             crate::simd::focal_lut_over(out, lut, g0x, g0y, inv.a, inv.b, *dx, *dy, *a, inv2a, *r, (x0 + i) as f32);
           }
           i += run;

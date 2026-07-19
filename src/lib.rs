@@ -29,8 +29,6 @@ mod bindings;
 // physical layout reflects ownership. These are not part of the public API.
 pub(crate) use composition::{json, limits, model, parse, property};
 #[cfg(feature = "cpu")]
-pub(crate) use renderer::cpu as render;
-#[cfg(feature = "cpu")]
 pub(crate) use renderer::cpu::{cells, raster, simd};
 pub(crate) use renderer::frame::{geometry, stroke};
 
@@ -53,48 +51,6 @@ pub use error::{Error, JsonErrorKind, Limit, Result};
 pub use limits::Limits;
 pub use model::Composition;
 pub use renderer::options::RenderOptions;
-
-/// Dev-only counters for the bench CLI (gradient pixels per kind and
-/// batched-kernel coverage). Not part of the stable API.
-#[doc(hidden)]
-#[cfg(feature = "cpu")]
-pub fn mode_stats() -> [u64; 3] {
-  let mut out = [0u64; 3];
-  for (o, c) in out.iter_mut().zip(render::MODE_STATS.iter()) {
-    *o = c.load(core::sync::atomic::Ordering::Relaxed);
-  }
-  out
-}
-
-#[doc(hidden)]
-#[cfg(feature = "cpu")]
-pub fn px_stats() -> [u64; 12] {
-  let mut out = [0u64; 12];
-  for (o, c) in out.iter_mut().zip(render::PX_STATS.iter()) {
-    *o = c.load(core::sync::atomic::Ordering::Relaxed);
-  }
-  out
-}
-
-#[doc(hidden)]
-#[cfg(feature = "cpu")]
-pub fn stroke_stats() -> [u64; 5] {
-  let mut out = [0u64; 5];
-  for (o, c) in out.iter_mut().zip(stroke::STROKE_STATS.iter()) {
-    *o = c.load(core::sync::atomic::Ordering::Relaxed);
-  }
-  out
-}
-
-#[doc(hidden)]
-#[cfg(feature = "cpu")]
-pub fn gradient_stats() -> [u64; 5] {
-  let mut out = [0u64; 5];
-  for (o, c) in out.iter_mut().zip(render::GRAD_STATS.iter()) {
-    *o = c.load(core::sync::atomic::Ordering::Relaxed);
-  }
-  out
-}
 
 impl Composition {
   /// Parses a Lottie composition from raw JSON bytes.

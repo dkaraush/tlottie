@@ -502,27 +502,6 @@ fn angle_delta(a: f32, b: f32) -> f32 {
   d
 }
 
-/// Development counters exposed through `stroke_stats`.
-pub(crate) static STROKE_STATS: [core::sync::atomic::AtomicU64; 5] = [
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-];
-
-#[cfg(feature = "stats")]
-#[inline]
-fn stroke_stat(i: usize, n: usize) {
-  if let Some(counter) = STROKE_STATS.get(i) {
-    counter.fetch_add(n as u64, core::sync::atomic::Ordering::Relaxed);
-  }
-}
-
-#[cfg(not(feature = "stats"))]
-#[inline(always)]
-fn stroke_stat(_i: usize, _n: usize) {}
-
 /// Sanitizes and strokes a flattened polyline.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stroke_polyline(points: &[Vec2], point_anchors: &[bool], closed: bool, hw: f32, cap: Cap, join: Join, miter_limit: f32, pool: &mut Vec<Vec<Vec2>>, _solo: bool) -> Vec<Contour> {
@@ -562,8 +541,6 @@ pub(crate) fn stroke_polyline(points: &[Vec2], point_anchors: &[bool], closed: b
 
   let mut out = Vec::new();
   stroke_outline(&pts, &anchors, closed, hw, cap, join, miter_limit, pool, &mut out);
-  stroke_stat(if closed { 1 } else { 0 }, 1);
-  stroke_stat(4, out.len());
   out
 }
 

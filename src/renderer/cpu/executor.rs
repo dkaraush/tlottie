@@ -76,7 +76,6 @@ pub(crate) struct RenderScratch {
 #[path = "coverage.rs"]
 mod coverage;
 use coverage::*;
-pub(crate) use coverage::{GRAD_STATS, MODE_STATS, PX_STATS};
 
 /// Bound on recycled point buffers (each typically 4-26 points).
 const PTS_POOL_CAP: usize = 4096;
@@ -152,8 +151,6 @@ impl RenderScratch {
 
   #[cfg(test)]
   pub(crate) fn take_u32(&mut self, n: usize) -> Vec<u32> {
-    px_stat(6, n);
-    px_stat(11, 1);
     let mut b = self.bufs_u32.pop().unwrap_or_default();
     b.clear();
     b.resize(n, 0);
@@ -168,7 +165,6 @@ impl RenderScratch {
   }
 
   pub(crate) fn take_surface_u32(&mut self, n: usize) -> Vec<u32> {
-    px_stat(11, 1);
     let mut b = self.surface_u32.pop().unwrap_or_default();
     b.resize(n, 0);
     b
@@ -414,7 +410,6 @@ impl RenderCtx<'_> {
           for_rows_boxed(&mut buf_a, w, da, |y, row| {
             let lo = y * w + da.x0;
             if let Some(mask_row) = maskbuf.get(lo..lo + row.len()) {
-              px_stat(10, row.len());
               modulate(row, mask_row);
             }
           });
@@ -464,7 +459,6 @@ impl RenderCtx<'_> {
         for_rows_boxed(canvas.pixels, w, da, |y, row| {
           let lo = y * w + da.x0;
           if let Some(src_row) = buf_a.get(lo..lo + row.len()) {
-            px_stat(7, row.len());
             crate::simd::composite_over_span(row, src_row, k);
           }
         });
@@ -664,7 +658,6 @@ impl RenderCtx<'_> {
         cells.sweep_spans(FillRule::NonZero, self.antialias, |y, x0, len, cov| {
           let lo = y * w + x0;
           if let Some(dst) = tmp.get_mut(lo..lo + len) {
-            px_stat(4, len);
             dst.fill(cov);
           }
         });
@@ -688,7 +681,6 @@ impl RenderCtx<'_> {
         let (Some(acc_row), Some(tmp_row)) = (acc.get_mut(lo..hi), tmp.get(lo..hi)) else {
           continue;
         };
-        px_stat(5, acc_row.len());
         for (a, &t) in acc_row.iter_mut().zip(tmp_row.iter()) {
           let mut c = u32::from(t);
           if mask.invert {

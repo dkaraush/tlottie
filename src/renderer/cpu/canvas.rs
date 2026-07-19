@@ -123,7 +123,6 @@ impl Canvas<'_> {
               break;
             };
             self.dirty.mark_row(y, x0, x0 + len);
-            px_stat(0, len);
             crate::simd::fill_span_solid(dst_row, cov_row, sr, sg, sb, sa);
             off += len;
           }
@@ -136,8 +135,6 @@ impl Canvas<'_> {
               break;
             };
             self.dirty.mark_row(y, x0, x0 + len);
-            px_stat(1, len);
-            px_stat(9, 1);
             crate::simd::fill_span_uniform(dst_row, cov, sr, sg, sb, sa);
           }
         }
@@ -165,8 +162,6 @@ impl Canvas<'_> {
           return;
         };
         dirty.mark_row(y, x0, x0 + len);
-        px_stat(2, len);
-        px_stat(8, 1);
         if capture {
           if spans.len() < SPAN_CAPTURE_MAX {
             spans.push(pack_span(y, x0, len, cov));
@@ -207,7 +202,6 @@ impl Canvas<'_> {
         return;
       };
       dirty.mark_row(y, x0, x0 + cov_row.len());
-      px_stat(3, cov_row.len());
       if capture {
         entry.rows.push((y as u32, x0 as u32, cov_row.len() as u32));
         if let PlaneData::Cov(d) = &mut entry.data {

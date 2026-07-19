@@ -16,61 +16,6 @@ pub(super) fn unpack_span(s: u64) -> (usize, usize, usize, u8) {
   ((s >> 44) as usize, ((s >> 24) & 0xf_ffff) as usize, ((s >> 8) & 0xffff) as usize, (s & 0xff) as u8)
 }
 
-/// Dev-only gradient instrumentation (zero cost when unread): pixel counts
-/// per gradient kind and how many pixels the batched NEON kernels covered.
-/// Indices: 0=linear 1=radial 2=focal 3=radial-batched 4=focal-batched.
-pub(crate) static GRAD_STATS: [core::sync::atomic::AtomicU64; 5] = [
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-];
-
-#[inline]
-pub(super) fn grad_stat(i: usize, n: usize) {
-  if let Some(c) = GRAD_STATS.get(i) {
-    c.fetch_add(n as u64, core::sync::atomic::Ordering::Relaxed);
-  }
-}
-
-/// Dev-only pixel-traffic counters (zero cost when unread), read via
-/// tlottie::px_stats(). Slots:
-/// 0=replay px (cov rows)  1=replay px (uniform spans)  2=fresh mode-S px
-/// 3=fresh dense px        4=mask coverage px           5=mask plane-walk px
-/// 6=offscreen clear px    7=composite px               8=fresh span count
-/// 9=replay span count    10=modulate px               11=offscreen takes
-pub(crate) static PX_STATS: [core::sync::atomic::AtomicU64; 12] = [
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-  core::sync::atomic::AtomicU64::new(0),
-];
-
-#[cfg(feature = "stats")]
-#[inline]
-pub(crate) fn px_stat(i: usize, n: usize) {
-  if let Some(c) = PX_STATS.get(i) {
-    c.fetch_add(n as u64, core::sync::atomic::Ordering::Relaxed);
-  }
-}
-
-#[cfg(not(feature = "stats"))]
-#[inline(always)]
-pub(crate) fn px_stat(_i: usize, _n: usize) {}
-
-/// Dev-only mode-selection counters: 0=mode S, 1=mode D (extent gate),
-/// 2=mode D (density gate). Read via tlottie::mode_stats().
-pub(crate) static MODE_STATS: [core::sync::atomic::AtomicU64; 3] = [core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)];
-
 /// Mode-S guard against edge-dense content: the cell engine's cost is
 /// ≈ perimeter px (deposit + sort), the dense engine's is ≈ area bytes.
 /// Stroke piece unions (thousands of tiny quads) have perimeter of the
@@ -108,20 +53,11 @@ pub(super) fn mode_s_wins(contours: &[Contour], canvas_px: usize) -> bool {
     return false;
   }
   if ((x1 - x0).max(y1 - y0)) <= MODE_S_MIN_EXTENT as f32 {
-    grad_stat_arr(&MODE_STATS, 1, 1);
     return false;
   }
   let density = if canvas_px <= 448 * 448 { MODE_S_EDGE_DENSITY_SMALL } else { MODE_S_EDGE_DENSITY_LARGE };
   let s = perim * density < (x1 - x0) * (y1 - y0);
-  grad_stat_arr(&MODE_STATS, if s { 0 } else { 2 }, 1);
   s
-}
-
-#[inline]
-pub(super) fn grad_stat_arr(arr: &[core::sync::atomic::AtomicU64; 3], i: usize, n: usize) {
-  if let Some(c) = arr.get(i) {
-    c.fetch_add(n as u64, core::sync::atomic::Ordering::Relaxed);
-  }
 }
 
 /// Rebuilds a row-plane cache entry from a span list (exact: spans arrive
