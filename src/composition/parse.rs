@@ -480,6 +480,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
   let mut ty_pos: Option<usize> = None;
   let mut hidden = false;
   let mut it_pos: Option<usize> = None;
+  let mut parsed_group: Option<(Vec<Shape>, Option<Transform>)> = None;
   let mut ks_pos: Option<usize> = None;
   let mut p_pos: Option<usize> = None;
   let mut s_pos: Option<usize> = None;
@@ -539,8 +540,14 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
         Ok(())
       }
       b"it" => {
-        it_pos = Some(c.pos());
-        c.skip_value()
+        if ty == Some(*b"gr") {
+          parsed_group = Some(parse_shape_list(c, limits, depth + 1, count)?);
+          it_pos = None;
+          Ok(())
+        } else {
+          it_pos = Some(c.pos());
+          c.skip_value()
+        }
       }
       b"ks" => {
         ks_pos = Some(c.pos());
@@ -678,6 +685,12 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
 
   match &ty {
     b"gr" => {
+      if let Some((shapes, transform)) = parsed_group {
+        return Ok(ParsedItem::Shape(Shape::Group(Box::new(Group {
+          transform: transform.unwrap_or_else(Transform::identity),
+          shapes,
+        }))));
+      }
       let Some(it_pos) = it_pos else {
         return Ok(ParsedItem::Ignored); // empty group
       };
