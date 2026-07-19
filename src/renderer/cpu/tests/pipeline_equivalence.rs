@@ -31,6 +31,7 @@ fn bitmap_binding_recycles_unfinished_frame_state_on_error() {
   assert!(renderer.bitmap.is_none());
   assert!(renderer.surfaces.is_empty());
   assert!(renderer.surface_dirty.is_empty());
+  assert!(renderer.surface_rows.is_empty());
   assert!(renderer.mask_accumulator.is_none());
 }
 
@@ -140,4 +141,30 @@ fn streamed_cpu_matches_direct_for_precomp_group_opacity() {
         "ks":{"o":{"a":0,"k":50},"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}}}]
     }"##,
   );
+}
+
+#[test]
+fn recycled_offscreen_rows_match_fresh_renderer_after_motion() {
+  let composition = Composition::parse(
+    br##"{"fr":30,"ip":0,"op":2,"w":16,"h":4,"layers":[
+      {"ty":4,"ind":1,"ip":0,"op":2,"st":0,
+       "ks":{"o":{"a":0,"k":50},"p":{"a":1,"k":[{"t":0,"s":[2,2],"e":[14,2]},{"t":1,"s":[14,2]}]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}},
+       "shapes":[
+         {"ty":"gr","it":[{"ty":"rc","p":{"a":0,"k":[0,0]},"s":{"a":0,"k":[4,4]},"r":{"a":0,"k":0}},{"ty":"fl","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"r":1}]},
+         {"ty":"gr","it":[{"ty":"rc","p":{"a":0,"k":[0,0]},"s":{"a":0,"k":[2,2]},"r":{"a":0,"k":0}},{"ty":"fl","c":{"a":0,"k":[0,0,1,1]},"o":{"a":0,"k":100},"r":1}]}
+       ]}
+    ]}"##,
+    &Limits::default(),
+  )
+  .unwrap();
+  let mut reused = crate::CPURenderer::new(composition.clone());
+  let mut first = [0u32; 16 * 4];
+  let mut actual = [0u32; 16 * 4];
+  reused.render(0.0, &mut first, 16, 4, RenderOptions::default()).unwrap();
+  reused.render(1.0, &mut actual, 16, 4, RenderOptions::default()).unwrap();
+
+  let mut fresh = crate::CPURenderer::new(composition);
+  let mut expected = [0u32; 16 * 4];
+  fresh.render(1.0, &mut expected, 16, 4, RenderOptions::default()).unwrap();
+  assert_eq!(actual, expected);
 }

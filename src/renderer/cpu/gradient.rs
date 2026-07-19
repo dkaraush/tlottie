@@ -186,7 +186,16 @@ pub(crate) fn radial_map(start: Vec2, end: Vec2, inv: Mat2x3, hl_len_pct: f32, h
 }
 
 impl Canvas<'_> {
-  pub(crate) fn fill_gradient(&mut self, cache: &mut CovCache, key: u128, src_key: u128, contours: &[Contour], rule: FillRule, lut: &[u32; GRADIENT_LUT_SIZE], map: &GradientMap) {
+  pub(crate) fn fill_gradient<const TRACK_ROWS: bool>(
+    &mut self,
+    cache: &mut CovCache,
+    key: u128,
+    src_key: u128,
+    contours: &[Contour],
+    rule: FillRule,
+    lut: &[u32; GRADIENT_LUT_SIZE],
+    map: &GradientMap,
+  ) {
     let w = self.w;
     let antialias = self.antialias;
     let dst_clear = self.dirty.is_empty();
@@ -206,6 +215,9 @@ impl Canvas<'_> {
           break;
         };
         self.dirty.mark_row(y, x0, x0 + len);
+        if TRACK_ROWS {
+          mark_row_bounds(&mut self.dirty_rows, y, x0, x0 + len);
+        }
         if dst_clear {
           dst_row.copy_from_slice(src_row);
         } else {
@@ -247,6 +259,9 @@ impl Canvas<'_> {
             break;
           };
           self.dirty.mark_row(y, x0, x0 + len);
+          if TRACK_ROWS {
+            mark_row_bounds(&mut self.dirty_rows, y, x0, x0 + len);
+          }
           if capture {
             // Source-plane capture needs actual per-pixel bytes.
             if cov == 255 && self.row_ones.len() < len {
@@ -295,6 +310,9 @@ impl Canvas<'_> {
             break;
           };
           self.dirty.mark_row(y, x0, x0 + len);
+          if TRACK_ROWS {
+            mark_row_bounds(&mut self.dirty_rows, y, x0, x0 + len);
+          }
           if capture {
             src_entry.rows.push((y as u32, x0 as u32, len as u32));
             if let PlaneData::Src(sd) = &mut src_entry.data {
@@ -325,6 +343,7 @@ impl Canvas<'_> {
     }
     let pixels = &mut *self.pixels;
     let dirty = &mut self.dirty;
+    let dirty_rows = &mut self.dirty_rows;
     if mode_s_wins(contours, w * self.h) {
       // Mode S: spans feed the same gradient_row math through a
       // synthesized uniform cov row.
@@ -342,6 +361,9 @@ impl Canvas<'_> {
           return;
         };
         dirty.mark_row(y, x0, x0 + len);
+        if TRACK_ROWS {
+          mark_row_bounds(dirty_rows, y, x0, x0 + len);
+        }
         if !capture {
         } else if spans.len() < SPAN_CAPTURE_MAX {
           spans.push(pack_span(y, x0, len, cov));
@@ -397,6 +419,9 @@ impl Canvas<'_> {
         return;
       };
       dirty.mark_row(y, x0, x0 + cov_row.len());
+      if TRACK_ROWS {
+        mark_row_bounds(dirty_rows, y, x0, x0 + cov_row.len());
+      }
       if capture {
         entry.rows.push((y as u32, x0 as u32, cov_row.len() as u32));
         if let PlaneData::Cov(d) = &mut entry.data {

@@ -84,7 +84,7 @@ impl ShapeWalker<'_> {
     for pj in pending.iter().rev() {
       let contours = match self.materialize(pj, arena, &|_| false) {
         DrawJob::Solid { key, contours, rule, color, opacity } => {
-          canvas.fill(&mut self.scratch.cov_cache, key, &contours, rule, color, opacity);
+          canvas.fill::<false>(&mut self.scratch.cov_cache, key, &contours, rule, color, opacity);
           if let Some(rec) = record.as_deref_mut() {
             rec.push(ReplayJob::Solid { key, rule, color, opacity });
           }
@@ -98,7 +98,7 @@ impl ShapeWalker<'_> {
           lut,
           map,
         } => {
-          canvas.fill_gradient(&mut self.scratch.cov_cache, key, src_key, &contours, rule, &lut, &map);
+          canvas.fill_gradient::<false>(&mut self.scratch.cov_cache, key, src_key, &contours, rule, &lut, &map);
           if let Some(rec) = record.as_deref_mut() {
             rec.push(ReplayJob::Gradient {
               key,
@@ -133,10 +133,10 @@ impl ShapeWalker<'_> {
     for j in jobs {
       match j {
         ReplayJob::Solid { key, rule, color, opacity } => {
-          canvas.fill(&mut self.scratch.cov_cache, *key, &[], *rule, *color, *opacity);
+          canvas.fill::<false>(&mut self.scratch.cov_cache, *key, &[], *rule, *color, *opacity);
         }
         ReplayJob::Gradient { key, src_key, rule, lut, map } => {
-          canvas.fill_gradient(&mut self.scratch.cov_cache, *key, *src_key, &[], *rule, lut, map);
+          canvas.fill_gradient::<false>(&mut self.scratch.cov_cache, *key, *src_key, &[], *rule, lut, map);
         }
       }
     }

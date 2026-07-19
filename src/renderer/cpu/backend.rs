@@ -5,7 +5,7 @@
 use crate::model::FillRule;
 use crate::renderer::frame::{Composite, FrameRenderer, Geometry, GradientKind, GradientPaint, Paint, Rule};
 
-use super::executor::{apply_matte, modulate, Canvas, DirtyBox, GradientMap, GradientMapKind};
+use super::executor::{apply_matte, modulate, Canvas, DirtyBox, GradientMap, GradientMapKind, RowBounds};
 use super::CPURenderer;
 
 struct BitmapReset<'a>(&'a mut CPURenderer);
@@ -14,8 +14,10 @@ impl Drop for BitmapReset<'_> {
   fn drop(&mut self) {
     self.0.bitmap = None;
     while let Some(surface) = self.0.surfaces.pop() {
-      let dirty = self.0.surface_dirty.pop().unwrap_or_else(DirtyBox::empty);
-      self.0.state.put_surface_u32(surface, self.0.width, dirty);
+      let _dirty = self.0.surface_dirty.pop().unwrap_or_else(DirtyBox::empty);
+      let rows = self.0.surface_rows.pop().unwrap_or_default();
+      self.0.state.put_surface_u32(surface, self.0.width, &rows);
+      self.0.row_bounds_pool.push(rows);
     }
     self.0.bitmap_dirty = false;
     if let Some(mask) = self.0.mask_accumulator.take() {
@@ -89,18 +91,25 @@ impl CPURenderer {
         None => return,
       },
     };
-    let mut canvas = Canvas::with_raster(pixels, self.width, self.height, raster, cells, self.antialias);
+    let dirty_rows = self.surface_rows.last_mut().map(Vec::as_mut_slice);
+    let track_rows = dirty_rows.is_some();
+    let mut canvas = Canvas::with_raster_and_rows(pixels, self.width, self.height, raster, cells, self.antialias, dirty_rows);
     if destination_dirty {
       // `Canvas` uses an empty dirty box to select a gradient copy fast
       // path. It is recreated for each streamed command, so carry the
       // destination's content state across commands explicitly.
       canvas.dirty.mark_row(0, 0, 1);
     }
-    match paint {
-      Paint::Solid(solid) => canvas.fill(&mut scratch.cov_cache, key, contours, fill_rule(solid.rule), solid.color, solid.opacity),
-      Paint::Gradient(gradient) => {
+    match (paint, track_rows) {
+      (Paint::Solid(solid), true) => canvas.fill::<true>(&mut scratch.cov_cache, key, contours, fill_rule(solid.rule), solid.color, solid.opacity),
+      (Paint::Solid(solid), false) => canvas.fill::<false>(&mut scratch.cov_cache, key, contours, fill_rule(solid.rule), solid.color, solid.opacity),
+      (Paint::Gradient(gradient), true) => {
         let map = gradient_map(gradient);
-        canvas.fill_gradient(&mut scratch.cov_cache, key, gradient.source_key, contours, fill_rule(gradient.rule), &gradient.lut, &map);
+        canvas.fill_gradient::<true>(&mut scratch.cov_cache, key, gradient.source_key, contours, fill_rule(gradient.rule), &gradient.lut, &map);
+      }
+      (Paint::Gradient(gradient), false) => {
+        let map = gradient_map(gradient);
+        canvas.fill_gradient::<false>(&mut scratch.cov_cache, key, gradient.source_key, contours, fill_rule(gradient.rule), &gradient.lut, &map);
       }
     }
     let draw_dirty = canvas.dirty;
@@ -120,37 +129,50 @@ impl CPURenderer {
           return;
         };
         let source_dirty = self.surface_dirty.pop().unwrap_or_else(DirtyBox::empty);
+        let source_rows = self.surface_rows.pop().unwrap_or_default();
         let width = self.width;
-        composite_over_box(self.active(), &source, width, source_dirty, opacity);
+        composite_over_rows(self.active(), &source, width, &source_rows, source_dirty, opacity);
         if !source_dirty.is_empty() {
-          self.mark_active_dirty(source_dirty);
+          self.mark_active_dirty(source_dirty, &source_rows);
         }
-        self.state.put_surface_u32(source, self.width, source_dirty);
+        self.state.put_surface_u32(source, self.width, &source_rows);
+        self.row_bounds_pool.push(source_rows);
       }
       Composite::Matte { kind, opacity } => {
         let Some(mut target) = self.surfaces.pop() else {
           return;
         };
         let target_dirty = self.surface_dirty.pop().unwrap_or_else(DirtyBox::empty);
+        let target_rows = self.surface_rows.pop().unwrap_or_default();
         let Some(source) = self.surfaces.pop() else {
           return;
         };
         let _source_dirty = self.surface_dirty.pop().unwrap_or_else(DirtyBox::empty);
+        let source_rows = self.surface_rows.pop().unwrap_or_default();
         apply_matte(&mut target, &source, kind);
         let width = self.width;
-        composite_over_box(self.active(), &target, width, target_dirty, opacity);
+        composite_over_rows(self.active(), &target, width, &target_rows, target_dirty, opacity);
         if !target_dirty.is_empty() {
-          self.mark_active_dirty(target_dirty);
+          self.mark_active_dirty(target_dirty, &target_rows);
         }
-        self.state.put_surface_u32(target, self.width, target_dirty);
-        self.state.put_surface_u32(source, self.width, _source_dirty);
+        self.state.put_surface_u32(target, self.width, &target_rows);
+        self.state.put_surface_u32(source, self.width, &source_rows);
+        self.row_bounds_pool.push(target_rows);
+        self.row_bounds_pool.push(source_rows);
       }
     }
   }
 
-  fn mark_active_dirty(&mut self, bounds: DirtyBox) {
+  fn mark_active_dirty(&mut self, bounds: DirtyBox, rows: &[RowBounds]) {
     if let Some(dirty) = self.surface_dirty.last_mut() {
       dirty.union(bounds);
+      if let Some(active_rows) = self.surface_rows.last_mut() {
+        for (active, &source) in active_rows.iter_mut().zip(rows) {
+          if !source.is_empty() {
+            active.mark(source.x0, source.x1.saturating_add(1));
+          }
+        }
+      }
     } else {
       self.bitmap_dirty = true;
     }
@@ -206,8 +228,12 @@ impl CPURenderer {
 impl FrameRenderer for CPURenderer {
   fn save_layer(&mut self) {
     let layer = self.state.take_surface_u32(self.width.saturating_mul(self.height));
+    let mut rows = self.row_bounds_pool.pop().unwrap_or_default();
+    rows.clear();
+    rows.resize(self.height, RowBounds::empty());
     self.surfaces.push(layer);
     self.surface_dirty.push(DirtyBox::empty());
+    self.surface_rows.push(rows);
   }
 
   fn draw(&mut self, geometry: Geometry<'_>, paint: Paint<'_>) {
@@ -227,6 +253,29 @@ impl FrameRenderer for CPURenderer {
   }
 }
 
+fn composite_over_rows(destination: &mut [u32], source: &[u32], width: usize, rows: &[RowBounds], bounds: DirtyBox, opacity: u8) {
+  if bounds.is_empty() || width == 0 {
+    return;
+  }
+  let height = destination.len().min(source.len()) / width;
+  let y0 = bounds.y0.min(height).min(rows.len());
+  let y1 = bounds.y1.saturating_add(1).min(height).min(rows.len());
+  for y in y0..y1 {
+    let row_bounds = rows[y];
+    if row_bounds.is_empty() {
+      continue;
+    }
+    let x0 = row_bounds.x0.min(width);
+    let x1 = row_bounds.x1.saturating_add(1).min(width);
+    if x0 >= x1 {
+      continue;
+    }
+    let row = y * width;
+    crate::simd::composite_over_span(&mut destination[row + x0..row + x1], &source[row + x0..row + x1], u32::from(opacity));
+  }
+}
+
+#[cfg(test)]
 fn composite_over_box(destination: &mut [u32], source: &[u32], width: usize, bounds: DirtyBox, opacity: u8) {
   if bounds.is_empty() || width == 0 {
     return;
@@ -291,6 +340,34 @@ mod composite_tests {
       let mut actual = original.clone();
       composite_over_box_reference(&mut expected, &source, width, bounds, opacity);
       composite_over_box(&mut actual, &source, width, bounds, opacity);
+      assert_eq!(actual, expected, "opacity={opacity}");
+    }
+  }
+
+  #[test]
+  fn composite_over_recorded_rows_matches_full_rows() {
+    let width = 24;
+    let height = 5;
+    let bounds = DirtyBox { x0: 2, y0: 1, x1: 21, y1: 4 };
+    let mut source = vec![0; width * height];
+    source[width + 8] = 0x8040_2010;
+    source[width + 16] = 0xff10_2030;
+    source[2 * width + 2..2 * width + 22].fill(0x4020_1008);
+    source[4 * width + 20] = 0x0101_0000;
+    let mut rows = vec![RowBounds::empty(); height];
+    for y in 0..height {
+      let row = &source[y * width..(y + 1) * width];
+      if let Some(first) = row.iter().position(|&pixel| pixel != 0) {
+        let last = row.iter().rposition(|&pixel| pixel != 0).unwrap_or(first) + 1;
+        rows[y].mark(first, last);
+      }
+    }
+    let original = vec![0xff20_4060; width * height];
+    for opacity in [1, 17, 128, 254, 255] {
+      let mut expected = original.clone();
+      let mut actual = original.clone();
+      composite_over_box_reference(&mut expected, &source, width, bounds, opacity);
+      composite_over_rows(&mut actual, &source, width, &rows, bounds, opacity);
       assert_eq!(actual, expected, "opacity={opacity}");
     }
   }

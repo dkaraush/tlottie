@@ -20,6 +20,8 @@ pub struct CPURenderer {
   pub(super) bitmap_dirty: bool,
   pub(super) surfaces: Vec<Vec<u32>>,
   pub(super) surface_dirty: Vec<super::executor::DirtyBox>,
+  pub(super) surface_rows: Vec<Vec<super::executor::RowBounds>>,
+  pub(super) row_bounds_pool: Vec<Vec<super::executor::RowBounds>>,
   pub(super) mask_accumulator: Option<Vec<u8>>,
 }
 
@@ -37,6 +39,8 @@ impl CPURenderer {
       bitmap_dirty: false,
       surfaces: Vec::new(),
       surface_dirty: Vec::new(),
+      surface_rows: Vec::new(),
+      row_bounds_pool: Vec::new(),
       mask_accumulator: None,
     }
   }
@@ -54,6 +58,8 @@ impl CPURenderer {
       bitmap_dirty: false,
       surfaces: Vec::new(),
       surface_dirty: Vec::new(),
+      surface_rows: Vec::new(),
+      row_bounds_pool: Vec::new(),
       mask_accumulator: None,
     }
   }

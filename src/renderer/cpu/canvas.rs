@@ -46,6 +46,36 @@ impl DirtyBox {
   }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RowBounds {
+  pub(crate) x0: usize,
+  pub(crate) x1: usize,
+}
+
+impl RowBounds {
+  pub(crate) fn empty() -> Self {
+    Self { x0: usize::MAX, x1: 0 }
+  }
+
+  pub(crate) fn is_empty(self) -> bool {
+    self.x0 > self.x1
+  }
+
+  pub(crate) fn mark(&mut self, x0: usize, x1: usize) {
+    if x1 <= x0 {
+      return;
+    }
+    self.x0 = self.x0.min(x0);
+    self.x1 = self.x1.max(x1 - 1);
+  }
+}
+
+pub(crate) fn mark_row_bounds(rows: &mut Option<&mut [RowBounds]>, y: usize, x0: usize, x1: usize) {
+  if let Some(row) = rows.as_deref_mut().and_then(|rows| rows.get_mut(y)) {
+    row.mark(x0, x1);
+  }
+}
+
 pub(crate) struct Canvas<'a> {
   pub(crate) pixels: &'a mut [u32],
   pub(crate) w: usize,
@@ -58,6 +88,10 @@ pub(crate) struct Canvas<'a> {
   /// Union of all rows/columns written since creation (fills, gradient
   /// fills, and nested offscreen composites all mark it).
   pub(crate) dirty: DirtyBox,
+  /// Optional per-row bounds owned by the active offscreen layer. Recording
+  /// them while drawing avoids rediscovering sparse bounds from pixels when
+  /// the layer is composited.
+  pub(crate) dirty_rows: Option<&'a mut [RowBounds]>,
   /// Uniform-coverage row scratch: mode-S gradient spans synthesize a
   /// constant cov row here so gradient_row's per-pixel math (and its
   /// bit-exactness contract with the cache replay) is reused verbatim.
@@ -74,7 +108,12 @@ pub(crate) struct Canvas<'a> {
 }
 
 impl<'a> Canvas<'a> {
+  #[cfg(test)]
   pub(crate) fn with_raster(pixels: &'a mut [u32], w: usize, h: usize, raster: Rasterizer, cells: CellRaster, antialias: bool) -> Self {
+    Self::with_raster_and_rows(pixels, w, h, raster, cells, antialias, None)
+  }
+
+  pub(crate) fn with_raster_and_rows(pixels: &'a mut [u32], w: usize, h: usize, raster: Rasterizer, cells: CellRaster, antialias: bool, dirty_rows: Option<&'a mut [RowBounds]>) -> Self {
     Canvas {
       pixels,
       w,
@@ -83,6 +122,7 @@ impl<'a> Canvas<'a> {
       raster,
       cells,
       dirty: DirtyBox::empty(),
+      dirty_rows,
       row_cov: Vec::new(),
       row_ones: Vec::new(),
       span_buf: Vec::new(),
@@ -93,7 +133,7 @@ impl<'a> Canvas<'a> {
 impl Canvas<'_> {
   /// Rasterizes `contours` and blends `color` (straight alpha, 0..=1
   /// components) with `opacity`, premultiplied source-over.
-  pub(crate) fn fill(&mut self, cache: &mut CovCache, key: u128, contours: &[Contour], rule: crate::model::FillRule, color: Color, opacity: f32) {
+  pub(crate) fn fill<const TRACK_ROWS: bool>(&mut self, cache: &mut CovCache, key: u128, contours: &[Contour], rule: crate::model::FillRule, color: Color, opacity: f32) {
     let alpha = (color.a * opacity).clamp(0.0, 1.0);
     if alpha <= 0.0 {
       return;
@@ -123,6 +163,9 @@ impl Canvas<'_> {
               break;
             };
             self.dirty.mark_row(y, x0, x0 + len);
+            if TRACK_ROWS {
+              mark_row_bounds(&mut self.dirty_rows, y, x0, x0 + len);
+            }
             crate::simd::fill_span_solid(dst_row, cov_row, sr, sg, sb, sa);
             off += len;
           }
@@ -135,6 +178,9 @@ impl Canvas<'_> {
               break;
             };
             self.dirty.mark_row(y, x0, x0 + len);
+            if TRACK_ROWS {
+              mark_row_bounds(&mut self.dirty_rows, y, x0, x0 + len);
+            }
             crate::simd::fill_span_uniform(dst_row, cov, sr, sg, sb, sa);
           }
         }
@@ -147,6 +193,7 @@ impl Canvas<'_> {
     }
     let pixels = &mut *self.pixels;
     let dirty = &mut self.dirty;
+    let dirty_rows = &mut self.dirty_rows;
     if mode_s_wins(contours, w * self.h) {
       // Mode S: sparse cells — no w×h plane, cost ∝ edge crossings.
       self.cells.reset();
@@ -162,6 +209,9 @@ impl Canvas<'_> {
           return;
         };
         dirty.mark_row(y, x0, x0 + len);
+        if TRACK_ROWS {
+          mark_row_bounds(dirty_rows, y, x0, x0 + len);
+        }
         if capture {
           if spans.len() < SPAN_CAPTURE_MAX {
             spans.push(pack_span(y, x0, len, cov));
@@ -210,6 +260,9 @@ impl Canvas<'_> {
         return;
       };
       dirty.mark_row(y, x0, x0 + cov_row.len());
+      if TRACK_ROWS {
+        mark_row_bounds(dirty_rows, y, x0, x0 + cov_row.len());
+      }
       if capture {
         entry.rows.push((y as u32, x0 as u32, cov_row.len() as u32));
         if let PlaneData::Cov(d) = &mut entry.data {

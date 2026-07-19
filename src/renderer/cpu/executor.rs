@@ -172,14 +172,15 @@ impl RenderScratch {
     b
   }
 
-  pub(crate) fn put_surface_u32(&mut self, mut b: Vec<u32>, width: usize, dirty: DirtyBox) {
-    if !dirty.is_empty() && width != 0 {
+  pub(crate) fn put_surface_u32(&mut self, mut b: Vec<u32>, width: usize, rows: &[RowBounds]) {
+    if width != 0 {
       let height = b.len() / width;
-      let x0 = dirty.x0.min(width);
-      let x1 = dirty.x1.saturating_add(1).min(width);
-      let y0 = dirty.y0.min(height);
-      let y1 = dirty.y1.saturating_add(1).min(height);
-      for y in y0..y1 {
+      for (y, &row) in rows.iter().take(height).enumerate() {
+        if row.is_empty() {
+          continue;
+        }
+        let x0 = row.x0.min(width);
+        let x1 = row.x1.saturating_add(1).min(width);
         b[y * width + x0..y * width + x1].fill(0);
       }
     }
@@ -556,7 +557,7 @@ impl RenderCtx<'_> {
           };
           let key = walker.fill_key(core::slice::from_ref(&(contour.clone(), true)), FillRule::NonZero);
           let contours: Vec<Contour> = if walker.scratch.cov_cache.contains(key) { Vec::new() } else { vec![walker.clip_all(&contour)] };
-          canvas.fill(&mut walker.scratch.cov_cache, key, &contours, FillRule::NonZero, color, content_opacity);
+          canvas.fill::<false>(&mut walker.scratch.cov_cache, key, &contours, FillRule::NonZero, color, content_opacity);
         }
       }
       LayerKind::Precomp => {
@@ -887,7 +888,7 @@ pub(crate) fn opacity_byte(opacity: f32) -> u32 {
 
 #[path = "canvas.rs"]
 mod canvas;
-pub(crate) use canvas::{Canvas, DirtyBox};
+pub(crate) use canvas::{mark_row_bounds, Canvas, DirtyBox, RowBounds};
 
 #[path = "gradient.rs"]
 mod gradient;
