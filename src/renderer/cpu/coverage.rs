@@ -21,12 +21,12 @@ pub(super) fn unpack_span(s: u64) -> (usize, usize, usize, u8) {
 /// Stroke piece unions (thousands of tiny quads) have perimeter of the
 /// same order as area — sorting their cell piles loses to the plane
 /// (measured: DogsEmoji@320 cold 1.4x, quicksort 21% of the profile).
-/// S wins when `perimeter * DENSITY < bbox area`. Canvas-scaled per the
-/// E156B matrix (2026-07-14): loosening to 12 won −6.4%/−4.9% at
-/// 64/320px but cost +1.4% at 720px, so small canvases admit denser
-/// paints to mode S than effects-class ones. Extent 32/42/64 measured
-/// flat; 42 kept (the d9d6ad5 crossover).
-pub(super) const MODE_S_EDGE_DENSITY_SMALL: f32 = 12.0; // canvas ≤ 448x448
+/// S wins when `perimeter * DENSITY < bbox area`. Canvas-scaled per E156B
+/// measurements: 12 remains best at 64, 14 wins about 1.2-1.5% across two
+/// 320px packs after the opaque-row changes, and 6 remains best at 720.
+/// Extent 32/42/64 measured flat; 42 kept (the d9d6ad5 crossover).
+pub(super) const MODE_S_EDGE_DENSITY_SMALL: f32 = 12.0; // canvas ≤ 160x160
+pub(super) const MODE_S_EDGE_DENSITY_MEDIUM: f32 = 14.0; // canvas ≤ 448x448
 pub(super) const MODE_S_EDGE_DENSITY_LARGE: f32 = 6.0;
 
 /// Decides the rasterizer mode for one paint: sparse cells (mode S) for
@@ -55,7 +55,13 @@ pub(super) fn mode_s_wins(contours: &[Contour], canvas_px: usize) -> bool {
   if ((x1 - x0).max(y1 - y0)) <= MODE_S_MIN_EXTENT as f32 {
     return false;
   }
-  let density = if canvas_px <= 448 * 448 { MODE_S_EDGE_DENSITY_SMALL } else { MODE_S_EDGE_DENSITY_LARGE };
+  let density = if canvas_px <= 160 * 160 {
+    MODE_S_EDGE_DENSITY_SMALL
+  } else if canvas_px <= 448 * 448 {
+    MODE_S_EDGE_DENSITY_MEDIUM
+  } else {
+    MODE_S_EDGE_DENSITY_LARGE
+  };
   let s = perim * density < (x1 - x0) * (y1 - y0);
   s
 }
