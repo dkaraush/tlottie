@@ -238,16 +238,15 @@ fn parse_path_object(c: &mut Cursor<'_>) -> Result<PathData> {
 /// Parses a property object `{a, k, ...}`. Whether `k` is static or animated
 /// is decided by its own shape (array of objects = keyframes), not by `a`.
 fn parse_property<T: Lerp>(c: &mut Cursor<'_>, limits: &Limits, parse_val: fn(&mut Cursor<'_>) -> Result<T>) -> Result<Property<T>> {
-  let mut k_pos: Option<usize> = None;
+  let mut property: Option<Property<T>> = None;
   for_each_field(c, |c, key| {
     if key == b"k" {
-      k_pos = Some(c.pos());
+      property = Some(parse_property_k(c, limits, parse_val)?);
+      return Ok(());
     }
     c.skip_value()
   })?;
-  let k_pos = k_pos.ok_or_else(|| invalid(c, "property missing k"))?;
-  let mut kc = c.fork_at(k_pos);
-  parse_property_k(&mut kc, limits, parse_val)
+  property.ok_or_else(|| invalid(c, "property missing k"))
 }
 
 fn parse_property_k<T: Lerp>(kc: &mut Cursor<'_>, limits: &Limits, parse_val: fn(&mut Cursor<'_>) -> Result<T>) -> Result<Property<T>> {
