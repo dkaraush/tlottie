@@ -242,10 +242,57 @@ fn composite_over_box(destination: &mut [u32], source: &[u32], width: usize, bou
   for y in y0..y1 {
     let row = y * width;
     let src_row = &source[row + x0..row + x1];
-    if src_row.iter().all(|&pixel| pixel == 0) {
+    // A DirtyBox has one shared x range, but isolated vector layers can be
+    // much narrower on individual rows. Keep the dense SIMD compositor while
+    // excluding each row's transparent margins.
+    let Some(first) = src_row.iter().position(|&pixel| pixel != 0) else {
       continue;
+    };
+    let last = src_row.iter().rposition(|&pixel| pixel != 0).unwrap_or(first) + 1;
+    crate::simd::composite_over_span(&mut destination[row + x0 + first..row + x0 + last], &src_row[first..last], u32::from(opacity));
+  }
+}
+
+#[cfg(test)]
+mod composite_tests {
+  use super::*;
+
+  fn composite_over_box_reference(destination: &mut [u32], source: &[u32], width: usize, bounds: DirtyBox, opacity: u8) {
+    if bounds.is_empty() || width == 0 {
+      return;
     }
-    crate::simd::composite_over_span(&mut destination[row + x0..row + x1], src_row, u32::from(opacity));
+    let height = destination.len().min(source.len()) / width;
+    let x0 = bounds.x0.min(width);
+    let x1 = bounds.x1.saturating_add(1).min(width);
+    let y0 = bounds.y0.min(height);
+    let y1 = bounds.y1.saturating_add(1).min(height);
+    if x0 >= x1 || y0 >= y1 {
+      return;
+    }
+    for y in y0..y1 {
+      let row = y * width;
+      crate::simd::composite_over_span(&mut destination[row + x0..row + x1], &source[row + x0..row + x1], u32::from(opacity));
+    }
+  }
+
+  #[test]
+  fn composite_over_box_row_trimming_matches_full_rows() {
+    let width = 24;
+    let height = 5;
+    let bounds = DirtyBox { x0: 2, y0: 1, x1: 21, y1: 4 };
+    let mut source = vec![0; width * height];
+    source[width + 8] = 0x8040_2010;
+    source[width + 16] = 0xff10_2030;
+    source[2 * width + 2..2 * width + 22].fill(0x4020_1008);
+    source[4 * width + 20] = 0x0101_0000;
+    let original: Vec<u32> = (0..width * height).map(|i| 0xff00_0000 | ((i as u32 * 0x0101_01) & 0x00ff_ffff)).collect();
+    for opacity in [1, 17, 128, 254, 255] {
+      let mut expected = original.clone();
+      let mut actual = original.clone();
+      composite_over_box_reference(&mut expected, &source, width, bounds, opacity);
+      composite_over_box(&mut actual, &source, width, bounds, opacity);
+      assert_eq!(actual, expected, "opacity={opacity}");
+    }
   }
 }
 
