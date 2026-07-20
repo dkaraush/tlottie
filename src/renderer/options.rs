@@ -13,10 +13,12 @@ pub struct RenderOptions {
   /// Smaller values improve accuracy at a performance cost.
   pub curve_tolerance: f32,
 
-  /// Reserved for a future single-color rendering override.
+  /// Renders only the animation's alpha mask.
   ///
-  /// This currently has no effect and remains present for API compatibility.
-  pub single_color: bool,
+  /// Output RGB channels are zero. Paint colors are skipped where possible,
+  /// while paint opacity, edge coverage, masks, mattes, and layer compositing
+  /// continue to determine the alpha channel.
+  pub alpha_only: bool,
 }
 
 impl Default for RenderOptions {
@@ -24,7 +26,7 @@ impl Default for RenderOptions {
     Self {
       antialias: true,
       curve_tolerance: 0.125,
-      single_color: false,
+      alpha_only: false,
     }
   }
 }

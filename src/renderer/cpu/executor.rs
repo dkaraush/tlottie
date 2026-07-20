@@ -88,6 +88,7 @@ pub(crate) struct RenderScratch {
 #[path = "coverage.rs"]
 mod coverage;
 use coverage::*;
+pub(crate) use coverage::{mode_s_wins, pack_span, unpack_span, CovCache, CovEntry, PlaneData, SPAN_CAPTURE_MAX};
 
 /// Bound on recycled point buffers (each typically 4-26 points).
 const PTS_POOL_CAP: usize = 4096;

@@ -18,6 +18,7 @@ const statsRow = document.getElementById('statsrow');
 const globalStats = document.getElementById('stats');
 const capFps = document.getElementById('capfps');
 const antialias = document.getElementById('antialias');
+const alphaOnly = document.getElementById('alphaonly');
 const curveTolerance = document.getElementById('curvetolerance');
 const curveToleranceVal = document.getElementById('curvetoleranceval');
 const sizeSlider = document.getElementById('sizeslider');
@@ -64,6 +65,8 @@ const engines = [
     frameCount: (i) => tl.tlottie_frame_count(i),
     render: (i, f, w, h, aa, tolerance) =>
       tl.tlottie_render_with_options(i, f, w, h, aa ? 1 : 0, tolerance),
+    renderAlpha8: (i, f, w, h, aa, tolerance) =>
+      tl.tlottie_render_alpha8_with_options(i, f, w, h, aa ? 1 : 0, tolerance),
   },
   {
     ...engineDom('rl'),
@@ -165,6 +168,9 @@ sizeSlider.addEventListener('input', applySize);
 antialias.addEventListener('change', () => {
   const tlottie = engines.find((e) => e.key === 'tl');
   if (tlottie?.drawMs) tlottie.drawMs.length = 0;
+});
+alphaOnly.addEventListener('change', () => {
+  for (const e of engines) if (e.drawMs) e.drawMs.length = 0;
 });
 curveTolerance.addEventListener('input', () => {
   curveToleranceVal.textContent = `${Number(curveTolerance.value).toFixed(3)} px`;
@@ -268,8 +274,10 @@ function loadLottie(bytes, name) {
         if (e.inFlight) continue;  // one GPU frame in flight at a time
         const frame = pos % e.frames;
         const d0 = performance.now();
-        const px = e.render(
-          e.inst, frame, e.w, e.h, antialias.checked, +curveTolerance.value);
+        const alpha8 = e.key === 'tl' && alphaOnly.checked;
+        const px = alpha8
+          ? e.renderAlpha8(e.inst, frame, e.w, e.h, antialias.checked, +curveTolerance.value)
+          : e.render(e.inst, frame, e.w, e.h, antialias.checked, +curveTolerance.value);
         if (!px) { e.dead = true; e.statsEl.textContent = 'render failed'; continue; }
         if (e.direct) {
           // GPU submit done; sample completes when the queue drains.
@@ -286,8 +294,24 @@ function loadLottie(bytes, name) {
           });
           continue;
         }
-        const rgba = new Uint8ClampedArray(
-          e.heap().buffer, px, e.w * e.h * 4);
+        let rgba;
+        if (alpha8) {
+          const alpha = new Uint8Array(e.heap().buffer, px, e.w * e.h);
+          if (!e.alphaRgba || e.alphaRgba.length !== e.w * e.h * 4) {
+            e.alphaRgba = new Uint8ClampedArray(e.w * e.h * 4);
+            for (let i = 0; i < e.alphaRgba.length; i += 4) {
+              e.alphaRgba[i] = 255;
+              e.alphaRgba[i + 1] = 255;
+              e.alphaRgba[i + 2] = 255;
+            }
+          }
+          for (let i = 0, j = 3; i < alpha.length; i++, j += 4) {
+            e.alphaRgba[j] = alpha[i];
+          }
+          rgba = e.alphaRgba;
+        } else {
+          rgba = new Uint8ClampedArray(e.heap().buffer, px, e.w * e.h * 4);
+        }
         e.ctx.putImageData(new ImageData(rgba, e.w, e.h), 0, 0);
         e.drawMs.push(performance.now() - d0);
         if (e.drawMs.length > WINDOW) e.drawMs.shift();

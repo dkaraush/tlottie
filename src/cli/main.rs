@@ -38,7 +38,7 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs<'_>, String> {
           return Err("--curve-tolerance requires a positive number".into());
         }
       }
-      "--single-color" => options.single_color = true,
+      "--alpha-only" | "--single-color" => options.alpha_only = true,
       option if option.starts_with("--aa=") || option.starts_with("--antialias=") => {
         let Some((_, value)) = option.split_once('=') else {
           return Err(format!("invalid antialias option: {option}"));
@@ -79,8 +79,8 @@ fn main() -> ExitCode {
 
 fn usage() -> ExitCode {
   eprintln!("usage: tlottie-cli info <file.json>...");
-  eprintln!("       tlottie-cli render [--backend cpu|vulkan] [--curve-tolerance <pixels>] <file.json> <frame> <size> <out.png>");
-  eprintln!("       tlottie-cli bench [--curve-tolerance <pixels>] <file.json> <size> <frames>");
+  eprintln!("       tlottie-cli render [--backend cpu|vulkan] [--alpha-only] [--curve-tolerance <pixels>] <file.json> <frame> <size> <out.png>");
+  eprintln!("       tlottie-cli bench [--alpha-only] [--curve-tolerance <pixels>] <file.json> <size> <frames>");
   ExitCode::from(2)
 }
 
@@ -105,6 +105,7 @@ fn bench_cmd(args: &[String]) -> ExitCode {
         }
         options.curve_tolerance = value;
       }
+      "--alpha-only" | "--single-color" => options.alpha_only = true,
       option if option.starts_with("--") => {
         eprintln!("bench: unknown option: {option}");
         return ExitCode::from(2);
@@ -309,6 +310,14 @@ mod tests {
     for disabled in ["--no-aa", "--aa=false", "--no-antialias", "--antialias=false"] {
       let values = args(&[disabled, "animation.json", "0", "256", "out.png"]);
       assert!(!parse_render_args(&values).unwrap().options.antialias, "{disabled}");
+    }
+  }
+
+  #[test]
+  fn parses_alpha_only_and_legacy_single_color_alias() {
+    for option in ["--alpha-only", "--single-color"] {
+      let values = args(&[option, "animation.json", "0", "256", "out.png"]);
+      assert!(parse_render_args(&values).unwrap().options.alpha_only, "{option}");
     }
   }
 

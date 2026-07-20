@@ -11,6 +11,8 @@ pub struct Instance {
   argb: Vec<u32>,
   /// Un-premultiplied RGBA8 copy handed to the canvas `ImageData`.
   rgba: Vec<u8>,
+  /// Direct one-byte-per-pixel alpha render target.
+  alpha8: Vec<u8>,
 }
 
 /// Allocates `len` bytes for JS to copy input into. Returns null on failure
@@ -61,6 +63,7 @@ pub unsafe extern "C" fn tlottie_new(json_ptr: *const u8, json_len: usize) -> *m
       anim: CPURenderer::new(comp),
       argb: Vec::new(),
       rgba: Vec::new(),
+      alpha8: Vec::new(),
     })),
     Err(_) => std::ptr::null_mut(),
   }
@@ -174,4 +177,46 @@ pub unsafe extern "C" fn tlottie_render_with_options(inst: *mut Instance, frame:
   }
   crate::pixel::argb_to_rgba_slice(&inst.argb, &mut inst.rgba);
   inst.rgba.as_ptr()
+}
+
+/// Renders directly into a `width * height` Alpha8 buffer owned by the
+/// instance. The returned pointer remains valid until the next render call.
+#[no_mangle]
+pub unsafe extern "C" fn tlottie_render_alpha8(inst: *mut Instance, frame: f32, width: u32, height: u32, antialias: u32) -> *const u8 {
+  unsafe { tlottie_render_alpha8_with_options(inst, frame, width, height, antialias, RenderOptions::default().curve_tolerance) }
+}
+
+/// Like [`tlottie_render_alpha8`], with an explicit curve tolerance.
+#[no_mangle]
+pub unsafe extern "C" fn tlottie_render_alpha8_with_options(inst: *mut Instance, frame: f32, width: u32, height: u32, antialias: u32, curve_tolerance: f32) -> *const u8 {
+  let Some(inst) = (unsafe { inst.as_mut() }) else {
+    return std::ptr::null();
+  };
+  if !curve_tolerance.is_finite() || curve_tolerance <= 0.0 {
+    return std::ptr::null();
+  }
+  let Some(px) = (width as usize).checked_mul(height as usize) else {
+    return std::ptr::null();
+  };
+  if inst.alpha8.len() != px {
+    inst.alpha8.resize(px, 0);
+  }
+  if inst
+    .anim
+    .render_alpha8(
+      frame,
+      &mut inst.alpha8,
+      width,
+      height,
+      RenderOptions {
+        antialias: antialias != 0,
+        curve_tolerance,
+        alpha_only: true,
+      },
+    )
+    .is_err()
+  {
+    return std::ptr::null();
+  }
+  inst.alpha8.as_ptr()
 }

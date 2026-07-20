@@ -432,9 +432,10 @@ class FrameStream:
 
 
 class Tlottie:
-    def __init__(self, path: Path, curve_tolerance: float = 0.125) -> None:
+    def __init__(self, path: Path, curve_tolerance: float = 0.125, alpha_only: bool = False) -> None:
         self.lib = C.CDLL(str(path))
         self.curve_tolerance = curve_tolerance
+        self.alpha_only = alpha_only
         self.lib.tlottie_new.argtypes = [C.c_void_p, C.c_size_t]
         self.lib.tlottie_new.restype = C.c_void_p
         self.lib.tlottie_drop.argtypes = [C.c_void_p]
@@ -461,6 +462,21 @@ class Tlottie:
             C.c_float,
         ]
         self.lib.tlottie_render_with_options.restype = C.c_int
+        self.lib.tlottie_render_alpha8_with_options.argtypes = [
+            C.c_void_p,
+            C.c_float,
+            C.c_uint32,
+            C.c_uint32,
+            C.POINTER(C.c_uint8),
+            C.c_size_t,
+            C.c_uint32,
+            C.c_float,
+        ]
+        self.lib.tlottie_render_alpha8_with_options.restype = C.c_int
+
+    def _pixel_buffer(self, count: int) -> Any:
+        pixel_type = C.c_uint8 if self.alpha_only else C.c_uint32
+        return (pixel_type * count)()
 
     def _render(
         self,
@@ -472,8 +488,13 @@ class Tlottie:
         out_len: int,
         antialias: int,
     ) -> int:
+        render = (
+            self.lib.tlottie_render_alpha8_with_options
+            if self.alpha_only
+            else self.lib.tlottie_render_with_options
+        )
         return int(
-            self.lib.tlottie_render_with_options(
+            render(
                 anim,
                 frame,
                 width,
@@ -492,7 +513,7 @@ class Tlottie:
         anim = self.lib.tlottie_new(buf, len(data))
         if not anim:
             raise RuntimeError("parse")
-        pixels = (C.c_uint32 * (size * size))()
+        pixels = self._pixel_buffer(size * size)
         count = max(1, int(self.lib.tlottie_frame_count(anim)))
 
         def render(frame: int) -> Any:
@@ -517,7 +538,7 @@ class Tlottie:
         anim = self.lib.tlottie_new(buf, len(data))
         if not anim:
             return False, 0.0, None, 0, rss_mb(), rss_mb(), "parse"
-        pixels = (C.c_uint32 * (size * size))()
+        pixels = self._pixel_buffer(size * size)
         try:
             count = max(1, int(self.lib.tlottie_frame_count(anim)))
             frames = count if frames <= 0 else frames
@@ -561,7 +582,7 @@ class Tlottie:
         anim = self.lib.tlottie_new(buf, len(data))
         if not anim:
             return False, [], "parse"
-        pixels = (C.c_uint32 * (size * size))()
+        pixels = self._pixel_buffer(size * size)
         try:
             count = max(1, int(self.lib.tlottie_frame_count(anim)))
             rc = self._render(
@@ -582,7 +603,7 @@ class Tlottie:
         anim = self.lib.tlottie_new(buf, len(data))
         if not anim:
             return False, [], 0, "parse"
-        pixels = (C.c_uint32 * (size * size))()
+        pixels = self._pixel_buffer(size * size)
         try:
             count = max(1, int(self.lib.tlottie_frame_count(anim)))
             frames = []
@@ -607,7 +628,7 @@ class Tlottie:
         anim = self.lib.tlottie_new(buf, len(data))
         if not anim:
             return False, 0.0, None, 0, rss_mb(), rss_mb(), "parse", [], 0
-        pixels = (C.c_uint32 * (size * size))()
+        pixels = self._pixel_buffer(size * size)
         try:
             count = max(1, int(self.lib.tlottie_frame_count(anim)))
             frames = count if frames <= 0 else frames
@@ -669,9 +690,10 @@ class TlottieVulkan:
         r"VK .*?record_ns=(\d+) submit_wait_ns=(\d+) gpu_elapsed_ns=(\d+)"
     )
 
-    def __init__(self, path: Path, curve_tolerance: float = 0.125) -> None:
+    def __init__(self, path: Path, curve_tolerance: float = 0.125, alpha_only: bool = False) -> None:
         self.cli = path
         self.curve_tolerance = curve_tolerance
+        self.alpha_only = alpha_only
 
     @staticmethod
     def frame_count(file: Path) -> int:
@@ -753,8 +775,7 @@ class TlottieVulkan:
                 env["TLOTTIE_VK_RAW_DIR"] = str(raw_dir)
             memory_samples: list[float] = []
             with tempfile.TemporaryFile() as stderr_file:
-                proc = subprocess.Popen(
-                    [
+                command = [
                         str(self.cli),
                         "render",
                         "--backend",
@@ -766,7 +787,11 @@ class TlottieVulkan:
                         str(start),
                         str(size),
                         str(out),
-                    ],
+                    ]
+                if self.alpha_only:
+                    command.insert(2, "--alpha-only")
+                proc = subprocess.Popen(
+                    command,
                     cwd=ROOT,
                     env=env,
                     stdout=subprocess.DEVNULL,
@@ -1319,6 +1344,7 @@ _WORKER_ACCURACY_SIZE = 64
 _WORKER_ACCURACY_TOLERANCE = 8
 _WORKER_ACCURACY_DIFF_THRESHOLD = 1.0
 _WORKER_CURVE_TOLERANCE = 0.125
+_WORKER_ALPHA_ONLY = False
 
 
 def init_worker(
@@ -1333,9 +1359,10 @@ def init_worker(
     accuracy_tolerance: int,
     accuracy_diff_threshold: float,
     curve_tolerance: float,
+    alpha_only: bool,
 ) -> None:
     global _WORKER_RENDERERS, _WORKER_RENDERER_ORDER, _WORKER_SIZE, _WORKER_FRAMES, _WORKER_ROOT, _WORKER_REPS
-    global _WORKER_ACCURACY_ENABLED, _WORKER_ACCURACY_SIZE, _WORKER_ACCURACY_TOLERANCE, _WORKER_ACCURACY_DIFF_THRESHOLD, _WORKER_CURVE_TOLERANCE
+    global _WORKER_ACCURACY_ENABLED, _WORKER_ACCURACY_SIZE, _WORKER_ACCURACY_TOLERANCE, _WORKER_ACCURACY_DIFF_THRESHOLD, _WORKER_CURVE_TOLERANCE, _WORKER_ALPHA_ONLY
     _WORKER_RENDERERS = {}
     _WORKER_RENDERER_ORDER = renderers
     _WORKER_SIZE = size
@@ -1347,12 +1374,13 @@ def init_worker(
     _WORKER_ACCURACY_TOLERANCE = accuracy_tolerance
     _WORKER_ACCURACY_DIFF_THRESHOLD = accuracy_diff_threshold
     _WORKER_CURVE_TOLERANCE = curve_tolerance
+    _WORKER_ALPHA_ONLY = alpha_only
     for renderer in renderers:
         lib = Path(libs[renderer])
         if renderer == "tlottie":
-            _WORKER_RENDERERS[renderer] = Tlottie(lib, curve_tolerance)
+            _WORKER_RENDERERS[renderer] = Tlottie(lib, curve_tolerance, alpha_only)
         elif renderer == "tlottie-vulkan":
-            _WORKER_RENDERERS[renderer] = TlottieVulkan(lib, curve_tolerance)
+            _WORKER_RENDERERS[renderer] = TlottieVulkan(lib, curve_tolerance, alpha_only)
         elif renderer in RLOTTIE_RENDERERS:
             _WORKER_RENDERERS[renderer] = Rlottie(lib)
         elif renderer == "thorvg":
@@ -1447,6 +1475,7 @@ def worker_measure(file_s: str) -> tuple[list[dict[str, Any]], dict[str, Any] | 
             accuracy_errors,
             _WORKER_ACCURACY_TOLERANCE,
             _WORKER_ACCURACY_DIFF_THRESHOLD,
+            _WORKER_ALPHA_ONLY,
         )
     return rows, accuracy_row
 
@@ -1464,6 +1493,7 @@ def run_size_batch(
     accuracy_tolerance: int,
     accuracy_diff_threshold: float,
     curve_tolerance: float,
+    alpha_only: bool,
     progress: ProgressDisplay | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     sampler = EnergySampler()
@@ -1490,6 +1520,7 @@ def run_size_batch(
             accuracy_tolerance,
             accuracy_diff_threshold,
             curve_tolerance,
+            alpha_only,
         ),
     ) as pool:
         for done, (file_rows, accuracy_row) in enumerate(
@@ -1530,6 +1561,7 @@ _ACCURACY_TOLERANCE = 8
 _ACCURACY_DIFF_THRESHOLD = 1.0
 _ACCURACY_INCLUDE_VULKAN = False
 _ACCURACY_CURVE_TOLERANCE = 0.125
+_ACCURACY_ALPHA_ONLY = False
 
 
 def init_accuracy_worker(
@@ -1540,8 +1572,9 @@ def init_accuracy_worker(
     diff_threshold: float,
     include_vulkan: bool,
     curve_tolerance: float,
+    alpha_only: bool,
 ) -> None:
-    global _ACCURACY_RENDERERS, _ACCURACY_ROOT, _ACCURACY_SIZE, _ACCURACY_FRAMES, _ACCURACY_TOLERANCE, _ACCURACY_DIFF_THRESHOLD, _ACCURACY_INCLUDE_VULKAN, _ACCURACY_CURVE_TOLERANCE
+    global _ACCURACY_RENDERERS, _ACCURACY_ROOT, _ACCURACY_SIZE, _ACCURACY_FRAMES, _ACCURACY_TOLERANCE, _ACCURACY_DIFF_THRESHOLD, _ACCURACY_INCLUDE_VULKAN, _ACCURACY_CURVE_TOLERANCE, _ACCURACY_ALPHA_ONLY
     _ACCURACY_ROOT = Path(root)
     _ACCURACY_SIZE = size
     _ACCURACY_FRAMES = frames
@@ -1549,14 +1582,15 @@ def init_accuracy_worker(
     _ACCURACY_DIFF_THRESHOLD = diff_threshold
     _ACCURACY_INCLUDE_VULKAN = include_vulkan
     _ACCURACY_CURVE_TOLERANCE = curve_tolerance
+    _ACCURACY_ALPHA_ONLY = alpha_only
     _ACCURACY_RENDERERS = {
-        "tlottie": Tlottie(LIBS["tlottie"], curve_tolerance),
+        "tlottie": Tlottie(LIBS["tlottie"], curve_tolerance, alpha_only),
         "rlottie": Rlottie(LIBS["rlottie"]),
         "thorvg": Thorvg(LIBS["thorvg"]),
     }
     if include_vulkan:
         _ACCURACY_RENDERERS["tlottie-vulkan"] = TlottieVulkan(
-            LIBS["tlottie-vulkan"], curve_tolerance
+            LIBS["tlottie-vulkan"], curve_tolerance, alpha_only
         )
 
 
@@ -1601,6 +1635,7 @@ def worker_accuracy(file_s: str) -> dict[str, Any]:
                 errors,
                 _ACCURACY_TOLERANCE,
                 _ACCURACY_DIFF_THRESHOLD,
+                _ACCURACY_ALPHA_ONLY,
             )
         except RuntimeError as error:
             return make_accuracy_row(
@@ -1612,6 +1647,7 @@ def worker_accuracy(file_s: str) -> dict[str, Any]:
                 errors + [f"stream:{error}"],
                 _ACCURACY_TOLERANCE,
                 _ACCURACY_DIFF_THRESHOLD,
+                _ACCURACY_ALPHA_ONLY,
             )
 
 
@@ -1624,6 +1660,7 @@ def make_accuracy_row(
     errors: list[str],
     tolerance: int,
     diff_threshold: float,
+    alpha_only: bool = False,
 ) -> dict[str, Any]:
     row = {
         "pack": pack_of(root, file),
@@ -1667,7 +1704,7 @@ def make_accuracy_row(
         candidate = rendered["tlottie"][frame]
         a = rendered["rlottie"][frame]
         b = rendered["thorvg"][frame]
-        bad, consensus = diff_from_consensus(candidate, a, b, tolerance)
+        bad, consensus = diff_from_consensus(candidate, a, b, tolerance, alpha_only, total)
         if consensus == 0:
             row["error"] = f"missing_consensus@{frame}"
             return row
@@ -1701,17 +1738,24 @@ def make_accuracy_row(
         max_channel_error_vulkan = 0
         vulkan_worst_frame = 0
         for frame in range(vulkan_frame_count):
-            distances = [px_distance(a, b) for a, b in zip(cpu[frame], vulkan[frame])]
+            if alpha_only:
+                cpu_alpha = alpha_values(cpu[frame], total, True)
+                vulkan_alpha = alpha_values(vulkan[frame], total, False)
+                pairs = list(zip(cpu_alpha, vulkan_alpha))
+                distances = [abs(int(a) - int(b)) for a, b in pairs]
+            else:
+                pairs = list(zip(cpu[frame], vulkan[frame]))
+                distances = [px_distance(a, b) for a, b in pairs]
             bad_percent = 100.0 * sum(distance > tolerance for distance in distances) / total
-            changed_percent = 100.0 * sum(a != b for a, b in zip(cpu[frame], vulkan[frame])) / total
+            changed_percent = 100.0 * sum(a != b for a, b in pairs) / total
             bad_percentages.append(bad_percent)
             changed_percentages.append(changed_percent)
             distance_sum += sum(distances)
             compared_pixels += len(distances)
             frame_error, frame_error_pixel, frame_cpu, frame_vulkan = max(
                 (
-                    (px_channel_error(a, b), index, a, b)
-                    for index, (a, b) in enumerate(zip(cpu[frame], vulkan[frame]))
+                    ((abs(int(a) - int(b)) if alpha_only else px_channel_error(a, b)), index, int(a), int(b))
+                    for index, (a, b) in enumerate(pairs)
                 ),
                 default=(0, 0, 0, 0),
             )
@@ -1740,8 +1784,37 @@ def make_accuracy_row(
 
 
 def diff_from_consensus(
-    candidate: Any, a: Any, b: Any, tolerance: int
+    candidate: Any,
+    a: Any,
+    b: Any,
+    tolerance: int,
+    alpha_only: bool = False,
+    total: int | None = None,
 ) -> tuple[int, int]:
+    if alpha_only:
+        if total is None:
+            raise ValueError("alpha-only accuracy requires a pixel count")
+        if np is not None:
+            candidate_alpha = numpy_alpha(candidate, total, True).astype(np.int16)
+            a_alpha = numpy_alpha(a, total, False).astype(np.int16)
+            b_alpha = numpy_alpha(b, total, False).astype(np.int16)
+            consensus_mask = np.abs(a_alpha - b_alpha) <= tolerance
+            consensus = int(np.count_nonzero(consensus_mask))
+            average = (a_alpha + b_alpha) // 2
+            candidate_close = np.abs(candidate_alpha - average) <= tolerance
+            return int(np.count_nonzero(consensus_mask & ~candidate_close)), consensus
+        candidate_alpha = alpha_values(candidate, total, True)
+        a_alpha = alpha_values(a, total, False)
+        b_alpha = alpha_values(b, total, False)
+        consensus = 0
+        bad = 0
+        for candidate_value, a_value, b_value in zip(candidate_alpha, a_alpha, b_alpha):
+            if abs(a_value - b_value) > tolerance:
+                continue
+            consensus += 1
+            if abs(candidate_value - ((a_value + b_value) // 2)) > tolerance:
+                bad += 1
+        return bad, consensus
     if np is not None:
         return diff_from_consensus_numpy(candidate, a, b, tolerance)
     bad = 0
@@ -1753,6 +1826,27 @@ def diff_from_consensus(
         if not px_close_to_avg(cp, ap, bp, tolerance):
             bad += 1
     return bad, consensus
+
+
+def alpha_values(frame: Any, total: int, alpha8: bool) -> Any:
+    if alpha8:
+        if isinstance(frame, (bytes, memoryview)):
+            return memoryview(frame).cast("B")[:total]
+        return frame
+    if isinstance(frame, (bytes, memoryview)):
+        raw = memoryview(frame).cast("B")
+        return raw[3 : total * 4 : 4]
+    return [((int(pixel) >> 24) & 0xFF) for pixel in frame]
+
+
+def numpy_alpha(frame: Any, total: int, alpha8: bool) -> Any:
+    if alpha8:
+        if isinstance(frame, (bytes, memoryview)):
+            return np.frombuffer(frame, dtype=np.uint8, count=total)
+        return np.asarray(frame, dtype=np.uint8)
+    if isinstance(frame, (bytes, memoryview)):
+        return np.frombuffer(frame, dtype=np.uint8, count=total * 4).reshape(-1, 4)[:, 3]
+    return (np.asarray(frame, dtype=np.uint32) >> 24).astype(np.uint8)
 
 
 def frame_pixels(frame: Any) -> Any:
@@ -1841,6 +1935,7 @@ def run_accuracy(
     jobs: int,
     include_vulkan: bool,
     curve_tolerance: float,
+    alpha_only: bool,
     progress: ProgressDisplay | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -1853,7 +1948,7 @@ def run_accuracy(
         initializer=init_accuracy_worker,
         initargs=(
             str(root), size, frames, tolerance, diff_threshold,
-            include_vulkan, curve_tolerance,
+            include_vulkan, curve_tolerance, alpha_only,
         ),
     ) as pool:
         for done, row in enumerate(
@@ -2001,6 +2096,7 @@ def save_diff_grids(
     size: int,
     tolerance: int,
     curve_tolerance: float,
+    alpha_only: bool,
 ) -> list[Path]:
     selected = select_diff_rows(rows, limit)
     if not selected:
@@ -2008,7 +2104,7 @@ def save_diff_grids(
     out_dir.mkdir(parents=True, exist_ok=True)
     clear_diff_dir(out_dir)
     renderers = {
-        "tlottie": Tlottie(LIBS["tlottie"], curve_tolerance),
+        "tlottie": Tlottie(LIBS["tlottie"], curve_tolerance, alpha_only),
         "rlottie": Rlottie(LIBS["rlottie"]),
         "thorvg": Thorvg(LIBS["thorvg"]),
     }
@@ -2028,6 +2124,14 @@ def save_diff_grids(
         if errors:
             print(f"   skipped diff grid for {rel}: {'; '.join(errors)}", flush=True)
             continue
+        if alpha_only:
+            total = size * size
+            for name, pixels in images.items():
+                values = alpha_values(pixels, total, name == "tlottie")
+                images[name] = [
+                    (int(alpha) << 24) | (int(alpha) << 16) | (int(alpha) << 8) | int(alpha)
+                    for alpha in values
+                ]
         grid = make_diff_grid(
             images["tlottie"],
             images["rlottie"],
@@ -2572,6 +2676,7 @@ def benchmark_invocation(args: argparse.Namespace, accuracy_size: int) -> str:
             command.extend((option, str(value)))
     for option, enabled in (
         ("--no-accuracy", args.no_accuracy),
+        ("--alpha-only", args.alpha_only),
     ):
         if enabled:
             command.append(option)
@@ -2624,6 +2729,13 @@ def main() -> int:
         help="max percent of consensus pixels that may differ on any frame",
     )
     ap.add_argument("--no-accuracy", action="store_true")
+    ap.add_argument(
+        "--alpha-only",
+        "--single-color",
+        dest="alpha_only",
+        action="store_true",
+        help="render tlottie directly into Alpha8 and compare only alpha accuracy",
+    )
     ap.add_argument(
         "--save-diffs",
         type=int,
@@ -2687,7 +2799,8 @@ def main() -> int:
     if not files:
         raise SystemExit(f"no .json files found under {args.input}")
     args.out.mkdir(parents=True, exist_ok=True)
-    print(f"== tlottie curve tolerance {args.curve_tolerance:g}px", flush=True)
+    mode = " Alpha8" if args.alpha_only else ""
+    print(f"== tlottie{mode} curve tolerance {args.curve_tolerance:g}px", flush=True)
 
     all_rows: list[dict[str, Any]] = []
     accuracy_rows: list[dict[str, Any]] = []
@@ -2734,6 +2847,7 @@ def main() -> int:
                 args.accuracy_tolerance,
                 args.accuracy_diff_threshold,
                 args.curve_tolerance,
+                args.alpha_only,
                 overall_progress,
             )
             all_rows.extend(size_rows)
@@ -2754,6 +2868,7 @@ def main() -> int:
                 args.jobs,
                 "tlottie-vulkan" in renderers,
                 args.curve_tolerance,
+                args.alpha_only,
                 overall_progress,
             )
         accuracy_by_pack = aggregate_accuracy(accuracy_rows)
@@ -2773,6 +2888,7 @@ def main() -> int:
                 accuracy_size,
                 args.accuracy_tolerance,
                 args.curve_tolerance,
+                args.alpha_only,
             )
             print(f"wrote {len(diff_paths)} diff grid(s)", flush=True)
 

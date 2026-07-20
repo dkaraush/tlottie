@@ -362,13 +362,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             destination = source_over(source, destination);
         }
     }
-    let packed = select(
+    var packed = select(
         (destination.a << 24u) | (destination.r << 16u) |
             (destination.g << 8u) | destination.b,
         (destination.a << 24u) | (destination.b << 16u) |
             (destination.g << 8u) | destination.r,
         (push.compact_flags & 4u) != 0u,
     );
+    if (push.compact_flags & 8u) != 0u {
+        packed = destination.a << 24u;
+    }
     words[push.output_word + gid.y * push.width + gid.x] = packed;
 }
 
@@ -410,12 +413,15 @@ fn simple_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     let quantized = vec4<u32>(clamp(destination, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0 + 0.5);
-    let packed = select(
+    var packed = select(
         (quantized.a << 24u) | (quantized.r << 16u) |
             (quantized.g << 8u) | quantized.b,
         (quantized.a << 24u) | (quantized.b << 16u) |
             (quantized.g << 8u) | quantized.r,
         (push.compact_flags & 4u) != 0u,
     );
+    if (push.compact_flags & 8u) != 0u {
+        packed = quantized.a << 24u;
+    }
     words[push.output_word + gid.y * push.width + gid.x] = packed;
 }

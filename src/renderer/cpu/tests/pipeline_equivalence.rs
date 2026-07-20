@@ -109,6 +109,38 @@ fn assert_matches_direct(json: &[u8]) {
   assert_eq!(streamed, direct);
 }
 
+fn assert_alpha8_matches_argb(json: &[u8]) {
+  let composition = Composition::parse(json, &Limits::default()).unwrap();
+  let mut renderer = crate::CPURenderer::new(composition);
+  let mut argb = vec![0u32; 32 * 32];
+  let mut alpha8 = vec![0u8; 32 * 32];
+  renderer.render(0.0, &mut argb, 32, 32, RenderOptions::default()).unwrap();
+  renderer.render_alpha8(0.0, &mut alpha8, 32, 32, RenderOptions::default()).unwrap();
+  for (index, (&pixel, &alpha)) in argb.iter().zip(&alpha8).enumerate() {
+    assert_eq!(alpha, (pixel >> 24) as u8, "pixel {index}");
+  }
+}
+
+#[test]
+fn alpha8_matches_argb_alpha_for_opaque_and_varying_opacity_gradients() {
+  assert_alpha8_matches_argb(
+    br#"{"fr":30,"ip":0,"op":1,"w":32,"h":32,"layers":[
+      {"ty":4,"ind":1,"ip":0,"op":1,"st":0,
+       "ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}},
+       "shapes":[{"ty":"gr","it":[
+         {"ty":"rc","p":{"a":0,"k":[16,16]},"s":{"a":0,"k":[24,24]},"r":{"a":0,"k":3}},
+         {"ty":"gf","o":{"a":0,"k":100},"r":1,"g":{"p":2,"k":{"a":0,"k":[0,1,0,0,1,0,0,1]}},"s":{"a":0,"k":[4,4]},"e":{"a":0,"k":[28,28]},"t":1}
+       ]}]},
+      {"ty":4,"ind":2,"ip":0,"op":1,"st":0,
+       "ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}},
+       "shapes":[{"ty":"gr","it":[
+         {"ty":"rc","p":{"a":0,"k":[16,16]},"s":{"a":0,"k":[16,16]},"r":{"a":0,"k":0}},
+         {"ty":"gf","o":{"a":0,"k":100},"r":1,"g":{"p":2,"k":{"a":0,"k":[0,0,0,1,1,1,1,1,0,0,1,1]}},"s":{"a":0,"k":[8,16]},"e":{"a":0,"k":[24,16]},"t":1}
+       ]}]}
+    ]}"#,
+  );
+}
+
 #[test]
 fn streamed_cpu_matches_direct_for_masked_shape() {
   assert_matches_direct(

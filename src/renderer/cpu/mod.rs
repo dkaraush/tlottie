@@ -1,5 +1,6 @@
 //! Stateful CPU renderer and its rasterization implementation.
 
+mod alpha_backend;
 mod backend;
 pub(crate) mod cells;
 pub(crate) mod executor;

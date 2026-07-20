@@ -129,3 +129,57 @@ pub unsafe extern "C" fn tlottie_render_with_options(anim: *mut TLottieInstance,
     Err(_) => -3,
   }
 }
+
+/// Renders one frame directly into `width * height` Alpha8 pixels.
+///
+/// # Safety
+/// `anim` must be a live handle returned by [`tlottie_new`]. `out` must
+/// point to at least `out_len` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn tlottie_render_alpha8(anim: *mut TLottieInstance, frame: f32, width: u32, height: u32, out: *mut u8, out_len: usize, antialias: u32) -> i32 {
+  unsafe { tlottie_render_alpha8_with_options(anim, frame, width, height, out, out_len, antialias, RenderOptions::default().curve_tolerance) }
+}
+
+/// Renders directly into Alpha8 with an explicit curve tolerance.
+///
+/// # Safety
+/// The pointer requirements are identical to [`tlottie_render_alpha8`].
+#[no_mangle]
+pub unsafe extern "C" fn tlottie_render_alpha8_with_options(
+  anim: *mut TLottieInstance,
+  frame: f32,
+  width: u32,
+  height: u32,
+  out: *mut u8,
+  out_len: usize,
+  antialias: u32,
+  curve_tolerance: f32,
+) -> i32 {
+  let Some(anim) = (unsafe { anim.as_mut() }) else {
+    return -1;
+  };
+  if out.is_null() || !curve_tolerance.is_finite() || curve_tolerance <= 0.0 {
+    return -1;
+  }
+  let Some(px) = (width as usize).checked_mul(height as usize) else {
+    return -2;
+  };
+  if out_len < px {
+    return -2;
+  }
+  let alpha = unsafe { core::slice::from_raw_parts_mut(out, px) };
+  match anim.renderer.render_alpha8(
+    frame,
+    alpha,
+    width,
+    height,
+    RenderOptions {
+      antialias: antialias != 0,
+      curve_tolerance,
+      alpha_only: true,
+    },
+  ) {
+    Ok(()) => 0,
+    Err(_) => -3,
+  }
+}

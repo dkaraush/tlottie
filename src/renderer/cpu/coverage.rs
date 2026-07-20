@@ -7,12 +7,12 @@ pub(super) const MODE_S_MIN_EXTENT: usize = 42;
 
 /// One uniform-coverage span, packed: y:20 | x0:20 | len:16 | cov:8.
 #[inline]
-pub(super) fn pack_span(y: usize, x0: usize, len: usize, cov: u8) -> u64 {
+pub(crate) fn pack_span(y: usize, x0: usize, len: usize, cov: u8) -> u64 {
   ((y as u64) << 44) | ((x0 as u64) << 24) | ((len as u64) << 8) | u64::from(cov)
 }
 
 #[inline]
-pub(super) fn unpack_span(s: u64) -> (usize, usize, usize, u8) {
+pub(crate) fn unpack_span(s: u64) -> (usize, usize, usize, u8) {
   ((s >> 44) as usize, ((s >> 24) & 0xf_ffff) as usize, ((s >> 8) & 0xffff) as usize, (s & 0xff) as u8)
 }
 
@@ -33,7 +33,7 @@ pub(super) const MODE_S_EDGE_DENSITY_LARGE: f32 = 6.0;
 /// large, edge-sparse paints; the dense accumulator (mode D) otherwise.
 /// One pass over points — negligible next to rasterization; non-finite
 /// points are ignored by f32 min/max.
-pub(super) fn mode_s_wins(contours: &[Contour], canvas_px: usize) -> bool {
+pub(crate) fn mode_s_wins(contours: &[Contour], canvas_px: usize) -> bool {
   let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
   let mut perim = 0.0f32;
   for c in contours {
@@ -145,7 +145,7 @@ pub(super) fn pre_size(spans: &[u64], rows: &mut Vec<(u32, u32, u32)>, data: &mu
 /// COV_ENTRY_MAX admission (8 bytes/span) — capture stops early and the
 /// entry is discarded instead of built and rejected (720px full-bleeds
 /// pushed 10-30k spans per paint just to be dropped).
-pub(super) const SPAN_CAPTURE_MAX: usize = COV_ENTRY_MAX / 8;
+pub(crate) const SPAN_CAPTURE_MAX: usize = COV_ENTRY_MAX / 8;
 
 /// Fragmentation test for a fresh span capture: average span shorter than
 /// 4 px → store as rows (see [`spans_to_cov_entry`]).
@@ -159,7 +159,7 @@ pub(super) fn spans_fragmented(spans: &[u64], px_total: usize) -> bool {
 /// composite — bit-exact because the blend formula is identical).
 /// The representation tag lives per entry: geometry keys are mode-blind,
 /// but one geometry always has one extent, hence one mode.
-pub(super) enum PlaneData {
+pub(crate) enum PlaneData {
   Cov(Vec<u8>),
   Spans(Vec<u64>),
   Src(Vec<u32>),
@@ -173,9 +173,9 @@ impl Default for PlaneData {
 
 /// Rows for one cached plane: `(y, x0, len)` per row into `data`.
 #[derive(Default)]
-pub(super) struct CovEntry {
-  pub(super) rows: Vec<(u32, u32, u32)>,
-  pub(super) data: PlaneData,
+pub(crate) struct CovEntry {
+  pub(crate) rows: Vec<(u32, u32, u32)>,
+  pub(crate) data: PlaneData,
 }
 
 /// Byte-budgeted map from 128-bit geometry hash to coverage rows.
@@ -287,7 +287,7 @@ impl Hasher128 {
 impl CovCache {
   /// Looks a key up in either generation (in place — see the
   /// no-promotion note below).
-  pub(super) fn get(&mut self, key: u128) -> Option<&CovEntry> {
+  pub(crate) fn get(&mut self, key: u128) -> Option<&CovEntry> {
     if self.young.contains_key(&key) {
       self.hits = self.hits.saturating_add(1);
       if self.frozen {
@@ -317,6 +317,14 @@ impl CovCache {
 
   pub(crate) fn contains(&self, key: u128) -> bool {
     self.young.contains_key(&key) || self.old.contains_key(&key)
+  }
+
+  pub(crate) fn contains_coverage(&self, key: u128) -> bool {
+    self
+      .young
+      .get(&key)
+      .or_else(|| self.old.get(&key))
+      .is_some_and(|entry| matches!(entry.data, PlaneData::Cov(_) | PlaneData::Spans(_)))
   }
 
   pub(super) fn size_of(e: &CovEntry) -> usize {
@@ -415,7 +423,7 @@ impl CovCache {
   /// True while the cache is still learning (capture pays for itself);
   /// false while frozen (the resident set replays, nothing new admits).
   #[inline]
-  pub(super) fn capture_enabled(&self) -> bool {
+  pub(crate) fn capture_enabled(&self) -> bool {
     !self.frozen
   }
 
@@ -444,7 +452,7 @@ impl CovCache {
     }
   }
 
-  pub(super) fn insert(&mut self, key: u128, mut entry: CovEntry) {
+  pub(crate) fn insert(&mut self, key: u128, mut entry: CovEntry) {
     if self.frozen {
       return;
     }

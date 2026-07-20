@@ -56,6 +56,30 @@ int32_t tlottie_render_with_options(
     uint32_t antialias,
     float curve_tolerance);
 
+/*
+ * Renders width * height bytes directly into an Alpha8 bitmap. Unlike the
+ * ARGB APIs above, out_len is measured in bytes and no color conversion is
+ * performed.
+ */
+int32_t tlottie_render_alpha8(
+    TLottieInstance *renderer,
+    float frame,
+    uint32_t width,
+    uint32_t height,
+    uint8_t *out,
+    size_t out_len,
+    uint32_t antialias);
+
+int32_t tlottie_render_alpha8_with_options(
+    TLottieInstance *renderer,
+    float frame,
+    uint32_t width,
+    uint32_t height,
+    uint8_t *out,
+    size_t out_len,
+    uint32_t antialias,
+    float curve_tolerance);
+
 #ifdef __cplusplus
 }
 #endif

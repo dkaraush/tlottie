@@ -589,13 +589,16 @@ impl<'a> VulkanRenderer<'a> {
     }) && group_depth == 0;
     // SAFETY: forwarded from this method's caller contract.
     unsafe {
+      if options.alpha_only {
+        return self.record_compute(cmd, scratch, target, &prepared, options.antialias, true, profile);
+      }
       match self.mode {
-        RendererMode::Compute => self.record_compute(cmd, scratch, target, &prepared, options.antialias, profile),
+        RendererMode::Compute => self.record_compute(cmd, scratch, target, &prepared, options.antialias, false, profile),
         RendererMode::Triangles => {
           if stencil_compatible {
             self.record_triangles(cmd, scratch, target, &prepared, profile)
           } else {
-            self.record_compute(cmd, scratch, target, &prepared, options.antialias, profile)
+            self.record_compute(cmd, scratch, target, &prepared, options.antialias, false, profile)
           }
         }
         RendererMode::StencilCover => {
@@ -603,14 +606,23 @@ impl<'a> VulkanRenderer<'a> {
             self.cache_stats.stencil_cover = true;
             self.record_triangles(cmd, scratch, target, &prepared, profile)
           } else {
-            self.record_compute(cmd, scratch, target, &prepared, options.antialias, profile)
+            self.record_compute(cmd, scratch, target, &prepared, options.antialias, false, profile)
           }
         }
       }
     }
   }
 
-  unsafe fn record_compute(&mut self, cmd: vk::CommandBuffer, scratch: BufferTarget, target: ImageTarget, prepared: &PreparedGeometry, antialias: bool, profile: Option<ProfileQueries>) -> Result<()> {
+  unsafe fn record_compute(
+    &mut self,
+    cmd: vk::CommandBuffer,
+    scratch: BufferTarget,
+    target: ImageTarget,
+    prepared: &PreparedGeometry,
+    antialias: bool,
+    alpha_only: bool,
+    profile: Option<ProfileQueries>,
+  ) -> Result<()> {
     let mut scene = build_compute_scene(
       target.width,
       target.height,
@@ -618,6 +630,7 @@ impl<'a> VulkanRenderer<'a> {
       &self.geometry.contours,
       prepared,
       antialias,
+      alpha_only,
       &mut self.scene_layout,
     )?;
     match target.format {
@@ -2422,6 +2435,7 @@ fn build_compute_scene(
   contours: &[CachedContour],
   prepared: &PreparedGeometry,
   antialias: bool,
+  alpha_only: bool,
   retained_layout: &mut SceneLayout,
 ) -> Result<ComputeScene> {
   let output_words = width.checked_mul(height).ok_or(Error::FrameTooLarge)?;
@@ -2525,7 +2539,7 @@ fn build_compute_scene(
       edge_bin_word: layout.offset(EDGE_BIN_SECTION)?,
       edge_word: layout.offset(EDGE_SECTION)?,
       tiles_y,
-      compact_flags: u32::from(compact_tile_indices) | (u32::from(compact_edge_indices) << 1),
+      compact_flags: u32::from(compact_tile_indices) | (u32::from(compact_edge_indices) << 1) | (u32::from(alpha_only) << 3),
     },
   })
 }
@@ -3295,7 +3309,7 @@ mod tests {
     assert_eq!(repeated.stats.dirty_points, 0);
 
     let mut layout = SceneLayout::default();
-    let scene = build_compute_scene(32, 32, &cache.arena.points, &cache.contours, &repeated, true, &mut layout)?;
+    let scene = build_compute_scene(32, 32, &cache.arena.points, &cache.contours, &repeated, true, false, &mut layout)?;
     assert_eq!(
       scene.sections[CONTOUR_SECTION],
       vec![0, 4, 1.0f32.to_bits(), 0.0f32.to_bits(), 0.0f32.to_bits(), 1.0f32.to_bits(), 10.0f32.to_bits(), (-3.0f32).to_bits(),]
@@ -3444,7 +3458,7 @@ mod tests {
     let mut cache = GeometryCache::default();
     let prepared = cache.prepare(&walked)?;
     let mut layout = SceneLayout::default();
-    let scene = build_compute_scene(4, 4, &cache.arena.points, &cache.contours, &prepared, true, &mut layout)?;
+    let scene = build_compute_scene(4, 4, &cache.arena.points, &cache.contours, &prepared, true, false, &mut layout)?;
     let paint_words = scene.sections.get(PAINT_SECTION).ok_or(Error::FrameTooLarge)?;
     assert_eq!(scene.push.antialias, 1);
     assert_eq!(paint_words.first(), Some(&0));
@@ -3465,7 +3479,7 @@ mod tests {
     let mut cache = GeometryCache::default();
     let prepared = cache.prepare(&walked)?;
     let mut layout = SceneLayout::default();
-    let mut scene = build_compute_scene(32, 32, &cache.arena.points, &cache.contours, &prepared, true, &mut layout)?;
+    let mut scene = build_compute_scene(32, 32, &cache.arena.points, &cache.contours, &prepared, true, false, &mut layout)?;
     let original = compute_bin_key(&scene)?;
 
     scene.sections[PAINT_SECTION][4] = 0xffab_cdef;

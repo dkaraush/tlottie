@@ -5,7 +5,7 @@
 use crate::model::FillRule;
 use crate::renderer::frame::{Composite, FrameRenderer, Geometry, GradientKind, GradientPaint, Paint, Rule};
 
-use super::executor::{apply_matte, modulate, Canvas, DirtyBox, GradientMap, GradientMapKind, RowBounds};
+use super::executor::{apply_matte, modulate, Canvas, CovCache, DirtyBox, GradientMap, GradientMapKind, RowBounds};
 use super::CPURenderer;
 
 struct BitmapReset<'a>(&'a mut CPURenderer);
@@ -52,6 +52,7 @@ impl CPURenderer {
     self.width = width as usize;
     self.height = height as usize;
     self.antialias = options.antialias;
+    self.alpha_only = options.alpha_only;
     self.bitmap_dirty = false;
     self.state.cov_cache.set_budget_for_canvas(self.width, self.height);
     self.state.cov_cache.frame_tick();
@@ -101,15 +102,15 @@ impl CPURenderer {
       canvas.dirty.mark_row(0, 0, 1);
     }
     match (paint, track_rows) {
-      (Paint::Solid(solid), true) => canvas.fill::<true>(&mut scratch.cov_cache, key, contours, fill_rule(solid.rule), solid.color, solid.opacity),
-      (Paint::Solid(solid), false) => canvas.fill::<false>(&mut scratch.cov_cache, key, contours, fill_rule(solid.rule), solid.color, solid.opacity),
+      (Paint::Solid(solid), true) => canvas.fill::<true>(&mut scratch.cov_cache, key, contours, fill_rule(solid.rule), alpha_color(solid.color, self.alpha_only), solid.opacity),
+      (Paint::Solid(solid), false) => canvas.fill::<false>(&mut scratch.cov_cache, key, contours, fill_rule(solid.rule), alpha_color(solid.color, self.alpha_only), solid.opacity),
       (Paint::Gradient(gradient), true) => {
         let map = gradient_map(gradient);
-        canvas.fill_gradient::<true>(&mut scratch.cov_cache, key, gradient.source_key, contours, fill_rule(gradient.rule), &gradient.lut, &map);
+        fill_gradient::<true>(&mut canvas, &mut scratch.cov_cache, key, contours, gradient, &map, self.alpha_only);
       }
       (Paint::Gradient(gradient), false) => {
         let map = gradient_map(gradient);
-        canvas.fill_gradient::<false>(&mut scratch.cov_cache, key, gradient.source_key, contours, fill_rule(gradient.rule), &gradient.lut, &map);
+        fill_gradient::<false>(&mut canvas, &mut scratch.cov_cache, key, contours, gradient, &map, self.alpha_only);
       }
     }
     let draw_dirty = canvas.dirty;
@@ -223,6 +224,48 @@ impl CPURenderer {
       }
     }
   }
+}
+
+fn alpha_color(mut color: crate::math::Color, alpha_only: bool) -> crate::math::Color {
+  if alpha_only {
+    color.r = 0.0;
+    color.g = 0.0;
+    color.b = 0.0;
+  }
+  color
+}
+
+fn fill_gradient<const TRACK_ROWS: bool>(
+  canvas: &mut Canvas<'_>,
+  cache: &mut CovCache,
+  key: u128,
+  contours: &[crate::geometry::Contour],
+  gradient: &GradientPaint,
+  map: &GradientMap,
+  alpha_only: bool,
+) {
+  if !alpha_only {
+    canvas.fill_gradient::<TRACK_ROWS>(cache, key, gradient.source_key, contours, fill_rule(gradient.rule), &gradient.lut, map);
+    return;
+  }
+
+  let first_alpha = gradient.lut.first().copied().unwrap_or(0) >> 24;
+  if gradient.lut.iter().all(|pixel| pixel >> 24 == first_alpha) {
+    let color = crate::math::Color {
+      r: 0.0,
+      g: 0.0,
+      b: 0.0,
+      a: first_alpha as f32 / 255.0,
+    };
+    canvas.fill::<TRACK_ROWS>(cache, key, contours, fill_rule(gradient.rule), color, 1.0);
+    return;
+  }
+
+  let mut alpha_lut = [0u32; crate::renderer::frame::GRADIENT_LUT_SIZE];
+  for (out, &pixel) in alpha_lut.iter_mut().zip(gradient.lut.iter()) {
+    *out = pixel & 0xff00_0000;
+  }
+  canvas.fill_gradient::<TRACK_ROWS>(cache, key, gradient.source_key ^ (1u128 << 127), contours, fill_rule(gradient.rule), &alpha_lut, map);
 }
 
 impl FrameRenderer for CPURenderer {
