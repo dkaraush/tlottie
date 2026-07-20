@@ -30,6 +30,8 @@ pub struct Composition {
   pub in_point: f32,
   /// One past the last frame of the playable range.
   pub out_point: f32,
+  /// Whether parsing proved that every playable frame is identical.
+  pub(crate) static_content: bool,
   /// Layers in file order (index 0 is drawn on top).
   pub(crate) layers: Vec<Layer>,
   /// Precomp assets, looked up by `Layer::ref_id`.
@@ -39,9 +41,20 @@ pub struct Composition {
 impl Composition {
   /// Number of frames in the playable range (at least 1).
   pub fn frame_count(&self) -> u32 {
+    if self.static_content {
+      return 1;
+    }
     let frames = f64::from(self.out_point) - f64::from(self.in_point);
     let frames = frames.floor().max(1.0);
     frames as u32 // saturating float→int cast
+  }
+
+  /// Returns whether parsing proved that every playable frame is identical.
+  ///
+  /// Detection is conservative: `false` means "possibly animated", while
+  /// `true` guarantees that [`Self::frame_count`] returns one.
+  pub fn is_static(&self) -> bool {
+    self.static_content
   }
 
   /// Animation duration in seconds.

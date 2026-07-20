@@ -9,7 +9,7 @@
 //!   full validation happens where a subtree is actually parsed.
 
 use crate::error::{Error, JsonErrorKind, Limit, Result};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -18,6 +18,7 @@ pub(crate) struct Cursor<'a> {
   pos: usize,
   max_depth: usize,
   easing_cache: Rc<RefCell<HashMap<String, [f32; 4]>>>,
+  saw_animated_property: Rc<Cell<bool>>,
 }
 
 impl<'a> Cursor<'a> {
@@ -27,6 +28,7 @@ impl<'a> Cursor<'a> {
       pos: 0,
       max_depth,
       easing_cache: Rc::new(RefCell::new(HashMap::new())),
+      saw_animated_property: Rc::new(Cell::new(false)),
     }
   }
 
@@ -43,7 +45,16 @@ impl<'a> Cursor<'a> {
       pos,
       max_depth: self.max_depth,
       easing_cache: Rc::clone(&self.easing_cache),
+      saw_animated_property: Rc::clone(&self.saw_animated_property),
     }
+  }
+
+  pub fn mark_animated_property(&self) {
+    self.saw_animated_property.set(true);
+  }
+
+  pub fn properties_are_static(&self) -> bool {
+    !self.saw_animated_property.get()
   }
 
   /// Matches the per-composition interpolator cache used by rlottie and

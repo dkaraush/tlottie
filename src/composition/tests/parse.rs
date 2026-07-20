@@ -91,6 +91,8 @@ fn parses_shape_layer() {
   assert_eq!(g.shapes.len(), 2); // path + fill; tr became the group transform
   assert!(matches!(g.shapes.first(), Some(Shape::Path(_))));
   assert!(matches!(g.shapes.get(1), Some(Shape::Fill(_))));
+  assert!(comp.is_static());
+  assert_eq!(comp.frame_count(), 1);
 }
 
 #[test]
@@ -134,4 +136,18 @@ fn parses_animated_position() {
   let p30 = layer.transform.position.eval(30.0);
   assert_eq!((p0.x, p0.y), (0.0, 0.0));
   assert_eq!((p30.x, p30.y), (100.0, 100.0));
+  assert!(!comp.is_static());
+  assert_eq!(comp.frame_count(), 30);
+}
+
+#[test]
+fn static_content_with_a_visibility_transition_keeps_declared_frames() {
+  let comp = parse(
+    r##"{"fr":30,"ip":0,"op":30,"w":16,"h":16,"layers":[
+      {"ty":1,"ind":1,"sw":16,"sh":16,"sc":"#ffffff","ip":10,"op":30,"st":0,"ks":{}}
+    ]}"##,
+  )
+  .unwrap();
+  assert!(!comp.is_static());
+  assert_eq!(comp.frame_count(), 30);
 }

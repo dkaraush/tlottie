@@ -65,6 +65,7 @@ fn empty_comp() -> Composition {
     frame_rate: 60.0,
     in_point: 0.0,
     out_point: 100.0,
+    static_content: false,
     layers: Vec::new(),
     assets: Vec::new(),
   }

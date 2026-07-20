@@ -2477,6 +2477,11 @@ white-space:nowrap;border-bottom:1px solid var(--line);font-size:10.5px;
 position:sticky;top:0;z-index:1}
 th.left{text-align:left}
 th.renderer{text-align:center;text-transform:none;font-size:11.5px;color:var(--ink)}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable::after{content:'\\2195';display:inline-block;margin-left:5px;color:var(--muted);opacity:.55}
+th.sortable[aria-sort='ascending']::after{content:'▲';color:var(--ink);opacity:1}
+th.sortable[aria-sort='descending']::after{content:'▼';color:var(--ink);opacity:1}
+th.sortable:focus-visible{outline:2px solid var(--tl);outline-offset:-2px}
 td{padding:4.5px 8px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap;
 font-family:ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;font-size:11.5px}
 td.left{font-family:system-ui;font-weight:550;text-align:left}
@@ -2497,6 +2502,78 @@ font-family:system-ui}
 .acc-warn{background:var(--warnsoft);color:var(--warn)}
 .acc-bad{background:var(--badsoft);color:var(--bad)}
 .muted{color:var(--muted)}
+"""
+    sorting_js = """
+document.querySelectorAll('table').forEach((table) => {
+  const headerRows = Array.from(table.rows).filter(
+    (row) => row.cells.length && row.cells[0].tagName === 'TH'
+  );
+  const dataRows = Array.from(table.rows).filter(
+    (row) => row.cells.length && row.cells[0].tagName === 'TD'
+  );
+  if (!headerRows.length || !dataRows.length) return;
+
+  const cellAtColumn = (row, targetColumn) => {
+    let column = 0;
+    for (const cell of row.cells) {
+      const nextColumn = column + cell.colSpan;
+      if (targetColumn >= column && targetColumn < nextColumn) return cell;
+      column = nextColumn;
+    }
+    return null;
+  };
+
+  const sortBy = (header, column) => {
+    const direction = header.getAttribute('aria-sort') === 'ascending'
+      ? 'descending'
+      : 'ascending';
+    const numeric = !/^(pack|file|name)$/i.test(header.textContent.trim());
+    const values = dataRows.map((row, index) => {
+      const text = (cellAtColumn(row, column)?.textContent || '').trim();
+      const value = numeric ? Number.parseFloat(text.replace(/,/g, '')) : text;
+      return {row, index, value, missing: numeric && Number.isNaN(value)};
+    });
+    values.sort((a, b) => {
+      if (a.missing !== b.missing) return a.missing ? 1 : -1;
+      let comparison = numeric
+        ? a.value - b.value
+        : a.value.localeCompare(b.value, undefined, {numeric: true, sensitivity: 'base'});
+      if (!comparison) return a.index - b.index;
+      return direction === 'ascending' ? comparison : -comparison;
+    });
+    for (const other of table.querySelectorAll('th.sortable')) {
+      other.setAttribute('aria-sort', other === header ? direction : 'none');
+    }
+    for (const item of values) item.row.parentElement.appendChild(item.row);
+  };
+
+  const occupiedUntilRow = [];
+  headerRows.forEach((row, rowIndex) => {
+    let column = 0;
+    for (const header of row.cells) {
+      while ((occupiedUntilRow[column] || 0) > rowIndex) column++;
+      const startColumn = column;
+      for (let offset = 0; offset < header.colSpan; offset++) {
+        occupiedUntilRow[column + offset] = Math.max(
+          occupiedUntilRow[column + offset] || 0,
+          rowIndex + header.rowSpan
+        );
+      }
+      column += header.colSpan;
+      if (header.colSpan !== 1) continue;
+      header.classList.add('sortable');
+      header.tabIndex = 0;
+      header.setAttribute('aria-sort', 'none');
+      header.title = 'Sort ascending; click again for descending';
+      header.addEventListener('click', () => sortBy(header, startColumn));
+      header.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        sortBy(header, startColumn);
+      });
+    }
+  });
+});
 """
     with path.open("w", encoding="utf-8") as f:
         f.write("<!doctype html><meta charset='utf-8'><title>Lottie Benchmark</title>")
@@ -2519,6 +2596,7 @@ font-family:system-ui}
             rows = pivot_aggregate(effect_pack_rows, ("pack", "size"))
             write_grouped_table(f, rows, renderers, ("pack",), include_size=False, accuracy_by_pack=accuracy_by_pack)
         f.write("</main>")
+        f.write(f"<script>{sorting_js}</script>")
 
 
 def write_grouped_table(
