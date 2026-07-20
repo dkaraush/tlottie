@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark tlottie, rlottie variants, and ThorVG via native libraries.
+"""Benchmark tlottie, rlottie variants, and ThorVG on the host or Android.
 
 The runner processes one renderer+canvas-size batch at a time so memory and
 package energy counters, when available, can be attributed to that renderer.
@@ -11,6 +11,10 @@ row by measured time. On macOS (Apple Silicon), per-task consumed energy
 (task_info TASK_POWER_INFO_V2.task_energy, the Activity Monitor source) is
 sampled around each renderer run inside the worker, giving direct per-row
 attribution. Memory on macOS is sampled via proc_pid_rusage physical footprint.
+
+Android runs isolated renderer executables in one device-side shell session.
+Per-frame output is reduced on-device, and a stable pack-aware sample is used
+by default so iterative performance runs do not require the entire corpus.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import argparse
 import concurrent.futures
 from contextlib import contextmanager, ExitStack
 import ctypes as C
+import hashlib
 import html
 import json
 import math
@@ -82,6 +87,30 @@ LIBS = {
     "thorvg": PROJECT_DIRS["thorvg"] / "build-release" / "src" / f"libthorvg-1{LIB_SUFFIX}",
     "tlottie-vulkan": ROOT / "target" / "release" / "tlottie-cli",
 }
+
+ANDROID_DEFAULT_OUT = ROOT / "target" / "benchmark-android"
+ANDROID_DEFAULT_DEVICE_ROOT = "/data/local/tmp/tgs_dump"
+ANDROID_REMOTE = "/data/local/tmp/tlottie-android-benchmark"
+ANDROID_DEFAULT_SAMPLE = 1000
+ANDROID_DEFAULT_RENDERERS = ("tlottie", "rlottie", "rlottie_2019_patched", "thorvg")
+ANDROID_RENDERERS = {
+    "tlottie": f"{ANDROID_REMOTE}/tlottie-benchmark-runner",
+    "rlottie": "/data/local/tmp/rlottie_dump_ref",
+    "rlottie_2019": "/data/local/tmp/rlottie_dump_rl19",
+    "rlottie_2019_patched": "/data/local/tmp/rlottie_dump_rlp",
+    "thorvg": "/data/local/tmp/thorvg_dump",
+}
+ANDROID_TLOTTIE_LIBRARY = f"{ANDROID_REMOTE}/libtlottie.so"
+ANDROID_BINARY_NAMES = {
+    "rlottie": "rlottie_dump_ref_android",
+    "rlottie_2019": "rlottie_dump_rl19_android",
+    "rlottie_2019_patched": "rlottie_dump_rlp_android",
+    "thorvg": "thorvg_dump_android",
+}
+ANDROID_FRAME_RE = re.compile(r"^F\s+\d+\s+(\d+)(?:\s+\d+)?$", re.MULTILINE)
+ANDROID_FRAME_SUMMARY_RE = re.compile(r"^FSUM\s+(\d+)\s+(\d+)\s+(\d+)$", re.MULTILINE)
+ANDROID_FMS_RE = re.compile(r"^FMS\s+([0-9.]+)$", re.MULTILINE)
+ANDROID_RSS_RE = re.compile(r"^Max RSS \(KiB\):\s+(\d+)$", re.MULTILINE)
 
 
 def run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
@@ -241,12 +270,40 @@ def discover(root: Path, limit: int | None) -> list[Path]:
     return files[:limit] if limit else files
 
 
+def sample_files(files: list[Path], root: Path, count: int) -> list[Path]:
+    """Choose a stable sample while including every pack when possible."""
+    if count <= 0 or count >= len(files):
+        return files
+
+    def rank(file: Path) -> bytes:
+        try:
+            name = file.relative_to(root).as_posix()
+        except ValueError:
+            name = str(file)
+        return hashlib.blake2b(name.encode("utf-8"), digest_size=16).digest()
+
+    by_pack: dict[str, list[Path]] = {}
+    for file in files:
+        by_pack.setdefault(pack_of(root, file), []).append(file)
+    selected: set[Path] = set()
+    if count >= len(by_pack):
+        selected.update(min(pack, key=rank) for pack in by_pack.values())
+    selected.update(
+        sorted((file for file in files if file not in selected), key=rank)[: count - len(selected)]
+    )
+    return [file for file in files if file in selected]
+
+
 def pack_of(root: Path, file: Path) -> str:
     try:
         rel = file.relative_to(root)
     except ValueError:
         return "."
     return rel.parts[0] if len(rel.parts) > 1 else "."
+
+
+def relative_file_name(root: Path, file: Path) -> str:
+    return file.name if root.is_file() else file.relative_to(root).as_posix()
 
 
 def select_packs(all_packs: list[str], selector: str) -> list[str]:
@@ -2689,12 +2746,16 @@ def write_tgv(path: Path, rows: list[dict[str, Any]], renderers: tuple[str, ...]
 
 
 def has_tl_rl19_comparison(renderers: tuple[str, ...]) -> bool:
-    return "tlottie" in renderers and "rlottie_2019" in renderers
+    return "tlottie" in renderers and any(
+        renderer in renderers for renderer in ("rlottie_2019", "rlottie_2019_patched")
+    )
 
 
 def tl_vs_rl19_percent(row: dict[str, Any]) -> float | None:
     tlottie_ms = row.get("tlottie_frame_ms")
     rlottie_2019_ms = row.get("rlottie_2019_frame_ms")
+    if rlottie_2019_ms is None:
+        rlottie_2019_ms = row.get("rlottie_2019_patched_frame_ms")
     if tlottie_ms is None or rlottie_2019_ms is None or rlottie_2019_ms <= 0:
         return None
     percent = (tlottie_ms / rlottie_2019_ms - 1.0) * 100.0
@@ -3094,10 +3155,616 @@ def num(v: Any) -> str:
     return str(v)
 
 
-def main() -> int:
+def android_adb(
+    serial: str,
+    *arguments: str,
+    capture: bool = False,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    executable = os.environ.get("ADB", "adb")
+    return subprocess.run(
+        [executable, "-s", serial, *arguments],
+        check=check,
+        text=True,
+        capture_output=capture,
+    )
+
+
+def android_connected_serial(requested: str | None) -> str:
+    if requested:
+        return requested
+    executable = os.environ.get("ADB", "adb")
+    result = subprocess.run(
+        [executable, "devices"], check=True, text=True, capture_output=True
+    )
+    serials = [
+        line.split("\t", 1)[0]
+        for line in result.stdout.splitlines()
+        if line.endswith("\tdevice")
+    ]
+    if len(serials) != 1:
+        raise SystemExit(
+            f"expected one connected Android device, found {len(serials)}; "
+            "use --android=SERIAL"
+        )
+    return serials[0]
+
+
+def android_toolchain() -> Path:
+    sdk = Path(
+        os.environ.get(
+            "ANDROID_SDK_ROOT",
+            os.environ.get("ANDROID_HOME", Path.home() / "Library/Android/sdk"),
+        )
+    )
+    configured = os.environ.get("ANDROID_NDK_HOME")
+    if configured:
+        ndk = Path(configured)
+    else:
+        candidates = sorted((sdk / "ndk").glob("*"), reverse=True)
+        if not candidates:
+            raise SystemExit(f"Android NDK not found under {sdk / 'ndk'}")
+        ndk = candidates[0]
+    roots = list((ndk / "toolchains/llvm/prebuilt").glob("*/bin"))
+    if not roots:
+        raise SystemExit(f"Android NDK toolchain not found under {ndk}")
+    return roots[0]
+
+
+def android_build_tlottie() -> tuple[Path, Path]:
+    linker = android_toolchain() / "aarch64-linux-android28-clang"
+    env = os.environ.copy()
+    env["CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"] = str(linker)
+    env["RUSTFLAGS"] = env.get("RUSTFLAGS", "-C target-cpu=cortex-a76")
+    cargo = ["cargo"]
+    if shutil_which("rustup"):
+        # Homebrew Rust cannot use targets installed by rustup. Run Cargo
+        # through rustup explicitly so PATH ordering cannot mix the two.
+        cargo = ["rustup", "run", "stable", "cargo"]
+    run(
+        cargo
+        + [
+            "build",
+            "--target",
+            "aarch64-linux-android",
+            "--release",
+            "--lib",
+            "--features",
+            "c-api",
+        ],
+        ROOT,
+        env,
+    )
+    output = ROOT / "target/aarch64-linux-android/release"
+    library = output / "libtlottie.so"
+    runner = output / "tlottie-benchmark-runner"
+    run(
+        [
+            str(linker),
+            "-O3",
+            "-std=c11",
+            "-I",
+            str(ROOT / "include"),
+            str(ROOT / "tools/benchmark_android_runner.c"),
+            "-L",
+            str(output),
+            "-ltlottie",
+            "-Wl,-rpath,$ORIGIN",
+            "-o",
+            str(runner),
+        ],
+        ROOT,
+    )
+    return runner, library
+
+
+def android_local_renderer_binary(renderer: str) -> Path | None:
+    name = ANDROID_BINARY_NAMES.get(renderer)
+    if not name:
+        return None
+    candidates = (ROOT / "tools" / name, PROJECTS / "tlottie" / "tools" / name)
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def android_product_name(device_name: str, manufacturer: str, model: str) -> str:
+    """Prefer a non-personal marketing name over an opaque model code."""
+    foldable = re.search(r"\bZ\s+(?:Fold|Flip)\s*\d+\b", device_name, re.IGNORECASE)
+    if foldable:
+        family = re.sub(r"\s+", " ", foldable.group(0)).replace("Fold ", "Fold").replace("Flip ", "Flip")
+        vendor = manufacturer.title() if manufacturer else "Samsung"
+        return f"{vendor} Galaxy {family}"
+    return model
+
+
+def android_device_info(serial: str, detailed: bool = False) -> str:
+    script = (
+        'cpu="$(getprop ro.soc.model)"; [ -n "$cpu" ] || cpu="$(getprop ro.hardware)"; '
+        "printf '%s|%s|%s|%s|%s|%s|%s' \"$cpu\" \"$(getprop ro.build.version.release)\" "
+        '"$(getprop ro.build.version.sdk)" "$(getprop ro.product.cpu.abi)" '
+        '"$(getprop ro.product.model)" "$(getprop ro.product.manufacturer)" '
+        '"$(settings get global device_name 2>/dev/null)"'
+    )
+    values = android_adb(serial, "shell", script, capture=True).stdout.strip().split("|", 6)
+    if len(values) != 7:
+        return "unknown Android device"
+    cpu, release, api, arch, model, manufacturer, device_name = values
+    product = android_product_name(device_name, manufacturer, model)
+    if detailed:
+        return (
+            f"CPU {cpu or 'unknown'}; OS Android {release} (API {api}); "
+            f"arch {arch}; device {product}"
+        )
+    return f"{product} / {arch} / Android {release} (API {api})"
+
+
+def android_core_masks(serial: str, jobs: int, configured: str | None) -> tuple[str, ...]:
+    if jobs < 1:
+        raise SystemExit("--jobs must be positive")
+    if configured:
+        masks = tuple(value.strip() for value in configured.split(",") if value.strip())
+        if len(masks) < jobs:
+            raise SystemExit("--core-mask must provide at least --jobs comma-separated masks")
+        return masks[:jobs]
+    present = android_adb(
+        serial,
+        "shell",
+        "cat",
+        "/sys/devices/system/cpu/present",
+        capture=True,
+    ).stdout.strip()
+    match = re.search(r"(?:^|,)(?:\d+-)?(\d+)$", present)
+    if not match:
+        raise SystemExit(f"could not parse Android CPU topology: {present!r}")
+    highest = int(match.group(1))
+    if jobs > highest + 1:
+        raise SystemExit(f"--jobs={jobs} exceeds the device's {highest + 1} CPUs")
+    return tuple(f"{1 << cpu:x}" for cpu in range(highest - jobs + 1, highest + 1))
+
+
+def android_resolve_device_root(serial: str, configured: str | None) -> str:
+    candidates = [
+        configured,
+        ANDROID_DEFAULT_DEVICE_ROOT,
+        "/sdcard/Android/data/com.example.tlottie/files/tgs_dump",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        result = android_adb(
+            serial,
+            "shell",
+            "test",
+            "-d",
+            candidate,
+            capture=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return candidate.rstrip("/")
+    if configured:
+        raise SystemExit(f"Android fixture root does not exist: {configured}")
+    raise SystemExit("Android fixture corpus not found; pass --device-root")
+
+
+def android_available_files(serial: str, device_root: str) -> set[str]:
+    script = f"cd {shlex.quote(device_root)} && find . -type f -name '*.json' -print"
+    output = android_adb(serial, "shell", script, capture=True).stdout
+    return {
+        line.removeprefix("./").rstrip("\r")
+        for line in output.splitlines()
+        if line.strip()
+    }
+
+
+def android_frame_count(file: Path) -> int:
+    try:
+        data = json.loads(file.read_text(encoding="utf-8"))
+        return max(1, math.ceil(float(data.get("op", 1)) - float(data.get("ip", 0))))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return 1
+
+
+def android_renderer_command(
+    renderer: str,
+    device_file: str,
+    size: int,
+    frames: int,
+    curve_tolerance: float,
+    sequence_variable: str,
+) -> str:
+    binary = ANDROID_RENDERERS[renderer]
+    if renderer == "tlottie":
+        arguments = [
+            binary,
+            device_file,
+            str(size),
+            str(frames),
+            str(curve_tolerance),
+        ]
+    else:
+        return " ".join(
+            (
+                shlex.quote(binary),
+                shlex.quote(device_file),
+                str(size),
+                f'"${sequence_variable}"',
+                shlex.quote(f"{ANDROID_REMOTE}/out"),
+            )
+        )
+    return shlex.join(arguments)
+
+
+def android_make_script(
+    files: list[Path],
+    root: Path,
+    device_root: str,
+    renderers: tuple[str, ...],
+    sizes: tuple[int, ...],
+    frames: int,
+    reps: int,
+    core_masks: tuple[str, ...],
+    curve_tolerance: float,
+) -> str:
+    # Reduce every renderer's per-frame output before it crosses ADB. Keeping
+    # isolated processes preserves per-file first-frame and peak-RSS metrics.
+    summarizer = r'''/^F [0-9]+ / { total += $3; if (frames++ > 0) { steady += $3; steady_count++ } next }
+/^FMS / { print; next }
+/^Max RSS \(KiB\):/ { print; next }
+/^(T |Real time|User time|System time|Major faults|Minor faults|File system|Voluntary context|Involuntary context)/ { next }
+{ print }
+END { printf "FSUM %d %.0f %.0f\n", frames, steady, total }'''
+    lines = [
+        "#!/system/bin/sh",
+        "set -u",
+        "export DUMP_NO_WRITE=1 BENCH_ONCE=1",
+        f"export LD_LIBRARY_PATH={shlex.quote(ANDROID_REMOTE)}:${{LD_LIBRARY_PATH:-}}",
+        f"mkdir -p {shlex.quote(ANDROID_REMOTE + '/out')}",
+    ]
+    if any(renderer != "tlottie" for renderer in renderers):
+        for index, file in enumerate(files):
+            count = android_frame_count(file)
+            sequence = ",".join(str(frame % count) for frame in range(frames))
+            lines.append(f"frames_{index}={shlex.quote(sequence)}")
+    for lane, core_mask in enumerate(core_masks):
+        lines.append("(")
+        for size in sizes:
+            for rep in range(reps):
+                for index in range(lane, len(files), len(core_masks)):
+                    file = files[index]
+                    relative = relative_file_name(root, file)
+                    device_file = f"{device_root.rstrip('/')}/{relative}"
+                    order = renderers if (rep + index) % 2 == 0 else tuple(reversed(renderers))
+                    for renderer in order:
+                        marker = json.dumps(
+                            {
+                                "renderer": renderer,
+                                "size": size,
+                                "rep": rep + 1,
+                                "file": relative,
+                            },
+                            separators=(",", ":"),
+                        )
+                        renderer_run = android_renderer_command(
+                            renderer,
+                            device_file,
+                            size,
+                            frames,
+                            curve_tolerance,
+                            f"frames_{index}",
+                        )
+                        lines.append(
+                            f"result=$(toybox time -v taskset {shlex.quote(core_mask)} "
+                            f"{renderer_run} 2>&1 | awk {shlex.quote(summarizer)})"
+                        )
+                        lines.append(
+                            f"printf '%s\\n%s\\n%s\\n' {shlex.quote('### ' + marker)} "
+                            '"$result" \'### END\''
+                        )
+        lines.append(") &")
+    lines.append("wait")
+    return "\n".join(lines) + "\n"
+
+
+def android_parse_log(text: str, root: Path) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    sections = re.findall(
+        r"^### (\{[^\n]*\})\r?\n(.*?)^### END\r?$",
+        text,
+        re.MULTILINE | re.DOTALL,
+    )
+    for marker, body in sections:
+        meta = json.loads(marker)
+        timings = [int(value) for value in ANDROID_FRAME_RE.findall(body)]
+        summary = ANDROID_FRAME_SUMMARY_RE.search(body)
+        fms = ANDROID_FMS_RE.search(body)
+        rss = ANDROID_RSS_RE.search(body)
+        if summary:
+            frame_total = int(summary.group(1))
+            steady_count = max(0, frame_total - 1)
+            steady_ns = int(summary.group(2))
+            measured_ns = int(summary.group(3))
+        else:
+            steady_count = max(0, len(timings) - 1)
+            steady_ns = sum(timings[1:])
+            measured_ns = sum(timings)
+        error = "" if measured_ns > 0 and fms else body.strip()[-500:]
+        rows.append(
+            {
+                "pack": pack_of(root, root / str(meta["file"])),
+                "file": meta["file"],
+                "size": int(meta["size"]),
+                "rep": int(meta["rep"]),
+                "renderer": meta["renderer"],
+                "ok": not error,
+                "first_frame_ms": float(fms.group(1)) if fms else 0.0,
+                "frame_ms": steady_ns / steady_count / 1_000_000.0 if steady_count else None,
+                "other_frames": steady_count,
+                "measured_ms": measured_ns / 1_000_000.0,
+                "memory_avg_mb": int(rss.group(1)) / 1024.0 if rss else 0.0,
+                "memory_max_mb": int(rss.group(1)) / 1024.0 if rss else 0.0,
+                "energy_j": None,
+                "error": error,
+            }
+        )
+    return rows
+
+
+def android_run_streamed(
+    serial: str,
+    remote_script: str,
+    log_path: Path,
+    expected: int,
+) -> str:
+    executable = os.environ.get("ADB", "adb")
+    process = subprocess.Popen(
+        [executable, "-s", serial, "shell", "sh", remote_script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    if process.stdout is None:
+        process.kill()
+        raise RuntimeError("could not capture Android benchmark output")
+    progress = ProgressDisplay("Android benchmark", expected)
+    progress_every = progress_interval(expected)
+    chunks: list[str] = []
+    current = "starting"
+    completed = 0
+    with log_path.open("w", encoding="utf-8") as log:
+        for line in process.stdout:
+            chunks.append(line)
+            log.write(line)
+            if line.startswith("### {"):
+                try:
+                    meta = json.loads(line[4:])
+                    current = f"{meta['renderer']} {meta['size']}px {meta['file']}"
+                except (KeyError, json.JSONDecodeError):
+                    current = "Android benchmark"
+            elif line.rstrip("\r\n") == "### END":
+                completed += 1
+                if progress.interactive:
+                    progress.advance("Android benchmark", current)
+                elif should_report_progress(completed, expected, progress_every):
+                    print(f"   Android {completed}/{expected} cases", flush=True)
+        log.flush()
+    return_code = process.wait()
+    progress.finish()
+    if return_code != 0:
+        raise SystemExit(
+            f"Android benchmark shell exited with status {return_code}; inspect {log_path}"
+        )
+    return "".join(chunks)
+
+
+def android_benchmark_invocation(args: argparse.Namespace) -> str:
+    command = [
+        "tools/benchmark.py",
+        str(args.input),
+        f"--android={args.android_serial}",
+        "--sizes",
+        args.sizes,
+        "--frames",
+        str(args.frames),
+        "--reps",
+        str(args.reps),
+        "--no-accuracy",
+        "--sample",
+        str(args.sample),
+        "--jobs",
+        str(args.jobs),
+        "--renderers",
+        args.renderers,
+        "--curve-tolerance",
+        str(args.curve_tolerance),
+        "--core-mask",
+        args.core_mask,
+    ]
+    for option, value in (("--limit", args.limit), ("--packs", args.packs)):
+        if value is not None:
+            command.extend((option, str(value)))
+    for option, enabled in (
+        ("--skip-build", args.skip_build),
+        ("--no-open", args.no_open),
+        ("--write-raw", args.write_raw),
+    ):
+        if enabled:
+            command.append(option)
+    return shlex.join(command)
+
+
+def run_android_benchmark(args: argparse.Namespace) -> int:
+    if not args.no_accuracy:
+        raise SystemExit("Android accuracy comparison is not supported; pass --no-accuracy")
+    if args.frames < 2 or args.reps < 1:
+        raise SystemExit("Android --frames must be >=2 and --reps must be positive")
+    if not math.isfinite(args.curve_tolerance) or args.curve_tolerance <= 0:
+        raise SystemExit("--curve-tolerance must be a positive finite number")
+    renderer_list = args.renderers or ",".join(ANDROID_DEFAULT_RENDERERS)
+    args.renderers = renderer_list
+    renderers = tuple(item.strip() for item in renderer_list.split(",") if item.strip())
+    unknown = [item for item in renderers if item not in ANDROID_RENDERERS]
+    if unknown:
+        raise SystemExit(f"unknown Android renderers: {','.join(unknown)}")
+    sizes = tuple(int(value) for value in args.sizes.split(",") if value)
+    if not sizes or any(size <= 0 for size in sizes):
+        raise SystemExit("--sizes must contain positive integers")
+    serial = android_connected_serial(args.android_serial)
+    args.android_serial = serial
+    args.out = args.out or ANDROID_DEFAULT_OUT
+    args.jobs = args.jobs or 2
+    core_masks = android_core_masks(serial, args.jobs, args.core_mask)
+    args.core_mask = ",".join(core_masks)
+    args.device_root = android_resolve_device_root(serial, args.device_root)
+
+    files = discover(args.input, None)
+    before_device_filter = len(files)
+    device_files = android_available_files(serial, args.device_root)
+    files = [
+        file
+        for file in files
+        if relative_file_name(args.input, file) in device_files
+    ]
+    if len(files) < before_device_filter:
+        print(
+            f"== device corpus intersection: {len(files)}/{before_device_filter} host files",
+            flush=True,
+        )
+    if args.limit:
+        files = files[: args.limit]
+    if args.packs is not None:
+        all_packs = sorted({pack_of(args.input, file) for file in files})
+        selected_packs = select_packs(all_packs, args.packs)
+        keep = set(selected_packs)
+        files = [file for file in files if pack_of(args.input, file) in keep]
+    if not files:
+        raise SystemExit(f"no .json files found under {args.input}")
+    available = len(files)
+    sample_count = ANDROID_DEFAULT_SAMPLE if args.sample is None else args.sample
+    if sample_count < 0:
+        raise SystemExit("--sample must be non-negative (0 means every file)")
+    files = sample_files(files, args.input, sample_count)
+    args.sample = sample_count
+    if len(files) < available:
+        print(
+            f"== Android deterministic sample: {len(files)}/{available} files "
+            "(--sample 0 benchmarks all files)",
+            flush=True,
+        )
+    else:
+        print(f"== Android files: {len(files)} (exhaustive)", flush=True)
+    packs = sorted({pack_of(args.input, file) for file in files})
+    print(f"== Android packs: {len(packs)}; device {android_device_info(serial)}", flush=True)
+    print(
+        f"== {args.jobs} pinned worker lane(s), core masks {args.core_mask}; "
+        "compact on-device frame summaries enabled",
+        flush=True,
+    )
+    if args.jobs > 1:
+        print("== use --jobs 1 for uncontended single-core reference timings", flush=True)
+
+    android_adb(serial, "shell", "mkdir", "-p", ANDROID_REMOTE)
+    if not args.skip_build:
+        runner, library = android_build_tlottie()
+        android_adb(serial, "push", str(runner), ANDROID_RENDERERS["tlottie"])
+        android_adb(serial, "push", str(library), ANDROID_TLOTTIE_LIBRARY)
+        android_adb(serial, "shell", "chmod", "755", ANDROID_RENDERERS["tlottie"])
+    for renderer in renderers:
+        result = android_adb(
+            serial,
+            "shell",
+            "test",
+            "-x",
+            ANDROID_RENDERERS[renderer],
+            capture=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            continue
+        local_binary = android_local_renderer_binary(renderer)
+        if local_binary is None or args.skip_build:
+            raise SystemExit(
+                f"missing Android renderer executable: {ANDROID_RENDERERS[renderer]}; "
+                f"no local {ANDROID_BINARY_NAMES.get(renderer, 'Android binary')} found"
+            )
+        print(f"== installing Android {renderer}: {local_binary}", flush=True)
+        android_adb(serial, "push", str(local_binary), ANDROID_RENDERERS[renderer])
+        android_adb(serial, "shell", "chmod", "755", ANDROID_RENDERERS[renderer])
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    script = android_make_script(
+        files,
+        args.input,
+        args.device_root,
+        renderers,
+        sizes,
+        args.frames,
+        args.reps,
+        core_masks,
+        args.curve_tolerance,
+    )
+    local_script = args.out / "benchmark-device.sh"
+    local_script.write_text(script, encoding="utf-8")
+    android_adb(serial, "push", str(local_script), f"{ANDROID_REMOTE}/benchmark-device.sh")
+    expected = len(files) * len(sizes) * len(renderers) * args.reps
+    print(f"== running {expected} isolated renderer cases on device", flush=True)
+    log_path = args.out / "benchmark-device.log"
+    output = android_run_streamed(
+        serial,
+        f"{ANDROID_REMOTE}/benchmark-device.sh",
+        log_path,
+        expected,
+    )
+    rows = android_parse_log(output, args.input)
+    if len(rows) != expected:
+        raise SystemExit(f"parsed {len(rows)}/{expected} Android rows; inspect {log_path}")
+    failures = [row for row in rows if not row["ok"]]
+    if failures:
+        raise SystemExit(f"{len(failures)} Android rows failed; inspect {log_path}")
+
+    file_rows = aggregate_file_rows(rows)
+    pack_rows = aggregate_pack_rows(file_rows)
+    pivot = pivot_aggregate(pack_rows, ("pack", "size"))
+    tgv = args.out / "benchmark.tgv"
+    html_path = args.out / "benchmark.html"
+    write_tgv(tgv, pivot, renderers, ("pack", "size"))
+    write_html(
+        html_path,
+        pack_rows,
+        file_rows,
+        renderers,
+        False,
+        args.reps,
+        None,
+        min(sizes),
+        args.accuracy_tolerance,
+        args.accuracy_diff_threshold,
+        android_benchmark_invocation(args),
+        android_device_info(serial, detailed=True),
+    )
+    if args.write_raw:
+        (args.out / "benchmark.raw.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
+    print(f"wrote {tgv}")
+    print(f"wrote {html_path}")
+    print(f"wrote {log_path}")
+    if args.write_raw:
+        print(f"wrote {args.out / 'benchmark.raw.json'}")
+    if not args.no_open:
+        webbrowser.open(html_path.resolve().as_uri())
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("input", nargs="?", type=Path, default=DEFAULT_INPUT)
-    ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--out", type=Path)
+    ap.add_argument(
+        "--android",
+        nargs="?",
+        const="",
+        metavar="SERIAL",
+        help="benchmark on the only connected Android device, or the given serial",
+    )
     ap.add_argument("--sizes", default=",".join(map(str, DEFAULT_SIZES)))
     ap.add_argument(
         "--frames",
@@ -3143,8 +3810,20 @@ def main() -> int:
     )
     ap.add_argument("--diff-dir", type=Path, help="directory for --save-diffs PNG grids")
     ap.add_argument("--write-raw", action="store_true", help="write benchmark raw JSON files")
-    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
+    ap.add_argument(
+        "--jobs",
+        type=int,
+        help="worker count (host: CPU count; Android: 2 pinned lanes)",
+    )
     ap.add_argument("--limit", type=int)
+    ap.add_argument(
+        "--sample",
+        type=int,
+        help=(
+            f"stable pack-aware Android sample size (default {ANDROID_DEFAULT_SAMPLE}); "
+            "0 benchmarks every selected file"
+        ),
+    )
     ap.add_argument(
         "--packs",
         help=(
@@ -3152,14 +3831,35 @@ def main() -> int:
             "or last N with -N (packs are sorted by name)"
         ),
     )
-    ap.add_argument("--renderers", default=",".join(DEFAULT_RENDERERS))
+    ap.add_argument(
+        "--renderers",
+        help=(
+            "comma-separated renderers; defaults to the five host renderers, "
+            "or tlottie,rlottie,rlottie_2019_patched,thorvg on Android"
+        ),
+    )
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--no-open", action="store_true", help="do not open benchmark.html")
-    args = ap.parse_args()
+    ap.add_argument("--device-root", help="Android fixture root (auto-detected by default)")
+    ap.add_argument(
+        "--core-mask",
+        help="comma-separated Android taskset masks (default: highest --jobs CPUs)",
+    )
+    args = ap.parse_args(argv)
 
     if args.curve_tolerance is None:
         args.curve_tolerance = 0.125 if not args.no_accuracy else 0.3
 
+    if args.android is not None:
+        args.android_serial = args.android
+        return run_android_benchmark(args)
+
+    args.out = args.out or DEFAULT_OUT
+    args.jobs = args.jobs or (os.cpu_count() or 1)
+    if args.sample is not None:
+        raise SystemExit("--sample is currently Android-only")
+
+    args.renderers = args.renderers or ",".join(DEFAULT_RENDERERS)
     renderers = tuple(r.strip() for r in args.renderers.split(",") if r.strip())
     bad = [r for r in renderers if r not in RENDERERS]
     if bad:
