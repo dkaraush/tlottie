@@ -256,6 +256,7 @@ fn parse_property_k<T: Lerp>(kc: &mut Cursor<'_>, limits: &Limits, parse_val: fn
     let mut probe = kc.fork_at(kc.pos() + 1);
     probe.skip_ws();
     if probe.peek() == Some(b'{') {
+      kc.mark_animated_property();
       return parse_keyframes(kc, limits, parse_val).map(Property::Animated);
     }
   }
@@ -1371,12 +1372,23 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits) -> Result<Composi
     return Err(missing("out point must be greater than in point"));
   }
 
+  // Static detection piggybacks on parsing: every deferred cursor shares the
+  // animated-property bit. Keep the final lifetime check flat and
+  // conservative; precomps are rejected rather than recursively analyzed.
+  let static_content = !layers.is_empty()
+    && assets.is_empty()
+    && c.properties_are_static()
+    && layers
+      .iter()
+      .all(|layer| layer.hidden || layer.out_point <= in_point as f32 || layer.in_point >= out_point as f32 || (layer.in_point <= in_point as f32 && layer.out_point >= out_point as f32));
+
   Ok(Composition {
     width: width as u32,
     height: height as u32,
     frame_rate: frame_rate as f32,
     in_point: in_point as f32,
     out_point: out_point as f32,
+    static_content,
     layers,
     assets,
   })
