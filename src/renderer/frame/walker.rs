@@ -69,11 +69,16 @@ fn rule_of(rule: FillRule) -> Rule {
 
 fn premul_argb(color: Color, opacity: f32) -> u32 {
   let a = (color.a * opacity).clamp(0.0, 1.0);
-  let scale = a;
-  let ai = (a * 255.0 + 0.5) as u32;
-  let ri = (color.r * scale * 255.0 + 0.5) as u32;
-  let gi = (color.g * scale * 255.0 + 0.5) as u32;
-  let bi = (color.b * scale * 255.0 + 0.5) as u32;
+  // Match Canvas::fill exactly: straight channels and paint alpha truncate
+  // independently, then premultiplication uses rounded byte division.
+  let ai = (a * 255.0) as u32;
+  let premul = |channel: f32| {
+    let straight = (channel.clamp(0.0, 1.0) * 255.0) as u32;
+    (straight * ai + 127) / 255
+  };
+  let ri = premul(color.r);
+  let gi = premul(color.g);
+  let bi = premul(color.b);
   (ai.min(255) << 24) | (ri.min(255) << 16) | (gi.min(255) << 8) | bi.min(255)
 }
 

@@ -30,6 +30,12 @@ impl FrameRenderer for Counter {
 }
 
 #[test]
+fn solid_premultiplication_matches_cpu_byte_math() {
+  let color = Color { r: 0.5, g: 0.25, b: 1.0, a: 0.5 };
+  assert_eq!(premul_argb(color, 0.5), 0x3f1f_103f);
+}
+
+#[test]
 fn borrowed_sink_receives_evaluated_geometry() {
   let json = br#"{"fr":30,"ip":0,"op":30,"w":100,"h":100,"layers":[
             {"ty":4,"ind":1,"ip":0,"op":30,"st":0,

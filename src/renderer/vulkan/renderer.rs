@@ -341,13 +341,7 @@ impl<'a> VulkanRenderer<'a> {
       Ok(pipeline) => pipeline,
       Err(error) => {
         // SAFETY: resources were just created and are not in use.
-        unsafe {
-          device.destroy_pipeline(resources.pipeline, None);
-          device.destroy_pipeline_layout(resources.pipeline_layout, None);
-          device.destroy_descriptor_pool(resources.descriptor_pool, None);
-          device.destroy_descriptor_set_layout(resources.descriptor_set_layout, None);
-          device.destroy_render_pass(resources.render_pass, None);
-        }
+        unsafe { destroy_triangle_pipeline(device, &resources) };
         return Err(error);
       }
     };
@@ -357,11 +351,7 @@ impl<'a> VulkanRenderer<'a> {
         // SAFETY: resources were just created and are not in use.
         unsafe {
           device.destroy_pipeline(bin_pipeline, None);
-          device.destroy_pipeline(resources.pipeline, None);
-          device.destroy_pipeline_layout(resources.pipeline_layout, None);
-          device.destroy_descriptor_pool(resources.descriptor_pool, None);
-          device.destroy_descriptor_set_layout(resources.descriptor_set_layout, None);
-          device.destroy_render_pass(resources.render_pass, None);
+          destroy_triangle_pipeline(device, &resources);
         }
         return Err(error);
       }
@@ -373,11 +363,7 @@ impl<'a> VulkanRenderer<'a> {
         unsafe {
           device.destroy_pipeline(compute_pipeline, None);
           device.destroy_pipeline(bin_pipeline, None);
-          device.destroy_pipeline(resources.pipeline, None);
-          device.destroy_pipeline_layout(resources.pipeline_layout, None);
-          device.destroy_descriptor_pool(resources.descriptor_pool, None);
-          device.destroy_descriptor_set_layout(resources.descriptor_set_layout, None);
-          device.destroy_render_pass(resources.render_pass, None);
+          destroy_triangle_pipeline(device, &resources);
         }
         return Err(error);
       }
@@ -1366,6 +1352,25 @@ struct TrianglePipeline {
   stencil_evenodd_pipeline: vk::Pipeline,
   group_composite_pipeline: vk::Pipeline,
   group_sampler: vk::Sampler,
+}
+
+/// Releases a fully constructed graphics pipeline bundle when a later compute
+/// pipeline fails during renderer initialization.
+///
+/// # Safety
+/// Every handle in `resources` must belong to `device` and must not be in use.
+unsafe fn destroy_triangle_pipeline(device: &ash::Device, resources: &TrianglePipeline) {
+  unsafe {
+    device.destroy_pipeline(resources.pipeline, None);
+    device.destroy_pipeline(resources.stencil_nonzero_pipeline, None);
+    device.destroy_pipeline(resources.stencil_evenodd_pipeline, None);
+    device.destroy_pipeline(resources.group_composite_pipeline, None);
+    device.destroy_sampler(resources.group_sampler, None);
+    device.destroy_pipeline_layout(resources.pipeline_layout, None);
+    device.destroy_descriptor_pool(resources.descriptor_pool, None);
+    device.destroy_descriptor_set_layout(resources.descriptor_set_layout, None);
+    device.destroy_render_pass(resources.render_pass, None);
+  }
 }
 
 struct TargetFramebuffer {

@@ -285,6 +285,222 @@ mod imp {
     Err(format!("no memory type with flags 0x{:x} for {name}", properties.as_raw()))
   }
 
+  /// Runs a line-oriented benchmark worker while retaining the Vulkan device,
+  /// pipelines, and fixed-size targets across animations.
+  pub(crate) fn batch_with_options(width: u32, height: u32, options: RenderOptions) -> ExitCode {
+    use std::io::{BufRead, Write};
+
+    let Some(bytes) = (width as vk::DeviceSize).checked_mul(height as vk::DeviceSize).and_then(|n| n.checked_mul(4)) else {
+      eprintln!("vulkan target too large");
+      return ExitCode::FAILURE;
+    };
+    let ctx = match VkCtx::new() {
+      Ok(ctx) => ctx,
+      Err(error) => {
+        eprintln!("vulkan init error: {error}");
+        return ExitCode::FAILURE;
+      }
+    };
+    // Complex stickers can have thousands of paints and conservative tile
+    // lists much larger than the output image. Retain one generously sized
+    // scene buffer in batch mode instead of failing later files or reallocating
+    // between animations.
+    let scratch_bytes = bytes.saturating_mul(4).max(64 * 1024 * 1024);
+    let scratch = match GpuBuffer::new(
+      &ctx,
+      scratch_bytes,
+      vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
+      vk::MemoryPropertyFlags::DEVICE_LOCAL,
+      "scratch pixels",
+    ) {
+      Ok(buffer) => buffer,
+      Err(error) => {
+        eprintln!("vulkan scratch buffer error: {error}");
+        return ExitCode::FAILURE;
+      }
+    };
+    let image = match RenderImage::new(&ctx, width, height) {
+      Ok(image) => image,
+      Err(error) => {
+        scratch.destroy(&ctx);
+        eprintln!("vulkan render image error: {error}");
+        return ExitCode::FAILURE;
+      }
+    };
+    let stencil = match RenderImage::new_stencil(&ctx, width, height) {
+      Ok(image) => image,
+      Err(error) => {
+        image.destroy(&ctx);
+        scratch.destroy(&ctx);
+        eprintln!("vulkan stencil image error: {error}");
+        return ExitCode::FAILURE;
+      }
+    };
+    let multisample = match RenderImage::new_multisample(&ctx, width, height) {
+      Ok(image) => image,
+      Err(error) => {
+        stencil.destroy(&ctx);
+        image.destroy(&ctx);
+        scratch.destroy(&ctx);
+        eprintln!("vulkan multisample image error: {error}");
+        return ExitCode::FAILURE;
+      }
+    };
+    let group = if ctx.raster_order_groups {
+      match RenderImage::new_group(&ctx, width, height) {
+        Ok(image) => Some(image),
+        Err(error) => {
+          multisample.destroy(&ctx);
+          stencil.destroy(&ctx);
+          image.destroy(&ctx);
+          scratch.destroy(&ctx);
+          eprintln!("vulkan alpha-group image error: {error}");
+          return ExitCode::FAILURE;
+        }
+      }
+    } else {
+      None
+    };
+    let staging = match GpuBuffer::new(
+      &ctx,
+      bytes,
+      vk::BufferUsageFlags::TRANSFER_DST,
+      vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+      "readback pixels",
+    ) {
+      Ok(buffer) => buffer,
+      Err(error) => {
+        if let Some(group) = &group {
+          group.destroy(&ctx);
+        }
+        multisample.destroy(&ctx);
+        stencil.destroy(&ctx);
+        image.destroy(&ctx);
+        scratch.destroy(&ctx);
+        eprintln!("vulkan staging buffer error: {error}");
+        return ExitCode::FAILURE;
+      }
+    };
+    let mut renderer = match tlottie::vulkan::VulkanRenderer::new_with_raster_order_groups(&ctx.device, ctx.raster_order_groups) {
+      Ok(renderer) => renderer,
+      Err(error) => {
+        staging.destroy(&ctx);
+        if let Some(group) = &group {
+          group.destroy(&ctx);
+        }
+        multisample.destroy(&ctx);
+        stencil.destroy(&ctx);
+        image.destroy(&ctx);
+        scratch.destroy(&ctx);
+        eprintln!("tlottie-vulkan init error: {error}");
+        return ExitCode::FAILURE;
+      }
+    };
+    if std::env::var("TLOTTIE_VK_MODE").as_deref() == Ok("stencil") {
+      renderer.set_mode(tlottie::vulkan::RendererMode::StencilCover);
+    }
+    renderer.set_multi_draw_indirect(ctx.multi_draw_indirect);
+
+    let pixel_count = width as usize * height as usize;
+    let mut pixels = vec![0u32; pixel_count];
+    let mut raw_bytes = Vec::with_capacity(pixel_count.saturating_mul(4));
+    let mut image_layout = vk::ImageLayout::UNDEFINED;
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
+    for line in stdin.lock().lines() {
+      let line = match line {
+        Ok(line) => line,
+        Err(error) => {
+          eprintln!("vulkan batch input error: {error}");
+          break;
+        }
+      };
+      let fields = line.split('\t').collect::<Vec<_>>();
+      let response = if let [file, start, frames, raw_path] = fields.as_slice() {
+        let request = start.parse::<f32>().ok().zip(frames.parse::<u32>().ok()).filter(|(_, frames)| *frames > 0);
+        match request {
+          Some((start, frames)) if start.is_finite() => match std::fs::read(file)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| Composition::parse(&bytes, &tlottie::Limits::default()).map_err(|error| error.to_string()))
+          {
+            Ok(comp) => {
+              let mut raw_file = if raw_path == &"-" {
+                None
+              } else {
+                std::path::Path::new(raw_path)
+                  .parent()
+                  .map(std::fs::create_dir_all)
+                  .transpose()
+                  .and_then(|_| std::fs::File::create(raw_path))
+                  .ok()
+              };
+              let raw_ready = raw_path == &"-" || raw_file.is_some();
+              let frame_count = comp.frame_count().max(1);
+              let mut ok = raw_ready;
+              for index in 0..frames {
+                let sequence_frame = (start + index as f32) % frame_count as f32;
+                let code = record_submit_read(
+                  &ctx,
+                  &scratch,
+                  &image,
+                  &stencil,
+                  &multisample,
+                  group.as_ref(),
+                  &staging,
+                  &mut renderer,
+                  &comp,
+                  sequence_frame,
+                  &mut pixels,
+                  width,
+                  height,
+                  options,
+                  image_layout,
+                );
+                if code != ExitCode::SUCCESS {
+                  ok = false;
+                  break;
+                }
+                image_layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+                if let Some(file) = raw_file.as_mut() {
+                  raw_bytes.clear();
+                  raw_bytes.extend(pixels.iter().flat_map(|pixel| pixel.to_le_bytes()));
+                  if file.write_all(&raw_bytes).is_err() {
+                    ok = false;
+                    break;
+                  }
+                }
+              }
+              if ok {
+                format!("OK\t{frame_count}\t{frames}")
+              } else {
+                "ERR\trender".to_string()
+              }
+            }
+            Err(error) => format!("ERR\t{}", error.replace(['\t', '\n', '\r'], " ")),
+          },
+          _ => "ERR\tbad request".to_string(),
+        }
+      } else {
+        "ERR\tbad request".to_string()
+      };
+      if writeln!(stdout, "{response}").and_then(|_| stdout.flush()).is_err() {
+        break;
+      }
+    }
+
+    // Every submitted frame is fence-complete before the next request.
+    drop(renderer);
+    staging.destroy(&ctx);
+    if let Some(group) = &group {
+      group.destroy(&ctx);
+    }
+    multisample.destroy(&ctx);
+    stencil.destroy(&ctx);
+    image.destroy(&ctx);
+    scratch.destroy(&ctx);
+    ExitCode::SUCCESS
+  }
+
   pub(crate) fn render_with_options(comp: &Composition, frame: f32, pixels: &mut [u32], width: u32, height: u32, options: RenderOptions) -> ExitCode {
     let Some(bytes) = (width as vk::DeviceSize).checked_mul(height as vk::DeviceSize).and_then(|n| n.checked_mul(4)) else {
       eprintln!("vulkan target too large");
@@ -297,7 +513,7 @@ mod imp {
         return ExitCode::FAILURE;
       }
     };
-    let scratch_bytes = bytes.saturating_mul(4).max(1024 * 1024);
+    let scratch_bytes = bytes.saturating_mul(4).max(64 * 1024 * 1024);
     let scratch = match GpuBuffer::new(
       &ctx,
       scratch_bytes,
@@ -660,10 +876,18 @@ mod imp {
 }
 
 #[cfg(feature = "vulkan")]
+pub(crate) use imp::batch_with_options as batch;
+#[cfg(feature = "vulkan")]
 pub(crate) use imp::render_with_options as render;
 
 #[cfg(not(feature = "vulkan"))]
 pub(crate) fn render(_comp: &tlottie::Composition, _frame: f32, _pixels: &mut [u32], _width: u32, _height: u32, _options: tlottie::RenderOptions) -> std::process::ExitCode {
+  eprintln!("tlottie-cli was built without --features vulkan");
+  std::process::ExitCode::FAILURE
+}
+
+#[cfg(not(feature = "vulkan"))]
+pub(crate) fn batch(_width: u32, _height: u32, _options: tlottie::RenderOptions) -> std::process::ExitCode {
   eprintln!("tlottie-cli was built without --features vulkan");
   std::process::ExitCode::FAILURE
 }
