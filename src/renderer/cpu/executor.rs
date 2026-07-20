@@ -1,6 +1,7 @@
 //! Frame rendering: evaluate the model at a frame, flatten geometry,
 //! rasterize, and composite into a premultiplied ARGB32 buffer.
 
+use super::mapped_surface::Surface;
 use crate::cells::CellRaster;
 #[cfg(test)]
 use crate::error::Error;
@@ -43,7 +44,7 @@ pub(crate) struct RenderScratch {
   /// CPU frame-renderer surfaces are returned already transparent. Unlike
   /// general scratch planes, acquiring one therefore does not need to clear
   /// the full canvas again.
-  surface_u32: Vec<Vec<u32>>,
+  surface_u32: Vec<Surface>,
   bufs_u8: Vec<Vec<u8>>,
   /// Gradient LUT memoization: building a 1024-entry premultiplied table
   /// from the stop list is pure, and stop values repeat across frames
@@ -178,13 +179,13 @@ impl RenderScratch {
     }
   }
 
-  pub(crate) fn take_surface_u32(&mut self, n: usize) -> Vec<u32> {
+  pub(crate) fn take_surface_u32(&mut self, n: usize) -> Surface {
     let mut b = self.surface_u32.pop().unwrap_or_default();
-    b.resize(n, 0);
+    b.resize_zeroed(n);
     b
   }
 
-  pub(crate) fn put_surface_u32(&mut self, mut b: Vec<u32>, width: usize, rows: &[RowBounds]) {
+  pub(crate) fn put_surface_u32(&mut self, mut b: Surface, width: usize, rows: &[RowBounds]) {
     if width != 0 {
       let height = b.len() / width;
       for (y, &row) in rows.iter().take(height).enumerate() {

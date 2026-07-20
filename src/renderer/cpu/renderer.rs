@@ -18,7 +18,7 @@ pub struct CPURenderer {
   pub(super) height: usize,
   pub(super) antialias: bool,
   pub(super) bitmap_dirty: bool,
-  pub(super) surfaces: Vec<Vec<u32>>,
+  pub(super) surfaces: Vec<super::mapped_surface::Surface>,
   pub(super) surface_dirty: Vec<super::executor::DirtyBox>,
   pub(super) surface_rows: Vec<Vec<super::executor::RowBounds>>,
   pub(super) row_bounds_pool: Vec<Vec<super::executor::RowBounds>>,
