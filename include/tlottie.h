@@ -10,6 +10,22 @@ extern "C" {
 
 typedef struct TLottieInstance TLottieInstance;
 
+enum TlottieFitzModifier {
+  TLOTTIE_FITZ_NONE = 0,
+  TLOTTIE_FITZ_TYPE_12 = 1,
+  TLOTTIE_FITZ_TYPE_3 = 2,
+  TLOTTIE_FITZ_TYPE_4 = 3,
+  TLOTTIE_FITZ_TYPE_5 = 4,
+  TLOTTIE_FITZ_TYPE_6 = 5,
+};
+
+typedef struct TLottieLayerColorReplacement {
+  const uint8_t *layer_name_prefix;
+  size_t layer_name_prefix_len;
+  /* Straight-alpha 0xAARRGGBB. */
+  uint32_t color;
+} TLottieLayerColorReplacement;
+
 enum TlottieStatus {
   TLOTTIE_OK = 0,
   TLOTTIE_ERROR_INVALID_ARGUMENT = -1,
@@ -19,6 +35,18 @@ enum TlottieStatus {
 
 /* Parses JSON and creates a CPU renderer. Returns NULL on failure. */
 TLottieInstance *tlottie_new(const uint8_t *json_ptr, size_t json_len);
+
+/*
+ * Like tlottie_new, with parse-time customization. Layer prefixes do not
+ * include the legacy trailing "**"; matching and color replacement happen
+ * once while the instance is created.
+ */
+TLottieInstance *tlottie_new_with_options(
+    const uint8_t *json_ptr,
+    size_t json_len,
+    uint32_t fitz_modifier,
+    const TLottieLayerColorReplacement *replacements,
+    size_t replacements_len);
 
 /* NULL is accepted. Other pointers must have come from tlottie_new. */
 void tlottie_drop(TLottieInstance *renderer);

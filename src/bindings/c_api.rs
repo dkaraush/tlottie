@@ -2,7 +2,18 @@
 
 #![allow(unsafe_code)]
 
-use crate::{CPURenderer, Composition, Limits, RenderOptions};
+use crate::{CPURenderer, Composition, FitzModifier, LayerColorReplacement, Limits, ParseOptions, RenderOptions};
+
+/// One constructor-time layer-prefix color override.
+#[repr(C)]
+pub struct TLottieLayerColorReplacement {
+  /// UTF-8 bytes for the layer-name prefix (without a trailing `**`).
+  pub layer_name_prefix: *const u8,
+  /// Number of bytes in `layer_name_prefix`.
+  pub layer_name_prefix_len: usize,
+  /// Straight-alpha color in `0xAARRGGBB` form.
+  pub color: u32,
+}
 
 /// Opaque renderer handle owned by C callers.
 pub struct TLottieInstance {
@@ -15,11 +26,62 @@ pub struct TLottieInstance {
 /// `json_ptr..json_ptr+json_len` must be readable for the duration of the call.
 #[no_mangle]
 pub unsafe extern "C" fn tlottie_new(json_ptr: *const u8, json_len: usize) -> *mut TLottieInstance {
+  unsafe { tlottie_new_with_options(json_ptr, json_len, 0, core::ptr::null(), 0) }
+}
+
+/// Parses Lottie JSON with a Fitz modifier and layer-prefix color overrides.
+///
+/// `fitz_modifier` is one of `TLOTTIE_FITZ_*`. Prefix strings are matched
+/// directly against layer `nm` values and need no trailing `**`.
+///
+/// # Safety
+/// The JSON and every prefix byte range must be readable for this call.
+#[no_mangle]
+pub unsafe extern "C" fn tlottie_new_with_options(
+  json_ptr: *const u8,
+  json_len: usize,
+  fitz_modifier: u32,
+  replacements_ptr: *const TLottieLayerColorReplacement,
+  replacements_len: usize,
+) -> *mut TLottieInstance {
   if json_ptr.is_null() {
     return core::ptr::null_mut();
   }
+  let Some(fitz_modifier) = FitzModifier::from_u32(fitz_modifier) else {
+    return core::ptr::null_mut();
+  };
+  if replacements_len != 0 && replacements_ptr.is_null() {
+    return core::ptr::null_mut();
+  }
   let json = unsafe { core::slice::from_raw_parts(json_ptr, json_len) };
-  match Composition::parse(json, &Limits::default()) {
+  let raw_replacements = if replacements_len == 0 {
+    &[]
+  } else {
+    unsafe { core::slice::from_raw_parts(replacements_ptr, replacements_len) }
+  };
+  let mut layer_color_replacements = Vec::with_capacity(raw_replacements.len());
+  for replacement in raw_replacements {
+    if replacement.layer_name_prefix_len != 0 && replacement.layer_name_prefix.is_null() {
+      return core::ptr::null_mut();
+    }
+    let bytes = if replacement.layer_name_prefix_len == 0 {
+      &[]
+    } else {
+      unsafe { core::slice::from_raw_parts(replacement.layer_name_prefix, replacement.layer_name_prefix_len) }
+    };
+    let Ok(prefix) = core::str::from_utf8(bytes) else {
+      return core::ptr::null_mut();
+    };
+    layer_color_replacements.push(LayerColorReplacement {
+      layer_name_prefix: prefix.to_owned(),
+      color: replacement.color,
+    });
+  }
+  let options = ParseOptions {
+    fitz_modifier,
+    layer_color_replacements,
+  };
+  match Composition::parse_with_options(json, &Limits::default(), &options) {
     Ok(comp) => Box::into_raw(Box::new(TLottieInstance { renderer: CPURenderer::new(comp) })),
     Err(_) => core::ptr::null_mut(),
   }

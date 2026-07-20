@@ -514,3 +514,4 @@ pub extern "system" fn Java_com_example_tlottie_NativeBridge_benchmarkThorvgGpu(
     })();
     java_string(&mut env, result)
 }
+

@@ -19,6 +19,7 @@ const globalStats = document.getElementById('stats');
 const capFps = document.getElementById('capfps');
 const antialias = document.getElementById('antialias');
 const alphaOnly = document.getElementById('alphaonly');
+const fitz = document.getElementById('fitz');
 const curveTolerance = document.getElementById('curvetolerance');
 const curveToleranceVal = document.getElementById('curvetoleranceval');
 const sizeSlider = document.getElementById('sizeslider');
@@ -57,7 +58,8 @@ const engines = [
     alloc: (n) => tl.tlottie_alloc(n),
     free: (p, n) => tl.tlottie_free(p, n),
     heap: () => new Uint8Array(tl.memory.buffer),
-    create: (p, n) => tl.tlottie_new(p, n),
+    create: (p, n, fitzModifier = 0) =>
+      tl.tlottie_new_with_options(p, n, fitzModifier, 0, 0),
     drop: (i) => tl.tlottie_drop(i),
     width: (i) => tl.tlottie_width(i),
     height: (i) => tl.tlottie_height(i),
@@ -125,6 +127,38 @@ const MAX_DIM = 1024;
 const WINDOW = 360;  // rolling-average window, in draws
 
 let raf = 0;
+let currentBytes = null;
+
+function fitzModifierValue() {
+  return Number(fitz.value);
+}
+
+function recreateTlottie() {
+  if (!currentBytes) return;
+  const modifier = fitzModifierValue();
+  const engine = engines.find((candidate) => candidate.key === 'tl');
+  const ptr = engine.alloc(currentBytes.length);
+  if (!ptr) {
+    err.textContent = 'tlottie allocation failed';
+    return;
+  }
+  engine.heap().set(currentBytes, ptr);
+  const next = engine.create(ptr, currentBytes.length, modifier);
+  engine.free(ptr, currentBytes.length);
+  if (!next) {
+    err.textContent = 'tlottie rejected the selected fitz value';
+    return;
+  }
+  if (engine.inst) engine.drop(engine.inst);
+  engine.inst = next;
+  engine.dead = false;
+  engine.drawMs.length = 0;
+  engine.statsEl.textContent = '';
+  err.textContent = '';
+  applySize();
+}
+
+fitz.addEventListener('change', recreateTlottie);
 
 // Renderer tabs: 'both' shows every available engine; an engine key shows
 // just that panel. Hidden engines are skipped in the render loop, so
@@ -182,6 +216,7 @@ function loadLottie(bytes, name) {
   cancelAnimationFrame(raf);
   err.textContent = '';
   globalStats.textContent = '';
+  currentBytes = bytes.slice();
 
   let loaded = null;  // engine-independent comp info from whichever parsed
   for (const e of engines) {
@@ -195,7 +230,7 @@ function loadLottie(bytes, name) {
     const ptr = e.alloc(bytes.length);
     if (!ptr) { e.statsEl.textContent = 'allocation failed'; continue; }
     e.heap().set(bytes, ptr);
-    const inst = e.create(ptr, bytes.length);
+    const inst = e.create(ptr, bytes.length, e.key === 'tl' ? fitzModifierValue() ?? 0 : 0);
     e.free(ptr, bytes.length);
     if (!inst) { e.statsEl.textContent = `rejected ${name}`; continue; }
 

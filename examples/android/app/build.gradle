@@ -37,7 +37,8 @@ def rustOutput = file("src/main/jniLibs/arm64-v8a/libtlottie_android.so")
 tasks.register("buildRust", Exec) {
     workingDir rootProject.projectDir
     commandLine "bash", "build-rust.sh"
-    inputs.files(fileTree(rootProject.file("../../crates")) { include "**/*.rs", "**/Cargo.toml", "**/*.wgsl" })
+    inputs.files(rootProject.file("../../Cargo.toml"), rootProject.file("../../build.rs"))
+    inputs.files(fileTree(rootProject.file("../../src")) { include "**/*.rs", "**/*.wgsl" })
     inputs.files(fileTree("../native") { include "Cargo.toml", "Cargo.lock", "src/**/*.rs" })
     outputs.file(rustOutput)
 }

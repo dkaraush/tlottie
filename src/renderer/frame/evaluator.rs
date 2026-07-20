@@ -10,6 +10,7 @@ pub(crate) struct ShapeWalker<'a> {
   pub(crate) width: usize,
   pub(crate) height: usize,
   pub(crate) antialias: bool,
+  pub(crate) color_override: Option<Color>,
 }
 
 /// A paint recorded during the walk. `range` indexes the geometry arena;
@@ -390,7 +391,7 @@ impl ShapeWalker<'_> {
           self.apply_repeater(rp, m, arena, pending, scope_start, jobs_start);
         }
         Shape::Fill(f) => {
-          let color = f.color.eval(self.frame);
+          let color = self.color_override.unwrap_or_else(|| f.color.eval(self.frame));
           let fill_opacity = (f.opacity.eval(self.frame) / 100.0).clamp(0.0, 1.0);
           let paint_opacity = opacity * fill_opacity;
           if opacity_byte(color.a * paint_opacity) == 0 {
@@ -440,7 +441,7 @@ impl ShapeWalker<'_> {
         Shape::Stroke(st) => {
           let stroke_opacity = (st.opacity.eval(self.frame) / 100.0).clamp(0.0, 1.0);
           let paint_opacity = opacity * stroke_opacity;
-          let color = st.color.eval(self.frame);
+          let color = self.color_override.unwrap_or_else(|| st.color.eval(self.frame));
           if opacity_byte(color.a * paint_opacity) == 0 {
             continue;
           }

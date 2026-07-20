@@ -512,6 +512,7 @@ impl RenderCtx<'_> {
           width: canvas.w,
           height: canvas.h,
           antialias: canvas.antialias,
+          color_override: layer.color_override,
         };
         let lp = layer as *const Layer as usize;
         let is_static = *walker.scratch.static_flags.entry(lp).or_insert_with(|| crate::model::shapes_static(&layer.shapes));
@@ -561,6 +562,7 @@ impl RenderCtx<'_> {
       }
       LayerKind::Solid => {
         if let Some((sw, sh, color)) = layer.solid {
+          let color = layer.color_override.unwrap_or(color);
           let contour = rect_contour(Vec2::new(sw * 0.5, sh * 0.5), Vec2::new(sw, sh), 0.0, false, &m, self.curve_tolerance);
           let walker = ShapeWalker {
             scratch,
@@ -570,6 +572,7 @@ impl RenderCtx<'_> {
             width: canvas.w,
             height: canvas.h,
             antialias: canvas.antialias,
+            color_override: layer.color_override,
           };
           let key = walker.fill_key(core::slice::from_ref(&(contour.clone(), true)), FillRule::NonZero);
           let contours: Vec<Contour> = if walker.scratch.cov_cache.contains(key) { Vec::new() } else { vec![walker.clip_all(&contour)] };

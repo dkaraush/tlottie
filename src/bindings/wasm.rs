@@ -2,7 +2,18 @@
 
 use std::alloc::{alloc, dealloc, Layout};
 
-use crate::{CPURenderer, Composition, Limits, RenderOptions};
+use crate::{CPURenderer, Composition, FitzModifier, LayerColorReplacement, Limits, ParseOptions, RenderOptions};
+
+/// Wasm-memory representation of one layer-prefix color override.
+#[repr(C)]
+pub struct LayerColorReplacementAbi {
+  /// Pointer to UTF-8 prefix bytes.
+  pub layer_name_prefix: *const u8,
+  /// Prefix byte length.
+  pub layer_name_prefix_len: usize,
+  /// Straight-alpha color in `0xAARRGGBB` form.
+  pub color: u32,
+}
 
 /// A playing instance plus its conversion buffers.
 pub struct Instance {
@@ -53,12 +64,61 @@ pub unsafe extern "C" fn tlottie_free(ptr: *mut u8, len: usize) {
 /// filled).
 #[no_mangle]
 pub unsafe extern "C" fn tlottie_new(json_ptr: *const u8, json_len: usize) -> *mut Instance {
+  unsafe { tlottie_new_with_options(json_ptr, json_len, 0, core::ptr::null(), 0) }
+}
+
+/// Parses JSON with constructor-time Fitz and layer-prefix color options.
+///
+/// # Safety
+/// All supplied wasm-memory byte ranges and the replacement array must be
+/// readable for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn tlottie_new_with_options(
+  json_ptr: *const u8,
+  json_len: usize,
+  fitz_modifier: u32,
+  replacements_ptr: *const LayerColorReplacementAbi,
+  replacements_len: usize,
+) -> *mut Instance {
   if json_ptr.is_null() {
+    return std::ptr::null_mut();
+  }
+  let Some(fitz_modifier) = FitzModifier::from_u32(fitz_modifier) else {
+    return std::ptr::null_mut();
+  };
+  if replacements_len != 0 && replacements_ptr.is_null() {
     return std::ptr::null_mut();
   }
   // SAFETY: caller contract — the range is a live allocation.
   let json = unsafe { std::slice::from_raw_parts(json_ptr, json_len) };
-  match Composition::parse(json, &Limits::default()) {
+  let raw_replacements = if replacements_len == 0 {
+    &[]
+  } else {
+    unsafe { std::slice::from_raw_parts(replacements_ptr, replacements_len) }
+  };
+  let mut layer_color_replacements = Vec::with_capacity(raw_replacements.len());
+  for replacement in raw_replacements {
+    if replacement.layer_name_prefix_len != 0 && replacement.layer_name_prefix.is_null() {
+      return std::ptr::null_mut();
+    }
+    let bytes = if replacement.layer_name_prefix_len == 0 {
+      &[]
+    } else {
+      unsafe { std::slice::from_raw_parts(replacement.layer_name_prefix, replacement.layer_name_prefix_len) }
+    };
+    let Ok(prefix) = std::str::from_utf8(bytes) else {
+      return std::ptr::null_mut();
+    };
+    layer_color_replacements.push(LayerColorReplacement {
+      layer_name_prefix: prefix.to_owned(),
+      color: replacement.color,
+    });
+  }
+  let options = ParseOptions {
+    fitz_modifier,
+    layer_color_replacements,
+  };
+  match Composition::parse_with_options(json, &Limits::default(), &options) {
     Ok(comp) => Box::into_raw(Box::new(Instance {
       anim: CPURenderer::new(comp),
       argb: Vec::new(),

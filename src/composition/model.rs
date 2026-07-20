@@ -102,6 +102,10 @@ pub(crate) struct Mask {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Layer {
+  /// `nm` — used to resolve constructor-time prefix color replacements.
+  pub name: String,
+  /// Constructor-time color override inherited by this layer's descendants.
+  pub color_override: Option<Color>,
   pub kind: LayerKind,
   /// `ind` — this layer's id for parenting.
   pub index: i32,

@@ -57,7 +57,20 @@ fn walk_frame(comp: &Composition, frame_index: f32, width: u32, height: u32, opt
     antialias: options.antialias,
     curve_tolerance: options.curve_tolerance,
   };
-  ctx.collect_layers(scratch, width as usize, height as usize, options.antialias, &comp.layers, base, frame, 1.0, &Vec::new(), 0, renderer)
+  ctx.collect_layers(
+    scratch,
+    width as usize,
+    height as usize,
+    options.antialias,
+    &comp.layers,
+    base,
+    frame,
+    1.0,
+    None,
+    &Vec::new(),
+    0,
+    renderer,
+  )
 }
 
 fn rule_of(rule: FillRule) -> Rule {
@@ -118,6 +131,7 @@ impl RenderCtx<'_> {
     base: Mat2x3,
     frame: f32,
     opacity: f32,
+    inherited_color: Option<Color>,
     clip: &ClipQuad,
     precomp_depth: usize,
     renderer: &mut impl FrameRenderer,
@@ -161,10 +175,10 @@ impl RenderCtx<'_> {
         // A matte source's layer opacity applies to its flattened result, not
         // independently to every child of a precomp. Carry it into the fused
         // matte composite instead of distributing it through the source tree.
-        self.collect_layer_content(scratch, width, height, antialias, src, source_matrix, frame, 1.0, clip, precomp_depth, renderer)?;
+        self.collect_layer_content(scratch, width, height, antialias, src, source_matrix, frame, 1.0, inherited_color, clip, precomp_depth, renderer)?;
         self.collect_masks(width, height, src, source_matrix, frame, clip, renderer);
         renderer.save_layer();
-        self.collect_layer_content(scratch, width, height, antialias, layer, m, frame, 1.0, clip, precomp_depth, renderer)?;
+        self.collect_layer_content(scratch, width, height, antialias, layer, m, frame, 1.0, inherited_color, clip, precomp_depth, renderer)?;
         self.collect_masks(width, height, layer, m, frame, clip, renderer);
         renderer.end_layer(Composite::Matte {
           kind,
@@ -200,6 +214,7 @@ impl RenderCtx<'_> {
         m,
         frame,
         if isolate { 1.0 } else { combined_opacity },
+        inherited_color,
         clip,
         precomp_depth,
         renderer,
@@ -225,6 +240,7 @@ impl RenderCtx<'_> {
     m: Mat2x3,
     frame: f32,
     content_opacity: f32,
+    inherited_color: Option<Color>,
     clip: &ClipQuad,
     precomp_depth: usize,
     renderer: &mut impl FrameRenderer,
@@ -232,6 +248,7 @@ impl RenderCtx<'_> {
     if opacity_byte(content_opacity) == 0 {
       return Ok(());
     }
+    let color_override = layer.color_override.or(inherited_color);
     match layer.kind {
       LayerKind::Shape => {
         let mut walker = ShapeWalker {
@@ -242,6 +259,7 @@ impl RenderCtx<'_> {
           width,
           height,
           antialias,
+          color_override,
         };
         let (arena, pending) = walker.walk_shapes(&layer.shapes, m, content_opacity, 0)?;
         walker.collect_shape_jobs(&arena, &pending, renderer);
@@ -251,6 +269,7 @@ impl RenderCtx<'_> {
       }
       LayerKind::Solid => {
         if let Some((sw, sh, color)) = layer.solid {
+          let color = color_override.unwrap_or(color);
           let contour = rect_contour(Vec2::new(sw * 0.5, sh * 0.5), Vec2::new(sw, sh), 0.0, false, &m, self.curve_tolerance);
           let contours = core::slice::from_ref(&contour);
           let key = geometry_key(contours, Rule::NonZero, width, height, antialias);
@@ -296,6 +315,7 @@ impl RenderCtx<'_> {
           m,
           child_frame,
           content_opacity,
+          color_override,
           &child_clip,
           precomp_depth + 1,
           renderer,

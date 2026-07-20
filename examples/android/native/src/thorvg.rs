@@ -203,3 +203,4 @@ impl Drop for ThorvgCpu {
         }
     }
 }
+

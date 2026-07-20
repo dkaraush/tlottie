@@ -197,6 +197,24 @@ impl<T: Lerp> Property<T> {
     }
   }
 
+  pub(crate) fn map_values(&mut self, mut map: impl FnMut(&mut T)) {
+    match self {
+      Property::Static(value) => map(value),
+      Property::Animated(timeline) => {
+        map(&mut timeline.first.value);
+        if let Some(end) = &mut timeline.first.end {
+          map(end);
+        }
+        for keyframe in &mut timeline.rest {
+          map(&mut keyframe.value);
+          if let Some(end) = &mut keyframe.end {
+            map(end);
+          }
+        }
+      }
+    }
+  }
+
   #[cfg(test)]
   pub fn is_static(&self) -> bool {
     matches!(self, Property::Static(_))

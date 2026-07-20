@@ -234,7 +234,10 @@ def shutil_which(name: str) -> str | None:
 
 
 def discover(root: Path, limit: int | None) -> list[Path]:
-    files = sorted(p for p in root.rglob("*.json") if p.is_file())
+    if root.is_file():
+        files = [root] if root.suffix.lower() == ".json" else []
+    else:
+        files = sorted(p for p in root.rglob("*.json") if p.is_file())
     return files[:limit] if limit else files
 
 
