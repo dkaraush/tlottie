@@ -121,6 +121,7 @@ pub(crate) fn flatten_path_reusing(data: &PathData, m: &Mat2x3, tolerance: f32, 
     let c1 = m.apply(Vec2::new(p0.x + tan_out(i0).x, p0.y + tan_out(i0).y));
     let c2 = m.apply(Vec2::new(p1.x + tan_in(i1).x, p1.y + tan_in(i1).y));
     let p1d = m.apply(p1);
+    let segment_start = points.len().saturating_sub(1);
     // Straight-line fast path: zero tangents.
     let t_out = tan_out(i0);
     let t_in = tan_in(i1);
@@ -129,12 +130,48 @@ pub(crate) fn flatten_path_reusing(data: &PathData, m: &Mat2x3, tolerance: f32, 
       anchors.push(true);
     } else {
       flatten_cubic(points, anchors, prev_dev, c1, c2, p1d, tolerance);
+      // Open stroke caps use the first/last flattened chord direction.
+      // Pin those chords to the authored cubic endpoint tangents so two
+      // separately-authored butt-capped curves which meet C1-continuously
+      // cannot expose a triangular gap from independent flattening.
+      if !data.closed && s == 0 && points.len() > segment_start + 1 {
+        let tangent = if (c1.x - prev_dev.x).abs() + (c1.y - prev_dev.y).abs() > 1e-6 {
+          Vec2::new(c1.x - prev_dev.x, c1.y - prev_dev.y)
+        } else {
+          Vec2::new(c2.x - prev_dev.x, c2.y - prev_dev.y)
+        };
+        align_endpoint_chord(points, segment_start, segment_start + 1, tangent, false);
+      }
+      if !data.closed && s + 1 == segs && points.len() > segment_start + 1 {
+        let end = points.len() - 1;
+        let tangent = if (p1d.x - c2.x).abs() + (p1d.y - c2.y).abs() > 1e-6 {
+          Vec2::new(p1d.x - c2.x, p1d.y - c2.y)
+        } else {
+          Vec2::new(p1d.x - c1.x, p1d.y - c1.y)
+        };
+        align_endpoint_chord(points, end, end - 1, tangent, true);
+      }
     }
     prev_dev = p1d;
   }
   let inv = m.inverse();
   contour.inv_lin = Some([inv.a, inv.b, inv.c, inv.d]);
   contour
+}
+
+fn align_endpoint_chord(points: &mut [Vec2], endpoint: usize, neighbor: usize, tangent: Vec2, reverse: bool) {
+  let len = (tangent.x * tangent.x + tangent.y * tangent.y).sqrt();
+  let Some((&end, old)) = points.get(endpoint).zip(points.get(neighbor).copied()) else {
+    return;
+  };
+  let chord = ((old.x - end.x) * (old.x - end.x) + (old.y - end.y) * (old.y - end.y)).sqrt();
+  if !(len > 1e-6 && chord > 0.0 && len.is_finite() && chord.is_finite()) {
+    return;
+  }
+  let sign = if reverse { -1.0 } else { 1.0 };
+  if let Some(point) = points.get_mut(neighbor) {
+    *point = Vec2::new(end.x + sign * tangent.x * chord / len, end.y + sign * tangent.y * chord / len);
+  }
 }
 
 /// Ellipse centered at `pos` with `size` (width/height), as 4 cubic arcs.

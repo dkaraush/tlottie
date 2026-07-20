@@ -9,16 +9,25 @@
 //!   full validation happens where a subtree is actually parsed.
 
 use crate::error::{Error, JsonErrorKind, Limit, Result};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 pub(crate) struct Cursor<'a> {
   bytes: &'a [u8],
   pos: usize,
   max_depth: usize,
+  easing_cache: Rc<RefCell<HashMap<String, [f32; 4]>>>,
 }
 
 impl<'a> Cursor<'a> {
   pub fn new(bytes: &'a [u8], max_depth: usize) -> Self {
-    Self { bytes, pos: 0, max_depth }
+    Self {
+      bytes,
+      pos: 0,
+      max_depth,
+      easing_cache: Rc::new(RefCell::new(HashMap::new())),
+    }
   }
 
   pub fn pos(&self) -> usize {
@@ -33,7 +42,21 @@ impl<'a> Cursor<'a> {
       bytes: self.bytes,
       pos,
       max_depth: self.max_depth,
+      easing_cache: Rc::clone(&self.easing_cache),
     }
+  }
+
+  /// Matches the per-composition interpolator cache used by rlottie and
+  /// ThorVG. Nearby curves share the first exact controls registered under
+  /// their two-decimal cache key.
+  pub fn intern_easing(&self, controls: [f32; 4]) -> [f32; 4] {
+    let key = format!("{:.2}_{:.2}_{:.2}_{:.2}", controls[0], controls[1], controls[2], controls[3]);
+    let mut cache = self.easing_cache.borrow_mut();
+    if let Some(easing) = cache.get(&key) {
+      return *easing;
+    }
+    cache.insert(key, controls);
+    controls
   }
 
   fn err(&self, kind: JsonErrorKind) -> Error {
@@ -231,5 +254,17 @@ mod tests {
       let expected = token.parse::<f64>().expect("valid number");
       assert_eq!(parsed.to_bits(), expected.to_bits(), "{token}");
     }
+  }
+
+  #[test]
+  fn easing_cache_reuses_first_curve_across_forked_cursors() {
+    let cursor = Cursor::new(b"", 8);
+    let fork = cursor.fork_at(0);
+    let first = [0.809, 0.0, 0.667, 1.0];
+    assert_eq!(cursor.intern_easing(first), first);
+    // Both outgoing X values format to 0.81, matching the compatibility
+    // cache key used by rlottie and ThorVG.
+    assert_eq!(fork.intern_easing([0.814, 0.0, 0.667, 1.0]), first);
+    assert_eq!(fork.intern_easing([0.821, 0.0, 0.667, 1.0]), [0.821, 0.0, 0.667, 1.0]);
   }
 }

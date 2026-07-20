@@ -273,8 +273,19 @@ pub(crate) fn stroke_outline(
       // orientations). Degenerate self-retracing dot paths emit two
       // SAME-sign displaced discs whose union is the disc rlottie
       // draws — dropping one carved half-moons out of NewsEmoji's
-      // planets.
-      x1 >= x0 && y1 >= y0 && (x1 - x0).max(y1 - y0) <= 2.0 * hw && ring_area(&b0.pts) * ring_area(&b1.pts) < 0.0
+      // round planets. Elongated closed strokes still need both loops.
+      let width = x1 - x0;
+      let height = y1 - y0;
+      let max_dim = width.max(height);
+      let min_dim = width.min(height);
+      x1 >= x0
+        && y1 >= y0
+        && max_dim <= 2.0 * hw
+        // Fully inverted round dots collapse to discs in rlottie. Strongly
+        // elongated ellipses retain the inset loop, which is visible as the
+        // nested candle rings in TenYearsOfTelegram.
+        && min_dim >= 0.9 * max_dim
+        && ring_area(&b0.pts) * ring_area(&b1.pts) < 0.0
     };
     let keep_b0 = if drop_inner { ring_area(&b0.pts).abs() >= ring_area(&b1.pts).abs() } else { true };
     for (ring, keep) in [(b0.pts, keep_b0), (b1.pts, !drop_inner || !keep_b0)] {

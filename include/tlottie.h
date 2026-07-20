@@ -41,6 +41,21 @@ int32_t tlottie_render(
     size_t out_len,
     uint32_t antialias);
 
+/*
+ * Like tlottie_render, with an explicit maximum curve-flattening error in
+ * device pixels. curve_tolerance must be finite and greater than zero.
+ * Smaller values improve geometric accuracy at a performance cost.
+ */
+int32_t tlottie_render_with_options(
+    TLottieInstance *renderer,
+    float frame,
+    uint32_t width,
+    uint32_t height,
+    uint32_t *out,
+    size_t out_len,
+    uint32_t antialias,
+    float curve_tolerance);
+
 #ifdef __cplusplus
 }
 #endif

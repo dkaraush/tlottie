@@ -49,8 +49,8 @@
   #stats { font-variant-numeric: tabular-nums; min-width: 11em; text-align: right; }
   #statsrow label { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px; }
   #statsrow input { cursor: pointer; }
-  #sizeslider { width: 120px; accent-color: #4a90d9; }
-  #sizeval { min-width: 4.5em; font-variant-numeric: tabular-nums; }
+  #sizeslider, #curvetolerance { width: 120px; accent-color: #4a90d9; }
+  #sizeval, #curvetoleranceval { min-width: 4.5em; font-variant-numeric: tabular-nums; }
   #err { color: #d9534f; }
   input[type=file] { display: none; }
 </style>
@@ -90,6 +90,10 @@
   <span id="stats"></span>
   <label><input type="checkbox" id="capfps"> cap to file fps</label>
   <label><input type="checkbox" id="antialias" checked> tlottie antialiasing</label>
+  <label>tlottie curve tolerance
+    <input type="range" id="curvetolerance" min="0.05" max="0.5" step="0.025" value="0.125">
+    <span id="curvetoleranceval">0.125 px</span>
+  </label>
   <label>size <input type="range" id="sizeslider" min="64" max="1024" step="32">
     <span id="sizeval"></span></label>
 </div>

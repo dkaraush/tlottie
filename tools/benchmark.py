@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """Benchmark tlottie, rlottie variants, and ThorVG via native libraries.
 
-The runner processes one renderer+canvas-size batch at a time so package energy
-counters, when available, can be attributed to that batch. Within each batch it
-uses many worker processes, and each worker loads the native library once.
+The runner processes one renderer+canvas-size batch at a time so memory and
+package energy counters, when available, can be attributed to that renderer.
+Within each batch it uses many worker processes, and each worker loads only the
+native library being measured.
 
 Energy: on Linux, RAPL package energy is read around the batch and prorated per
 row by measured time. On macOS (Apple Silicon), per-task consumed energy
 (task_info TASK_POWER_INFO_V2.task_energy, the Activity Monitor source) is
 sampled around each renderer run inside the worker, giving direct per-row
-attribution. Memory on macOS is sampled via proc_pid_rusage resident size.
+attribution. Memory on macOS is sampled via proc_pid_rusage physical footprint.
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+from contextlib import contextmanager, ExitStack
 import ctypes as C
 import html
 import json
@@ -24,13 +26,21 @@ import os
 from pathlib import Path
 import platform
 import re
+import shlex
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Any
+from urllib.parse import quote
 import webbrowser
 import zlib
+
+try:
+    import numpy as np
+except ImportError:  # Keep the benchmark usable with the Python standard library only.
+    np = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +51,14 @@ DEFAULT_SIZES = (64, 320, 720)
 DEFAULT_RENDERERS = ("tlottie", "rlottie", "rlottie_2019", "rlottie_2019_patched", "thorvg")
 RENDERERS = DEFAULT_RENDERERS + ("tlottie-vulkan",)
 RLOTTIE_RENDERERS = ("rlottie", "rlottie_2019", "rlottie_2019_patched")
+RENDERER_URLS = {
+    "tlottie": "https://github.com/dkaraush/tlottie",
+    "tlottie-vulkan": "https://github.com/dkaraush/tlottie",
+    "rlottie": "https://github.com/Samsung/rlottie",
+    "rlottie_2019": "https://github.com/TelegramMessenger/rlottie",
+    "rlottie_2019_patched": "https://github.com/dkaraush/rlottie",
+    "thorvg": "https://github.com/thorvg/thorvg",
+}
 PROJECT_DIRS = {
     "rlottie": PROJECTS / "rlottie",
     "rlottie_2019": PROJECTS / "rlottie_2019",
@@ -321,19 +339,34 @@ if platform.system() == "Darwin":
             _LIBSYSTEM = None
 
 
-def rss_mb() -> float:
+def process_memory_mb(pid: int) -> float:
+    """Return the process memory metric used by the benchmark, in MiB.
+
+    macOS's resident size includes shared/mapped pages and is a misleading
+    comparison between native libraries.  ``ri_phys_footprint`` is the kernel's
+    accounting of the process's attributable physical memory and is the value
+    Activity Monitor uses for its Memory column.  Linux has no direct
+    equivalent available here, so retain current RSS there.
+
+    The historical ``rss_mb`` helper and raw-output ``*_rss_*`` aliases are
+    retained for compatibility with existing benchmark consumers.
+    """
     if _LIBPROC is not None:
         info = _RusageInfoV2()
-        if _LIBPROC.proc_pid_rusage(os.getpid(), _RUSAGE_INFO_V2, C.byref(info)) == 0:
-            return info.ri_resident_size / 1048576.0
+        if _LIBPROC.proc_pid_rusage(pid, _RUSAGE_INFO_V2, C.byref(info)) == 0:
+            return info.ri_phys_footprint / 1048576.0
         return 0.0
     try:
-        for line in Path("/proc/self/status").read_text().splitlines():
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
             if line.startswith("VmRSS:"):
                 return float(line.split()[1]) / 1024.0
     except OSError:
         pass
     return 0.0
+
+
+def rss_mb() -> float:
+    return process_memory_mb(os.getpid())
 
 
 def task_energy_nj() -> int | None:
@@ -382,9 +415,26 @@ class EnergySampler:
             return 0
 
 
+class FrameStream:
+    """A random-access facade over one live renderer animation."""
+
+    def __init__(self, count: int, render: Any) -> None:
+        self.count = count
+        self.render = render
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __getitem__(self, frame: int) -> Any:
+        if frame < 0 or frame >= self.count:
+            raise IndexError(frame)
+        return self.render(frame)
+
+
 class Tlottie:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, curve_tolerance: float = 0.125) -> None:
         self.lib = C.CDLL(str(path))
+        self.curve_tolerance = curve_tolerance
         self.lib.tlottie_new.argtypes = [C.c_void_p, C.c_size_t]
         self.lib.tlottie_new.restype = C.c_void_p
         self.lib.tlottie_drop.argtypes = [C.c_void_p]
@@ -400,6 +450,63 @@ class Tlottie:
             C.c_uint32,
         ]
         self.lib.tlottie_render.restype = C.c_int
+        self.lib.tlottie_render_with_options.argtypes = [
+            C.c_void_p,
+            C.c_float,
+            C.c_uint32,
+            C.c_uint32,
+            C.POINTER(C.c_uint32),
+            C.c_size_t,
+            C.c_uint32,
+            C.c_float,
+        ]
+        self.lib.tlottie_render_with_options.restype = C.c_int
+
+    def _render(
+        self,
+        anim: Any,
+        frame: float,
+        width: int,
+        height: int,
+        pixels: Any,
+        out_len: int,
+        antialias: int,
+    ) -> int:
+        return int(
+            self.lib.tlottie_render_with_options(
+                anim,
+                frame,
+                width,
+                height,
+                pixels,
+                out_len,
+                antialias,
+                self.curve_tolerance,
+            )
+        )
+
+    @contextmanager
+    def frame_stream(self, file: Path, size: int) -> Any:
+        data = file.read_bytes()
+        buf = C.create_string_buffer(data)
+        anim = self.lib.tlottie_new(buf, len(data))
+        if not anim:
+            raise RuntimeError("parse")
+        pixels = (C.c_uint32 * (size * size))()
+        count = max(1, int(self.lib.tlottie_frame_count(anim)))
+
+        def render(frame: int) -> Any:
+            rc = self._render(
+                anim, float(frame % count), size, size, pixels, size * size, 1
+            )
+            if rc != 0:
+                raise RuntimeError(f"render:{rc}@{frame}")
+            return memoryview(pixels)
+
+        try:
+            yield FrameStream(count, render)
+        finally:
+            self.lib.tlottie_drop(anim)
 
     def measure(
         self, file: Path, size: int, frames: int
@@ -415,7 +522,7 @@ class Tlottie:
             count = max(1, int(self.lib.tlottie_frame_count(anim)))
             frames = count if frames <= 0 else frames
             rss_samples: list[float] = []
-            rc = self.lib.tlottie_render(
+            rc = self._render(
                 anim, 0.0, size, size, pixels, size * size, 1
             )
             first_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
@@ -434,7 +541,7 @@ class Tlottie:
                     if not anim:
                         render_ns += time.perf_counter_ns() - t1
                         return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "parse"
-                rc = self.lib.tlottie_render(
+                rc = self._render(
                     anim, frame, size, size, pixels, size * size, 1
                 )
                 render_ns += time.perf_counter_ns() - t1
@@ -457,7 +564,7 @@ class Tlottie:
         pixels = (C.c_uint32 * (size * size))()
         try:
             count = max(1, int(self.lib.tlottie_frame_count(anim)))
-            rc = self.lib.tlottie_render(
+            rc = self._render(
                 anim, float(frame % count), size, size, pixels, size * size, 1
             )
             if rc != 0:
@@ -467,7 +574,9 @@ class Tlottie:
             if anim:
                 self.lib.tlottie_drop(anim)
 
-    def render_frames_argb(self, file: Path, size: int) -> tuple[bool, list[list[int]], int, str]:
+    def render_frames_argb(
+        self, file: Path, size: int, max_frames: int = 0
+    ) -> tuple[bool, list[bytes], int, str]:
         data = file.read_bytes()
         buf = C.create_string_buffer(data)
         anim = self.lib.tlottie_new(buf, len(data))
@@ -477,13 +586,14 @@ class Tlottie:
         try:
             count = max(1, int(self.lib.tlottie_frame_count(anim)))
             frames = []
-            for frame in range(count):
-                rc = self.lib.tlottie_render(
+            render_count = min(count, max_frames) if max_frames > 0 else count
+            for frame in range(render_count):
+                rc = self._render(
                     anim, float(frame), size, size, pixels, size * size, 1
                 )
                 if rc != 0:
                     return False, [], count, f"render:{rc}@{frame}"
-                frames.append(list(pixels))
+                frames.append(bytes(pixels))
             return True, frames, count, ""
         finally:
             self.lib.tlottie_drop(anim)
@@ -503,7 +613,7 @@ class Tlottie:
             frames = count if frames <= 0 else frames
             rss_samples: list[float] = []
             out_frames: list[list[int]] = []
-            rc = self.lib.tlottie_render(
+            rc = self._render(
                 anim, 0.0, size, size, pixels, size * size, 1
             )
             first_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
@@ -522,7 +632,7 @@ class Tlottie:
                     if not anim:
                         render_ns += time.perf_counter_ns() - t1
                         return False, first_ms, None, i - 1, rss_mb(), rss_mb(), "parse", [], count
-                rc = self.lib.tlottie_render(
+                rc = self._render(
                     anim, float(i % count), size, size, pixels, size * size, 1
                 )
                 render_ns += time.perf_counter_ns() - t1
@@ -559,8 +669,9 @@ class TlottieVulkan:
         r"VK .*?record_ns=(\d+) submit_wait_ns=(\d+) gpu_elapsed_ns=(\d+)"
     )
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, curve_tolerance: float = 0.125) -> None:
         self.cli = path
+        self.curve_tolerance = curve_tolerance
 
     @staticmethod
     def frame_count(file: Path) -> int:
@@ -575,30 +686,36 @@ class TlottieVulkan:
     ) -> tuple[bool, float, float | None, int, float, float, str]:
         count = self.frame_count(file)
         frames = count if frames <= 0 else max(1, frames)
-        memory = rss_mb()
-        ok, samples, _pixels, error = self._run_sequence(file, size, 0, frames, False)
+        ok, samples, _pixels, error, mem_avg, mem_max = self._run_sequence(
+            file, size, 0, frames, False
+        )
         if not ok:
-            return False, 0.0, None, 0, memory, memory, error
+            return False, 0.0, None, 0, mem_avg, mem_max, error
         return (
             True,
             samples[0],
             avg(samples[1:]) if len(samples) > 1 else None,
             len(samples) - 1,
-            memory,
-            memory,
+            mem_avg,
+            mem_max,
             "",
         )
 
     def render_argb(self, file: Path, size: int, frame: int) -> tuple[bool, list[int], str]:
         count = self.frame_count(file)
-        ok, _samples, frames, error = self._run_sequence(
+        ok, _samples, frames, error, _mem_avg, _mem_max = self._run_sequence(
             file, size, frame % count, 1, True
         )
         return (True, frames[0], "") if ok and frames else (False, [], error)
 
-    def render_frames_argb(self, file: Path, size: int) -> tuple[bool, list[list[int]], int, str]:
+    def render_frames_argb(
+        self, file: Path, size: int, max_frames: int = 0
+    ) -> tuple[bool, list[bytes], int, str]:
         count = self.frame_count(file)
-        ok, _samples, frames, error = self._run_sequence(file, size, 0, count, True)
+        render_count = min(count, max_frames) if max_frames > 0 else count
+        ok, _samples, frames, error, _mem_avg, _mem_max = self._run_sequence(
+            file, size, 0, render_count, True
+        )
         return ok, frames, count, error
 
     def measure_frames_argb(
@@ -606,17 +723,18 @@ class TlottieVulkan:
     ) -> tuple[bool, float, float | None, int, float, float, str, list[list[int]], int]:
         count = self.frame_count(file)
         frames = count if frames <= 0 else max(1, frames)
-        memory = rss_mb()
-        ok, samples, pixels, error = self._run_sequence(file, size, 0, frames, True)
+        ok, samples, pixels, error, mem_avg, mem_max = self._run_sequence(
+            file, size, 0, frames, True
+        )
         if not ok:
-            return False, 0.0, None, 0, memory, memory, error, [], count
+            return False, 0.0, None, 0, mem_avg, mem_max, error, [], count
         return (
             True,
             samples[0],
             avg(samples[1:]) if len(samples) > 1 else None,
             len(samples) - 1,
-            memory,
-            memory,
+            mem_avg,
+            mem_max,
             "",
             pixels,
             count,
@@ -624,7 +742,7 @@ class TlottieVulkan:
 
     def _run_sequence(
         self, file: Path, size: int, start: int, frames: int, capture: bool
-    ) -> tuple[bool, list[float], list[list[int]], str]:
+    ) -> tuple[bool, list[float], list[list[int]], str, float, float]:
         env = os.environ.copy()
         env["TLOTTIE_VK_FRAMES"] = str(frames)
         with tempfile.TemporaryDirectory(prefix="tlottie-vulkan-") as temp:
@@ -633,32 +751,48 @@ class TlottieVulkan:
             raw_dir = directory / "raw"
             if capture:
                 env["TLOTTIE_VK_RAW_DIR"] = str(raw_dir)
-            proc = subprocess.run(
-                [
-                    str(self.cli),
-                    "render",
-                    "--backend",
-                    "vulkan",
-                    "--antialias",
-                    str(file),
-                    str(start),
-                    str(size),
-                    str(out),
-                ],
-                cwd=ROOT,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            memory_samples: list[float] = []
+            with tempfile.TemporaryFile() as stderr_file:
+                proc = subprocess.Popen(
+                    [
+                        str(self.cli),
+                        "render",
+                        "--backend",
+                        "vulkan",
+                        "--antialias",
+                        "--curve-tolerance",
+                        str(self.curve_tolerance),
+                        str(file),
+                        str(start),
+                        str(size),
+                        str(out),
+                    ],
+                    cwd=ROOT,
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_file,
+                )
+                while proc.poll() is None:
+                    memory = process_memory_mb(proc.pid)
+                    if memory > 0.0:
+                        memory_samples.append(memory)
+                    time.sleep(0.001)
+                memory = process_memory_mb(proc.pid)
+                if memory > 0.0:
+                    memory_samples.append(memory)
+                stderr_file.seek(0)
+                stderr = stderr_file.read().decode(errors="replace")
+            mem_avg = avg(memory_samples)
+            mem_max = max(memory_samples, default=0.0)
             if proc.returncode != 0:
-                return False, [], [], proc.stderr.strip()[-500:]
+                return False, [], [], stderr.strip()[-500:], mem_avg, mem_max
             samples = [
                 (int(record_ns) + int(submit_ns)) / 1_000_000.0
-                for record_ns, submit_ns, _gpu_ns in self.FRAME_RE.findall(proc.stderr)
+                for record_ns, submit_ns, _gpu_ns in self.FRAME_RE.findall(stderr)
             ]
             if len(samples) != frames:
-                return False, [], [], f"expected {frames} Vulkan samples, got {len(samples)}"
+                error = f"expected {frames} Vulkan samples, got {len(samples)}"
+                return False, [], [], error, mem_avg, mem_max
             pixels = []
             if capture:
                 pixel_count = size * size
@@ -668,11 +802,12 @@ class TlottieVulkan:
                     try:
                         data = path.read_bytes()
                     except OSError as error:
-                        return False, [], [], f"read {path.name}: {error}"
+                        return False, [], [], f"read {path.name}: {error}", mem_avg, mem_max
                     if len(data) != expected_bytes:
-                        return False, [], [], f"{path.name}: {len(data)} != {expected_bytes} bytes"
-                    pixels.append(list(struct.unpack(f"<{pixel_count}I", data)))
-            return True, samples, pixels, ""
+                        error = f"{path.name}: {len(data)} != {expected_bytes} bytes"
+                        return False, [], [], error, mem_avg, mem_max
+                    pixels.append(data)
+            return True, samples, pixels, "", mem_avg, mem_max
 
 
 class Rlottie:
@@ -693,6 +828,25 @@ class Rlottie:
             C.c_size_t,
             C.c_size_t,
         ]
+
+    @contextmanager
+    def frame_stream(self, file: Path, size: int) -> Any:
+        anim = self.lib.lottie_animation_from_file(os.fsencode(file))
+        if not anim:
+            raise RuntimeError("parse")
+        pixels = (C.c_uint32 * (size * size))()
+        count = max(1, int(self.lib.lottie_animation_get_totalframe(anim)))
+
+        def render(frame: int) -> Any:
+            self.lib.lottie_animation_render(
+                anim, frame % count, pixels, size, size, size * 4
+            )
+            return memoryview(pixels)
+
+        try:
+            yield FrameStream(count, render)
+        finally:
+            self.lib.lottie_animation_destroy(anim)
 
     def measure(
         self, file: Path, size: int, frames: int
@@ -745,7 +899,9 @@ class Rlottie:
             if anim:
                 self.lib.lottie_animation_destroy(anim)
 
-    def render_frames_argb(self, file: Path, size: int) -> tuple[bool, list[list[int]], int, str]:
+    def render_frames_argb(
+        self, file: Path, size: int, max_frames: int = 0
+    ) -> tuple[bool, list[bytes], int, str]:
         anim = self.lib.lottie_animation_from_file(os.fsencode(file))
         if not anim:
             return False, [], 0, "parse"
@@ -753,9 +909,10 @@ class Rlottie:
         try:
             count = max(1, int(self.lib.lottie_animation_get_totalframe(anim)))
             frames = []
-            for frame in range(count):
+            render_count = min(count, max_frames) if max_frames > 0 else count
+            for frame in range(render_count):
                 self.lib.lottie_animation_render(anim, frame, pixels, size, size, size * 4)
-                frames.append(list(pixels))
+                frames.append(bytes(pixels))
             return True, frames, count, ""
         finally:
             self.lib.lottie_animation_destroy(anim)
@@ -842,6 +999,47 @@ class Thorvg:
         self.lib.tvg_canvas_update.argtypes = [C.c_void_p]
         self.lib.tvg_canvas_draw.argtypes = [C.c_void_p, C.c_bool]
         self.lib.tvg_canvas_sync.argtypes = [C.c_void_p]
+
+    @contextmanager
+    def frame_stream(self, file: Path, size: int) -> Any:
+        anim = self.lib.tvg_animation_new()
+        if not anim:
+            raise RuntimeError("new")
+        canvas = None
+        try:
+            pic = self.lib.tvg_animation_get_picture(anim)
+            if not pic or self.lib.tvg_picture_load(pic, os.fsencode(file)) != self.SUCCESS:
+                raise RuntimeError("parse")
+            self.lib.tvg_picture_set_size(pic, float(size), float(size))
+            total = C.c_float(0.0)
+            self.lib.tvg_animation_get_total_frame(anim, C.byref(total))
+            count = max(1, int(total.value))
+            pixels = (C.c_uint32 * (size * size))()
+            canvas = self.lib.tvg_swcanvas_create(self.ENGINE_NONE)
+            if not canvas:
+                raise RuntimeError("canvas")
+            if (
+                self.lib.tvg_swcanvas_set_target(
+                    canvas, pixels, size, size, size, self.ARGB8888
+                )
+                != self.SUCCESS
+            ):
+                raise RuntimeError("target")
+            if self.lib.tvg_canvas_add(canvas, pic) != self.SUCCESS:
+                raise RuntimeError("add")
+
+            def render(frame: int) -> Any:
+                self.lib.tvg_animation_set_frame(anim, float(frame % count))
+                self.lib.tvg_canvas_update(canvas)
+                self.lib.tvg_canvas_draw(canvas, True)
+                self.lib.tvg_canvas_sync(canvas)
+                return memoryview(pixels)
+
+            yield FrameStream(count, render)
+        finally:
+            if canvas:
+                self.lib.tvg_canvas_destroy(canvas)
+            self.lib.tvg_animation_del(anim)
 
     def measure(
         self, file: Path, size: int, frames: int
@@ -964,7 +1162,9 @@ class Thorvg:
             if anim:
                 self.lib.tvg_animation_del(anim)
 
-    def render_frames_argb(self, file: Path, size: int) -> tuple[bool, list[list[int]], int, str]:
+    def render_frames_argb(
+        self, file: Path, size: int, max_frames: int = 0
+    ) -> tuple[bool, list[bytes], int, str]:
         anim = self.lib.tvg_animation_new()
         if not anim:
             return False, [], 0, "new"
@@ -989,12 +1189,13 @@ class Thorvg:
             if self.lib.tvg_canvas_add(canvas, pic) != self.SUCCESS:
                 return False, [], count, "add"
             frames = []
-            for frame in range(count):
+            render_count = min(count, max_frames) if max_frames > 0 else count
+            for frame in range(render_count):
                 self.lib.tvg_animation_set_frame(anim, float(frame))
                 self.lib.tvg_canvas_update(canvas)
                 self.lib.tvg_canvas_draw(canvas, True)
                 self.lib.tvg_canvas_sync(canvas)
-                frames.append(list(pixels))
+                frames.append(bytes(pixels))
             return True, frames, count, ""
         finally:
             if canvas:
@@ -1117,6 +1318,7 @@ _WORKER_ACCURACY_ENABLED = False
 _WORKER_ACCURACY_SIZE = 64
 _WORKER_ACCURACY_TOLERANCE = 8
 _WORKER_ACCURACY_DIFF_THRESHOLD = 1.0
+_WORKER_CURVE_TOLERANCE = 0.125
 
 
 def init_worker(
@@ -1130,9 +1332,10 @@ def init_worker(
     accuracy_size: int,
     accuracy_tolerance: int,
     accuracy_diff_threshold: float,
+    curve_tolerance: float,
 ) -> None:
     global _WORKER_RENDERERS, _WORKER_RENDERER_ORDER, _WORKER_SIZE, _WORKER_FRAMES, _WORKER_ROOT, _WORKER_REPS
-    global _WORKER_ACCURACY_ENABLED, _WORKER_ACCURACY_SIZE, _WORKER_ACCURACY_TOLERANCE, _WORKER_ACCURACY_DIFF_THRESHOLD
+    global _WORKER_ACCURACY_ENABLED, _WORKER_ACCURACY_SIZE, _WORKER_ACCURACY_TOLERANCE, _WORKER_ACCURACY_DIFF_THRESHOLD, _WORKER_CURVE_TOLERANCE
     _WORKER_RENDERERS = {}
     _WORKER_RENDERER_ORDER = renderers
     _WORKER_SIZE = size
@@ -1143,12 +1346,13 @@ def init_worker(
     _WORKER_ACCURACY_SIZE = accuracy_size
     _WORKER_ACCURACY_TOLERANCE = accuracy_tolerance
     _WORKER_ACCURACY_DIFF_THRESHOLD = accuracy_diff_threshold
+    _WORKER_CURVE_TOLERANCE = curve_tolerance
     for renderer in renderers:
         lib = Path(libs[renderer])
         if renderer == "tlottie":
-            _WORKER_RENDERERS[renderer] = Tlottie(lib)
+            _WORKER_RENDERERS[renderer] = Tlottie(lib, curve_tolerance)
         elif renderer == "tlottie-vulkan":
-            _WORKER_RENDERERS[renderer] = TlottieVulkan(lib)
+            _WORKER_RENDERERS[renderer] = TlottieVulkan(lib, curve_tolerance)
         elif renderer in RLOTTIE_RENDERERS:
             _WORKER_RENDERERS[renderer] = Rlottie(lib)
         elif renderer == "thorvg":
@@ -1259,6 +1463,8 @@ def run_size_batch(
     accuracy_size: int,
     accuracy_tolerance: int,
     accuracy_diff_threshold: float,
+    curve_tolerance: float,
+    progress: ProgressDisplay | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     sampler = EnergySampler()
     sampler.start()
@@ -1267,6 +1473,8 @@ def run_size_batch(
     accuracy_rows: list[dict[str, Any]] = []
     total = len(files)
     progress_every = progress_interval(total)
+    owns_progress = progress is None
+    progress = progress or ProgressDisplay(f"measure {renderers[0]} {size}px", total)
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=jobs,
         initializer=init_worker,
@@ -1281,6 +1489,7 @@ def run_size_batch(
             accuracy_size,
             accuracy_tolerance,
             accuracy_diff_threshold,
+            curve_tolerance,
         ),
     ) as pool:
         for done, (file_rows, accuracy_row) in enumerate(
@@ -1289,8 +1498,15 @@ def run_size_batch(
             rows.extend(file_rows)
             if accuracy_row:
                 accuracy_rows.append(accuracy_row)
-            if should_report_progress(done, total, progress_every):
+            if progress.interactive:
+                progress.advance(
+                    f"measure {renderers[0]} {size}px",
+                    display_file(files[done - 1], root),
+                )
+            elif should_report_progress(done, total, progress_every):
                 print(f"   measured {done}/{total} files", flush=True)
+    if owns_progress:
+        progress.finish()
     elapsed = time.perf_counter() - t0
     energy_j = sampler.stop_j()
     total_ms = sum(r["measured_ms"] for r in rows if r["ok"])
@@ -1313,6 +1529,7 @@ _ACCURACY_FRAMES = 0
 _ACCURACY_TOLERANCE = 8
 _ACCURACY_DIFF_THRESHOLD = 1.0
 _ACCURACY_INCLUDE_VULKAN = False
+_ACCURACY_CURVE_TOLERANCE = 0.125
 
 
 def init_accuracy_worker(
@@ -1322,58 +1539,87 @@ def init_accuracy_worker(
     tolerance: int,
     diff_threshold: float,
     include_vulkan: bool,
+    curve_tolerance: float,
 ) -> None:
-    global _ACCURACY_RENDERERS, _ACCURACY_ROOT, _ACCURACY_SIZE, _ACCURACY_FRAMES, _ACCURACY_TOLERANCE, _ACCURACY_DIFF_THRESHOLD, _ACCURACY_INCLUDE_VULKAN
+    global _ACCURACY_RENDERERS, _ACCURACY_ROOT, _ACCURACY_SIZE, _ACCURACY_FRAMES, _ACCURACY_TOLERANCE, _ACCURACY_DIFF_THRESHOLD, _ACCURACY_INCLUDE_VULKAN, _ACCURACY_CURVE_TOLERANCE
     _ACCURACY_ROOT = Path(root)
     _ACCURACY_SIZE = size
     _ACCURACY_FRAMES = frames
     _ACCURACY_TOLERANCE = tolerance
     _ACCURACY_DIFF_THRESHOLD = diff_threshold
     _ACCURACY_INCLUDE_VULKAN = include_vulkan
+    _ACCURACY_CURVE_TOLERANCE = curve_tolerance
     _ACCURACY_RENDERERS = {
-        "tlottie": Tlottie(LIBS["tlottie"]),
+        "tlottie": Tlottie(LIBS["tlottie"], curve_tolerance),
         "rlottie": Rlottie(LIBS["rlottie"]),
         "thorvg": Thorvg(LIBS["thorvg"]),
     }
     if include_vulkan:
-        _ACCURACY_RENDERERS["tlottie-vulkan"] = TlottieVulkan(LIBS["tlottie-vulkan"])
+        _ACCURACY_RENDERERS["tlottie-vulkan"] = TlottieVulkan(
+            LIBS["tlottie-vulkan"], curve_tolerance
+        )
 
 
 def worker_accuracy(file_s: str) -> dict[str, Any]:
     file = Path(file_s)
-    rendered: dict[str, list[list[int]]] = {}
+    rendered: dict[str, Any] = {}
     counts: dict[str, int] = {}
     errors = []
-    accuracy_renderers = ("tlottie", "rlottie", "thorvg") + (
-        ("tlottie-vulkan",) if _ACCURACY_INCLUDE_VULKAN else ()
-    )
-    for renderer in accuracy_renderers:
-        ok, frames, count, err = _ACCURACY_RENDERERS[renderer].render_frames_argb(
-            file, _ACCURACY_SIZE
-        )
-        if not ok:
-            errors.append(f"{renderer}:{err}")
-        rendered[renderer] = frames
-        counts[renderer] = count
-    if _ACCURACY_FRAMES > 0:
-        rendered = {renderer: frames[:_ACCURACY_FRAMES] for renderer, frames in rendered.items()}
-    return make_accuracy_row(
-        file,
-        _ACCURACY_ROOT,
-        _ACCURACY_SIZE,
-        rendered,
-        counts,
-        errors,
-        _ACCURACY_TOLERANCE,
-        _ACCURACY_DIFF_THRESHOLD,
-    )
+    with ExitStack() as stack:
+        for renderer in ("tlottie", "rlottie", "thorvg"):
+            try:
+                stream = stack.enter_context(
+                    _ACCURACY_RENDERERS[renderer].frame_stream(file, _ACCURACY_SIZE)
+                )
+            except RuntimeError as error:
+                errors.append(f"{renderer}:{error}")
+                continue
+            counts[renderer] = stream.count
+            frame_count = (
+                min(stream.count, _ACCURACY_FRAMES)
+                if _ACCURACY_FRAMES > 0
+                else stream.count
+            )
+            rendered[renderer] = FrameStream(frame_count, stream.render)
+
+        if _ACCURACY_INCLUDE_VULKAN:
+            ok, frames, count, err = _ACCURACY_RENDERERS["tlottie-vulkan"].render_frames_argb(
+                file, _ACCURACY_SIZE, _ACCURACY_FRAMES
+            )
+            if not ok:
+                errors.append(f"tlottie-vulkan:{err}")
+            rendered["tlottie-vulkan"] = frames
+            counts["tlottie-vulkan"] = count
+
+        try:
+            return make_accuracy_row(
+                file,
+                _ACCURACY_ROOT,
+                _ACCURACY_SIZE,
+                rendered,
+                counts,
+                errors,
+                _ACCURACY_TOLERANCE,
+                _ACCURACY_DIFF_THRESHOLD,
+            )
+        except RuntimeError as error:
+            return make_accuracy_row(
+                file,
+                _ACCURACY_ROOT,
+                _ACCURACY_SIZE,
+                {},
+                counts,
+                errors + [f"stream:{error}"],
+                _ACCURACY_TOLERANCE,
+                _ACCURACY_DIFF_THRESHOLD,
+            )
 
 
 def make_accuracy_row(
     file: Path,
     root: Path,
     size: int,
-    rendered: dict[str, list[list[int]]],
+    rendered: dict[str, list[Any]],
     counts: dict[str, int],
     errors: list[str],
     tolerance: int,
@@ -1494,17 +1740,64 @@ def make_accuracy_row(
 
 
 def diff_from_consensus(
-    candidate: list[int], a: list[int], b: list[int], tolerance: int
+    candidate: Any, a: Any, b: Any, tolerance: int
 ) -> tuple[int, int]:
+    if np is not None:
+        return diff_from_consensus_numpy(candidate, a, b, tolerance)
     bad = 0
     consensus = 0
-    for cp, ap, bp in zip(candidate, a, b):
+    for cp, ap, bp in zip(frame_pixels(candidate), frame_pixels(a), frame_pixels(b)):
         if not px_close(ap, bp, tolerance):
             continue
         consensus += 1
         if not px_close_to_avg(cp, ap, bp, tolerance):
             bad += 1
     return bad, consensus
+
+
+def frame_pixels(frame: Any) -> Any:
+    """Expose a compact raw ARGB frame as uint32 pixels for the Python fallback."""
+    if isinstance(frame, (bytes, memoryview)):
+        return memoryview(frame).cast("B").cast("I")
+    return frame
+
+
+def diff_from_consensus_numpy(
+    candidate: Any, a: Any, b: Any, tolerance: int
+) -> tuple[int, int]:
+    candidate_channels = numpy_channels(candidate)
+    a_channels = numpy_channels(a)
+    b_channels = numpy_channels(b)
+    consensus_mask = numpy_close_mask(a_channels, b_channels, tolerance)
+    consensus = int(np.count_nonzero(consensus_mask))
+    if consensus == 0:
+        return 0, 0
+
+    # This identity computes floor((a + b) / 2) without widening uint8.
+    avg_channels = (a_channels & b_channels) + ((a_channels ^ b_channels) >> 1)
+    candidate_close = numpy_close_mask(candidate_channels, avg_channels, tolerance)
+    bad = int(np.count_nonzero(consensus_mask & ~candidate_close))
+    return bad, consensus
+
+
+def numpy_channels(frame: Any) -> Any:
+    if isinstance(frame, (bytes, memoryview)):
+        return np.frombuffer(frame, dtype=np.uint8).reshape(-1, 4)
+    pixels = np.asarray(frame, dtype=np.uint32)
+    return pixels.view(np.uint8).reshape(-1, 4)
+
+
+def numpy_close_mask(a: Any, b: Any, tolerance: int) -> Any:
+    # Native render buffers are little-endian ARGB words, hence byte columns BGRA.
+    alpha_delta = np.maximum(a[:, 3], b[:, 3]) - np.minimum(a[:, 3], b[:, 3])
+    red_delta = np.maximum(a[:, 2], b[:, 2]) - np.minimum(a[:, 2], b[:, 2])
+    green_delta = np.maximum(a[:, 1], b[:, 1]) - np.minimum(a[:, 1], b[:, 1])
+    blue_delta = np.maximum(a[:, 0], b[:, 0]) - np.minimum(a[:, 0], b[:, 0])
+    rgb_delta = np.maximum(np.maximum(red_delta, green_delta), blue_delta)
+    weighted_rgb_delta = np.multiply(
+        rgb_delta, np.maximum(a[:, 3], b[:, 3]), dtype=np.uint16
+    )
+    return (alpha_delta <= tolerance) & (weighted_rgb_delta <= tolerance * 255)
 
 
 def px_close(a: int, b: int, tolerance: int) -> bool:
@@ -1547,22 +1840,123 @@ def run_accuracy(
     diff_threshold: float,
     jobs: int,
     include_vulkan: bool,
+    curve_tolerance: float,
+    progress: ProgressDisplay | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     total = len(files)
     progress_every = progress_interval(total)
+    owns_progress = progress is None
+    progress = progress or ProgressDisplay(f"accuracy {size}px", total)
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=jobs,
         initializer=init_accuracy_worker,
-        initargs=(str(root), size, frames, tolerance, diff_threshold, include_vulkan),
+        initargs=(
+            str(root), size, frames, tolerance, diff_threshold,
+            include_vulkan, curve_tolerance,
+        ),
     ) as pool:
         for done, row in enumerate(
-            pool.map(worker_accuracy, [str(p) for p in files], chunksize=4), 1
+            pool.map(worker_accuracy, [str(p) for p in files], chunksize=1), 1
         ):
             rows.append(row)
-            if should_report_progress(done, total, progress_every):
+            if progress.interactive:
+                progress.advance(f"accuracy {size}px", display_file(files[done - 1], root))
+            elif should_report_progress(done, total, progress_every):
                 print(f"   accuracy {done}/{total} files", flush=True)
+    if owns_progress:
+        progress.finish()
     return rows
+
+
+class ProgressDisplay:
+    SPINNER = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+    def __init__(self, label: str, total: int) -> None:
+        self.label = label
+        self.total = total
+        self.completed = 0
+        self.started = time.perf_counter()
+        self.last_draw = 0.0
+        self.interactive = sys.stdout.isatty()
+        self.unicode = (sys.stdout.encoding or "").lower().startswith("utf")
+        if self.interactive:
+            self.update(0, "starting", force=True)
+
+    def advance(self, label: str, status: str) -> None:
+        self.label = label
+        self.completed = min(self.total, self.completed + 1)
+        self.update(self.completed, status)
+
+    def update(self, done: int, status: str, force: bool = False) -> None:
+        if not self.interactive:
+            return
+        now = time.perf_counter()
+        if not force and done < self.total and now - self.last_draw < 0.05:
+            return
+        self.last_draw = now
+        elapsed = max(0.0, now - self.started)
+        ratio = done / self.total if self.total else 1.0
+        rate = done / elapsed if elapsed > 0.0 else 0.0
+        eta = (self.total - done) / rate if rate > 0.0 else None
+        try:
+            columns = os.get_terminal_size().columns
+        except OSError:
+            columns = 120
+        bar_width = 12 if columns >= 80 else 8
+        filled = min(bar_width, int(ratio * bar_width))
+        if self.unicode:
+            bar = "█" * filled + "░" * (bar_width - filled)
+            spinner = self.SPINNER[done % len(self.SPINNER)]
+            separator = "•"
+        else:
+            bar = "#" * filled + "-" * (bar_width - filled)
+            spinner = "*"
+            separator = "|"
+        metrics = (
+            f"{100.0 * ratio:5.1f}% {done}/{self.total} {separator} "
+            f"{rate:4.1f}/s {separator} ETA {format_duration(eta) if eta is not None else '--:--'}"
+        )
+        if columns >= 140:
+            metrics += f" {separator} {format_duration(elapsed)} elapsed"
+        prefix = f" {spinner} [{bar}] {metrics} "
+        phase_width = max(0, min(28, columns - len(prefix) - 12))
+        phase_text = truncate_middle(self.label, phase_width)
+        phase = f"{phase_text} " if phase_text else ""
+        available = max(0, columns - len(prefix) - len(phase) - 1)
+        short_status = truncate_middle(status, available)
+        print(f"\r\033[2K{prefix}{phase}{short_status}", end="", flush=True)
+
+    def finish(self) -> None:
+        if not self.interactive:
+            return
+        self.update(self.total, "complete", force=True)
+        print(flush=True)
+
+
+def display_file(file: Path, root: Path) -> str:
+    try:
+        return str(file.relative_to(root))
+    except ValueError:
+        return file.name
+
+
+def truncate_middle(value: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(value) <= width:
+        return value
+    if width <= 3:
+        return value[:width]
+    left = (width - 1) // 2
+    return value[:left] + "…" + value[-(width - left - 1) :]
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
 
 
 def progress_interval(total: int) -> int:
@@ -1606,6 +2000,7 @@ def save_diff_grids(
     limit: int,
     size: int,
     tolerance: int,
+    curve_tolerance: float,
 ) -> list[Path]:
     selected = select_diff_rows(rows, limit)
     if not selected:
@@ -1613,7 +2008,7 @@ def save_diff_grids(
     out_dir.mkdir(parents=True, exist_ok=True)
     clear_diff_dir(out_dir)
     renderers = {
-        "tlottie": Tlottie(LIBS["tlottie"]),
+        "tlottie": Tlottie(LIBS["tlottie"], curve_tolerance),
         "rlottie": Rlottie(LIBS["rlottie"]),
         "thorvg": Thorvg(LIBS["thorvg"]),
     }
@@ -1861,19 +2256,57 @@ def pivot_aggregate(rows: list[dict[str, Any]], key_cols: tuple[str, ...]) -> li
 
 def write_tgv(path: Path, rows: list[dict[str, Any]], renderers: tuple[str, ...], key_cols: tuple[str, ...]) -> None:
     cols = list(key_cols)
+    comparison_col = "tl vs rl19"
+    include_comparison = has_tl_rl19_comparison(renderers)
+    if include_comparison:
+        cols.insert(cols.index("pack") + 1, comparison_col)
     for r in renderers:
         cols += [
             f"{r}_first_frame_ms",
             f"{r}_frame_ms",
-            f"{r}_rss_avg_mb",
-            f"{r}_rss_max_mb",
+            f"{r}_memory_avg_mb",
+            f"{r}_memory_max_mb",
             f"{r}_energy_j",
             f"{r}_error",
         ]
     with path.open("w", encoding="utf-8") as f:
         f.write("\t".join(cols) + "\n")
         for row in rows:
-            f.write("\t".join(format_cell(row.get(c)) for c in cols) + "\n")
+            values = {
+                **row,
+                comparison_col: format_tl_vs_rl19_percent(row) if include_comparison else None,
+            }
+            f.write("\t".join(format_cell(values.get(c)) for c in cols) + "\n")
+
+
+def has_tl_rl19_comparison(renderers: tuple[str, ...]) -> bool:
+    return "tlottie" in renderers and "rlottie_2019" in renderers
+
+
+def tl_vs_rl19_percent(row: dict[str, Any]) -> float | None:
+    tlottie_ms = row.get("tlottie_frame_ms")
+    rlottie_2019_ms = row.get("rlottie_2019_frame_ms")
+    if tlottie_ms is None or rlottie_2019_ms is None or rlottie_2019_ms <= 0:
+        return None
+    percent = (tlottie_ms / rlottie_2019_ms - 1.0) * 100.0
+    return percent if math.isfinite(percent) else None
+
+
+def format_tl_vs_rl19_percent(row: dict[str, Any]) -> str:
+    percent = tl_vs_rl19_percent(row)
+    return "n/a" if percent is None else f"{percent:+.1f}%"
+
+
+def tl_vs_rl19_cell(row: dict[str, Any]) -> str:
+    percent = tl_vs_rl19_percent(row)
+    if percent is None:
+        return "<td class='comparison muted'>n/a</td>"
+    direction = "faster" if percent < 0 else "slower" if percent > 0 else "equal"
+    fill = min(abs(percent), 100.0)
+    return (
+        f"<td class='comparison {direction}' style='--fill:{fill:.1f}%'>"
+        f"{percent:+.1f}%</td>"
+    )
 
 
 def format_cell(v: Any) -> str:
@@ -1912,8 +2345,11 @@ def write_html(
     accuracy_size: int,
     accuracy_tolerance: int,
     accuracy_diff_threshold: float,
+    benchmark_command: str | None = None,
+    machine_details: str | None = None,
 ) -> None:
-    system_info = f"{platform.system()} {platform.release()} / {platform.machine()}"
+    benchmark_command = benchmark_command or "python3 tools/benchmark.py"
+    machine_details = machine_details or current_machine_details()
     css = """
 :root{--bg:#f4f6f7;--surface:#fff;--ink:#1d2429;--muted:#5c6b76;--line:#dde4e8;
 --tl:#0d7f8c;--good:#1e7d46;--bad:#bb4436;--head:#f0f3f5;
@@ -1928,12 +2364,12 @@ main{width:min-content;max-width:100%;margin:0 auto}
 h1{font-size:20px;margin:0 0 4px}
 h2{font-size:15px;margin:28px 0 8px}
 a{color:var(--tl)}
-.note{color:var(--muted);font-size:13px;margin:2px 0;max-width:980px}
+.note{color:var(--muted);font-size:13px;margin:2px 0;}
 .tablewrap{overflow-x:auto;max-width:100%;width:fit-content;background:var(--surface);
 border:1px solid var(--line);border-radius:6px;margin:0 0 8px}
 table{border-collapse:collapse;width:auto;font-size:12px}
 th{background:var(--head);color:var(--muted);font-weight:600;text-align:right;padding:6px 8px;
-white-space:nowrap;border-bottom:1px solid var(--line);font-size:10.5px;text-transform:uppercase;
+white-space:nowrap;border-bottom:1px solid var(--line);font-size:10.5px;
 position:sticky;top:0;z-index:1}
 th.left{text-align:left}
 th.renderer{text-align:center;text-transform:none;font-size:11.5px;color:var(--ink)}
@@ -1945,6 +2381,12 @@ th.metric-last,td.metric-last{border-right:1px solid var(--line)}
 tr:last-child td{border-bottom:0}
 .winner{color:var(--tl);font-weight:700}
 .loser{color:var(--bad);font-weight:700}
+.comparison{font-weight:700;min-width:74px}
+.comparison.faster{color:var(--good);background:linear-gradient(to right,
+var(--goodsoft) var(--fill),transparent var(--fill))}
+.comparison.slower{color:var(--bad);background:linear-gradient(to left,
+var(--badsoft) var(--fill),transparent var(--fill))}
+.comparison.equal{color:var(--muted)}
 .acc-badge{margin-left:8px;border-radius:4px;padding:1px 6px;font-weight:600;font-size:10.5px;
 font-family:system-ui}
 .acc-ok{background:var(--goodsoft);color:var(--good)}
@@ -1955,31 +2397,9 @@ font-family:system-ui}
     with path.open("w", encoding="utf-8") as f:
         f.write("<!doctype html><meta charset='utf-8'><title>Lottie Benchmark</title>")
         f.write(f"<style>{css}</style>")
-        f.write("<main><h1>Lottie benchmark</h1>")
-        f.write(f"<p class='note'>Run on {esc(system_info)}.</p>")
-        f.write(
-            "<p class='note'>fms is load/init plus first-frame draw. "
-            "ms is the average of subsequent frames only. "
-            "Memory columns are process RSS samples inside benchmark workers, "
-            "not isolated renderer-owned allocation. "
-            "J is consumed energy: on macOS (Apple Silicon) per-task "
-            "task_power_info_v2.task_energy sampled around each renderer run; "
-            "on Linux RAPL package energy prorated by measured time.</p>"
-        )
-        if accuracy_by_pack:
-            f.write(
-                "<p class='note'>Pack names include good/all animations for tlottie "
-                f"versus the rlottie+thorvg consensus at {accuracy_size}px over every frame. "
-                f"An animation is broken if any frame differs by more than "
-                f"{accuracy_diff_threshold:g}% of consensus pixels; "
-                f"pixel tolerance {accuracy_tolerance} opacity-weighted ARGB distance.</p>"
-            )
-            if "tlottie-vulkan" in renderers:
-                f.write(
-                    "<p class='note'>VK badges compare retained Vulkan raw premultiplied "
-                    "ARGB frames directly with tlottie CPU using the same tolerance and "
-                    "per-animation threshold.</p>"
-                )
+        f.write("<main>")
+        f.write(f"<p class='note'><code>{esc(benchmark_command)}</code></p>")
+        f.write(f"<p class='note'>{esc(machine_details)}</p>")
         for size in sorted({r["size"] for r in pack_rows}):
             f.write(f"<h2>{size}px</h2>")
             rows = pivot_aggregate([r for r in pack_rows if r["size"] == size], ("pack", "size"))
@@ -2005,29 +2425,38 @@ def write_grouped_table(
     include_size: bool,
     accuracy_by_pack: dict[str, dict[str, Any]] | None = None,
 ) -> None:
+    include_comparison = has_tl_rl19_comparison(renderers)
     f.write("<div class='tablewrap'><table><tr>")
     for label in labels:
         f.write(f"<th rowspan='2' class='left'>{esc(label)}</th>")
+        if label == "pack" and include_comparison:
+            f.write("<th rowspan='2'>tl vs rl19</th>")
     if include_size:
         f.write("<th rowspan='2'>size</th>")
     for r in renderers:
-        f.write(f"<th colspan='4' class='renderer'>{esc(r)}</th>")
+        url = RENDERER_URLS.get(r)
+        name = f"<a href='{esc(url)}'>{esc(r)}</a>" if url else esc(r)
+        f.write(f"<th colspan='4' class='renderer'>{name}</th>")
     f.write("</tr><tr>")
     for _ in renderers:
         f.write(
             "<th class='metric'>fms</th><th>ms</th>"
-            "<th>RSS MiB (avg/max)</th><th class='metric-last'>J</th>"
+            f"<th>MiB (avg/max)</th>"
+            "<th class='metric-last'>J</th>"
         )
     f.write("</tr>")
     for row in rows:
         f.write("<tr>")
         for label in labels:
             value = row[label]
-            if label == "pack" and accuracy_by_pack:
-                value = pack_label(value, accuracy_by_pack.get(value))
+            if label == "pack":
+                accuracy = accuracy_by_pack.get(value) if accuracy_by_pack else None
+                value = pack_label(value, accuracy)
                 f.write(f"<td class='left'>{value}</td>")
             else:
                 f.write(f"<td class='left'>{esc(value)}</td>")
+            if label == "pack" and include_comparison:
+                f.write(tl_vs_rl19_cell(row))
         if include_size:
             f.write(f"<td>{row['size']}</td>")
         for r in renderers:
@@ -2053,20 +2482,23 @@ def write_grouped_table(
 
 
 def pack_label(pack: str, accuracy: dict[str, Any] | None) -> str:
+    linked_pack = (
+        f"<a href='https://t.me/addstickers/{quote(pack, safe='')}'>{esc(pack)}</a>"
+    )
     if not accuracy:
-        return esc(pack)
+        return linked_pack
     good = int(accuracy.get("good", 0))
     total = int(accuracy.get("total", 0))
     ratio = accuracy.get("ratio")
     if not total or ratio is None:
-        return esc(pack)
+        return linked_pack
     cls = "acc-ok"
     if ratio < 0.5:
         cls = "acc-bad"
     elif good < total:
         cls = "acc-warn"
     label = (
-        f"{esc(pack)} "
+        f"{linked_pack} "
         f"<span class='acc-badge {cls}'>{good}/{total}</span>"
     )
     vulkan_total = int(accuracy.get("vulkan_total", 0))
@@ -2082,6 +2514,68 @@ def pack_label(pack: str, accuracy: dict[str, Any] | None) -> str:
             f"VK {vulkan_good}/{vulkan_total}, max {vulkan_max:.2f}%</span>"
         )
     return label
+
+
+def current_machine_details() -> str:
+    cpu = platform.processor().strip()
+    if platform.system() == "Darwin":
+        result = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        cpu = result.stdout.strip() or cpu
+    elif platform.system() == "Linux":
+        try:
+            for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
+                if line.lower().startswith(("model name", "hardware")):
+                    cpu = line.split(":", 1)[1].strip()
+                    break
+        except (OSError, IndexError):
+            pass
+    cpu = cpu or "unknown"
+    return (
+        f"CPU {cpu}; OS {platform.system()} {platform.release()}; "
+        f"arch {platform.machine()}"
+    )
+
+
+def benchmark_invocation(args: argparse.Namespace, accuracy_size: int) -> str:
+    command = [
+        "tools/benchmark.py",
+        "--sizes",
+        args.sizes,
+        "--frames",
+        str(args.frames),
+        "--reps",
+        str(args.reps),
+        "--jobs",
+        str(args.jobs),
+        "--curve-tolerance",
+        str(args.curve_tolerance),
+    ]
+    if not args.no_accuracy:
+        command.extend([
+            "--accuracy-size",
+            str(accuracy_size),
+            "--accuracy-tolerance",
+            str(args.accuracy_tolerance),
+            "--accuracy-diff-threshold",
+            str(args.accuracy_diff_threshold),
+        ])
+    for option, value in (
+        ("--limit", args.limit),
+        ("--packs", args.packs),
+    ):
+        if value is not None:
+            command.extend((option, str(value)))
+    for option, enabled in (
+        ("--no-accuracy", args.no_accuracy),
+    ):
+        if enabled:
+            command.append(option)
+    return shlex.join(command)
 
 
 def esc(v: Any) -> str:
@@ -2108,6 +2602,14 @@ def main() -> int:
         help="frames to render per animation per rep; 0 renders every frame",
     )
     ap.add_argument("--reps", type=int, default=2)
+    ap.add_argument(
+        "--curve-tolerance",
+        type=float,
+        help=(
+            "tlottie maximum device-space curve-flattening error in pixels; "
+            "defaults to 0.125 with accuracy enabled and 0.3 with --no-accuracy"
+        ),
+    )
     ap.add_argument("--accuracy-size", type=int)
     ap.add_argument(
         "--accuracy-tolerance",
@@ -2144,6 +2646,9 @@ def main() -> int:
     ap.add_argument("--no-open", action="store_true", help="do not open benchmark.html")
     args = ap.parse_args()
 
+    if args.curve_tolerance is None:
+        args.curve_tolerance = 0.125 if not args.no_accuracy else 0.3
+
     renderers = tuple(r.strip() for r in args.renderers.split(",") if r.strip())
     bad = [r for r in renderers if r not in RENDERERS]
     if bad:
@@ -2153,6 +2658,8 @@ def main() -> int:
         raise SystemExit("--reps must be positive")
     if args.frames < 0:
         raise SystemExit("--frames must be non-negative")
+    if not math.isfinite(args.curve_tolerance) or args.curve_tolerance <= 0:
+        raise SystemExit("--curve-tolerance must be a positive finite number")
     if args.accuracy_tolerance < 0:
         raise SystemExit("--accuracy-tolerance must be non-negative")
     if args.accuracy_diff_threshold < 0:
@@ -2180,58 +2687,63 @@ def main() -> int:
     if not files:
         raise SystemExit(f"no .json files found under {args.input}")
     args.out.mkdir(parents=True, exist_ok=True)
+    print(f"== tlottie curve tolerance {args.curve_tolerance:g}px", flush=True)
 
     all_rows: list[dict[str, Any]] = []
     accuracy_rows: list[dict[str, Any]] = []
     accuracy_by_pack: dict[str, dict[str, Any]] | None = None
-    accuracy_size = args.accuracy_size or min(sizes)
+    accuracy_size = args.accuracy_size or max(sizes)
     accuracy_frame_label = "all frames" if args.frames == 0 else f"first {args.frames} frame(s)"
     accuracy_renderers = ("tlottie", "rlottie", "thorvg")
-    can_reuse_accuracy = (
-        not args.no_accuracy
-        and accuracy_size in sizes
-        and all(r in renderers for r in accuracy_renderers)
-    )
     if not args.no_accuracy:
         for required in accuracy_renderers:
             if not LIBS[required].exists():
                 raise SystemExit(f"missing {required} library for accuracy: {LIBS[required]}")
-        mode = "reused from performance pass" if can_reuse_accuracy else "separate pass"
         print(
             f"== accuracy {accuracy_size}px {accuracy_frame_label}: {len(files)} files, "
             f"pixel tolerance {args.accuracy_tolerance}, "
-            f"broken if diff > {args.accuracy_diff_threshold:g}% ({mode})",
+            f"broken if diff > {args.accuracy_diff_threshold:g}% (separate pass)",
             flush=True,
         )
 
     energy_available = EnergySampler().available() or task_energy_nj() is not None
     if not energy_available:
         print("== energy counters unavailable; J columns will be n/a", flush=True)
+    phase_count = len(sizes) * len(renderers) + (0 if args.no_accuracy else 1)
+    overall_progress = ProgressDisplay("benchmark", len(files) * phase_count)
     for size in sizes:
-        print(
-            f"== {size}px: {len(files)} files, {args.jobs} workers, "
-            f"{args.reps} interleaved reps, renderers={','.join(renderers)}",
-            flush=True,
-        )
-        size_rows, size_accuracy_rows = run_size_batch(
-            renderers,
-            size,
-            files,
-            args.input,
-            args.frames,
-            args.jobs,
-            args.reps,
-            can_reuse_accuracy and size == accuracy_size,
-            accuracy_size,
-            args.accuracy_tolerance,
-            args.accuracy_diff_threshold,
-        )
-        all_rows.extend(size_rows)
-        accuracy_rows.extend(size_accuracy_rows)
+        if not overall_progress.interactive:
+            print(
+                f"== {size}px: {len(files)} files, {args.jobs} workers, "
+                f"{args.reps} reps, isolated renderers={','.join(renderers)}",
+                flush=True,
+            )
+        for renderer in renderers:
+            if not overall_progress.interactive:
+                print(f"   renderer={renderer}", flush=True)
+            size_rows, _ = run_size_batch(
+                (renderer,),
+                size,
+                files,
+                args.input,
+                args.frames,
+                args.jobs,
+                args.reps,
+                False,
+                accuracy_size,
+                args.accuracy_tolerance,
+                args.accuracy_diff_threshold,
+                args.curve_tolerance,
+                overall_progress,
+            )
+            all_rows.extend(size_rows)
 
     if not args.no_accuracy:
         if not accuracy_rows:
-            print("== accuracy fallback: rendering separate accuracy pass", flush=True)
+            # Accuracy needs several renderers' frames at once, so keep it out
+            # of the performance workers whose memory must remain isolated.
+            if not overall_progress.interactive:
+                print("== accuracy: rendering separate accuracy pass", flush=True)
             accuracy_rows = run_accuracy(
                 files,
                 args.input,
@@ -2241,8 +2753,12 @@ def main() -> int:
                 args.accuracy_diff_threshold,
                 args.jobs,
                 "tlottie-vulkan" in renderers,
+                args.curve_tolerance,
+                overall_progress,
             )
         accuracy_by_pack = aggregate_accuracy(accuracy_rows)
+    overall_progress.finish()
+    if not args.no_accuracy:
         if args.save_diffs:
             diff_dir = args.diff_dir or (args.out / "diffs")
             print(
@@ -2256,6 +2772,7 @@ def main() -> int:
                 args.save_diffs,
                 accuracy_size,
                 args.accuracy_tolerance,
+                args.curve_tolerance,
             )
             print(f"wrote {len(diff_paths)} diff grid(s)", flush=True)
 
@@ -2276,6 +2793,8 @@ def main() -> int:
         accuracy_size,
         args.accuracy_tolerance,
         args.accuracy_diff_threshold,
+        benchmark_invocation(args, accuracy_size),
+        current_machine_details(),
     )
     raw = args.out / "benchmark.raw.json"
     accuracy_raw = args.out / "benchmark-accuracy.raw.json"

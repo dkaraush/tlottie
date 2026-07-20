@@ -28,6 +28,7 @@ DEFAULT_REMOTE = "/data/local/tmp/tlottie-android-benchmark"
 ANDROID_RENDERERS = {
     "tlottie": f"{DEFAULT_REMOTE}/tlottie-cli",
     "rlottie": "/data/local/tmp/rlottie_dump_ref",
+    "rlottie_2019": "/data/local/tmp/rlottie_dump_rl19",
     "rlottie_2019_patched": "/data/local/tmp/rlottie_dump_rlp",
     "thorvg": "/data/local/tmp/thorvg_dump",
 }
@@ -94,6 +95,59 @@ def device_info(serial: str) -> str:
         capture=True,
     ).stdout.strip()
     return values.replace("|", " / ")
+
+
+def device_machine_details(serial: str) -> str:
+    values = adb(
+        serial,
+        "shell",
+        "cpu=\"$(getprop ro.soc.model)\"; [ -n \"$cpu\" ] || cpu=\"$(getprop ro.hardware)\"; "
+        "printf '%s|%s|%s|%s|%s' \"$cpu\" \"$(getprop ro.build.version.release)\" "
+        "\"$(getprop ro.build.version.sdk)\" \"$(getprop ro.product.cpu.abi)\" "
+        "\"$(getprop ro.product.model)\"",
+        capture=True,
+    ).stdout.strip().split("|", 4)
+    if len(values) != 5:
+        return device_info(serial)
+    cpu, release, api, arch, model = values
+    return f"CPU {cpu or 'unknown'}; OS Android {release} (API {api}); arch {arch}; device {model}"
+
+
+def benchmark_invocation(args: argparse.Namespace) -> str:
+    command_line = [
+        "python3",
+        "tools/benchmark_android.py",
+        str(args.input),
+        "--out",
+        str(args.out),
+        "--serial",
+        args.serial,
+        "--device-root",
+        args.device_root,
+        "--sizes",
+        args.sizes,
+        "--frames",
+        str(args.frames),
+        "--reps",
+        str(args.reps),
+        "--packs",
+        args.packs,
+        "--renderers",
+        args.renderers,
+        "--core-mask",
+        args.core_mask,
+    ]
+    for option, value in (("--limit", args.limit), ("--curve-tolerance", args.curve_tolerance)):
+        if value is not None:
+            command_line.extend((option, str(value)))
+    for option, enabled in (
+        ("--skip-build", args.skip_build),
+        ("--no-open", args.no_open),
+        ("--write-raw", args.write_raw),
+    ):
+        if enabled:
+            command_line.append(option)
+    return shlex.join(command_line)
 
 
 def frame_count(file: Path) -> int:
@@ -249,15 +303,20 @@ def main() -> int:
     tgv = args.out / "benchmark.tgv"
     html = args.out / "benchmark.html"
     HOST.write_tgv(tgv, pivot, renderers, ("pack", "size"))
-    HOST.write_html(html, pack_rows, file_rows, renderers, False, args.reps, None, min(sizes), 16, 1.0)
-    # The shared writer intentionally defaults to host platform metadata.
-    contents = html.read_text(encoding="utf-8")
-    contents = re.sub(r"Run on [^<]+\.", f"Run on {device_info(args.serial)} (CPU {args.core_mask}).", contents, count=1)
-    contents = contents.replace(
-        "Memory columns are process RSS samples inside benchmark workers, not isolated renderer-owned allocation.",
-        "Memory columns are isolated Android process maximum RSS from toybox time; avg and max repeat that same value.",
+    HOST.write_html(
+        html,
+        pack_rows,
+        file_rows,
+        renderers,
+        False,
+        args.reps,
+        None,
+        min(sizes),
+        16,
+        1.0,
+        benchmark_invocation(args),
+        device_machine_details(args.serial),
     )
-    html.write_text(contents, encoding="utf-8")
     if args.write_raw:
         (args.out / "benchmark.raw.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
     print(f"wrote {tgv}")

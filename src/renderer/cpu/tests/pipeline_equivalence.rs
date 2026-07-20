@@ -61,6 +61,43 @@ fn shape_layer_opacity_is_applied_after_paints_are_flattened() {
   assert_eq!(pixels[5] >> 24, 127);
 }
 
+#[test]
+fn matte_source_precomp_opacity_is_applied_after_flattening() {
+  let composition = Composition::parse(
+    br##"{"fr":30,"ip":0,"op":1,"w":4,"h":4,
+      "assets":[{"id":"matte","w":4,"h":4,"layers":[
+        {"ty":1,"ind":1,"sw":4,"sh":4,"sc":"#ffffff","ip":0,"op":1,"st":0,"ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[2,2]},"a":{"a":0,"k":[2,2]},"s":{"a":0,"k":[100,100]}}},
+        {"ty":1,"ind":2,"sw":4,"sh":4,"sc":"#ffffff","ip":0,"op":1,"st":0,"ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[2,2]},"a":{"a":0,"k":[2,2]},"s":{"a":0,"k":[100,100]}}}
+      ]}],
+      "layers":[
+        {"ty":0,"ind":1,"td":1,"refId":"matte","w":4,"h":4,"ip":0,"op":1,"st":0,"ks":{"o":{"a":0,"k":50},"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]}}},
+        {"ty":1,"ind":2,"tt":1,"sw":4,"sh":4,"sc":"#00ff00","ip":0,"op":1,"st":0,"ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[2,2]},"a":{"a":0,"k":[2,2]},"s":{"a":0,"k":[100,100]}}}
+      ]}"##,
+    &Limits::default(),
+  )
+  .unwrap();
+  let mut renderer = crate::CPURenderer::new(composition);
+  let mut pixels = [0u32; 16];
+  renderer.render(0.0, &mut pixels, 4, 4, RenderOptions::default()).unwrap();
+  assert_eq!(pixels[5] >> 24, 127);
+}
+
+#[test]
+fn matte_source_is_sampled_for_the_consumers_lifetime() {
+  let composition = Composition::parse(
+    br##"{"fr":30,"ip":0,"op":2,"w":4,"h":4,"layers":[
+      {"ty":1,"ind":1,"td":1,"sw":4,"sh":4,"sc":"#ffffff","ip":0,"op":1,"st":0,"ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[2,2]},"a":{"a":0,"k":[2,2]},"s":{"a":0,"k":[100,100]}}},
+      {"ty":1,"ind":2,"tt":1,"sw":4,"sh":4,"sc":"#00ff00","ip":0,"op":2,"st":0,"ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[2,2]},"a":{"a":0,"k":[2,2]},"s":{"a":0,"k":[100,100]}}}
+    ]}"##,
+    &Limits::default(),
+  )
+  .unwrap();
+  let mut renderer = crate::CPURenderer::new(composition);
+  let mut pixels = [0u32; 16];
+  renderer.render(1.0, &mut pixels, 4, 4, RenderOptions::default()).unwrap();
+  assert_eq!(pixels[5], 0xff00_ff00);
+}
+
 fn assert_matches_direct(json: &[u8]) {
   let composition = Composition::parse(json, &Limits::default()).unwrap();
   let mut direct = vec![0u32; 64 * 64];

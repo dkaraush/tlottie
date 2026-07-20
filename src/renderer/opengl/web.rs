@@ -61,6 +61,16 @@ impl WebGlRenderer {
 
   /// Resizes the canvas drawing buffer, renders, uploads, and presents a frame.
   pub fn render(&mut self, frame: f32, width: u32, height: u32, antialias: bool) -> core::result::Result<(), JsValue> {
+    self.render_with_options(frame, width, height, antialias, RenderOptions::default().curve_tolerance)
+  }
+
+  /// Renders with an explicit positive maximum curve-flattening error in
+  /// device pixels.
+  #[wasm_bindgen(js_name = renderWithOptions)]
+  pub fn render_with_options(&mut self, frame: f32, width: u32, height: u32, antialias: bool, curve_tolerance: f32) -> core::result::Result<(), JsValue> {
+    if !curve_tolerance.is_finite() || curve_tolerance <= 0.0 {
+      return Err(JsValue::from_str("curve_tolerance must be finite and greater than zero"));
+    }
     if self.canvas.width() != width {
       self.canvas.set_width(width);
     }
@@ -75,6 +85,7 @@ impl WebGlRenderer {
         height,
         RenderOptions {
           antialias,
+          curve_tolerance,
           ..RenderOptions::default()
         },
       )

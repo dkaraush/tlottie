@@ -23,7 +23,7 @@ enum RecordedOp {
   EndLayer { opacity: u8 },
   BeginMatte,
   BeginMatteTarget,
-  EndMatte { kind: u8, opacity: u8 },
+  EndMatte { kind: u8, opacity: u8, source_opacity: u8 },
   Mask { mode: u8, inverted: bool, opacity: u8, first: bool, last: bool },
 }
 
@@ -97,7 +97,7 @@ impl tlottie_internal::FrameRenderer for VulkanRenderer<'_> {
           end: at,
         });
       }
-      tlottie_internal::Composite::Matte { kind, opacity } => {
+      tlottie_internal::Composite::Matte { kind, opacity, source_opacity } => {
         let target = self.saves.pop();
         let source = self.saves.pop();
         if let Some(index) = source {
@@ -112,7 +112,7 @@ impl tlottie_internal::FrameRenderer for VulkanRenderer<'_> {
         }
         let at = self.frame.contours.len();
         self.frame.commands.push(RecordedCommand {
-          op: RecordedOp::EndMatte { kind, opacity },
+          op: RecordedOp::EndMatte { kind, opacity, source_opacity },
           start: at,
           end: at,
         });
@@ -2890,11 +2890,11 @@ impl GeometryCache {
             ..PreparedPaint::default()
           },
         ),
-        RecordedOp::EndMatte { kind, opacity } => (
+        RecordedOp::EndMatte { kind, opacity, source_opacity } => (
           tlottie_internal::Rule::NonZero,
           PreparedPaint {
             paint_kind: 6,
-            argb: (u32::from(*opacity) << 24) | u32::from(*kind),
+            argb: (u32::from(*opacity) << 24) | (u32::from(*source_opacity) << 8) | u32::from(*kind),
             bounds: [f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY],
             ..PreparedPaint::default()
           },
@@ -3550,7 +3550,11 @@ mod tests {
           end: 0,
         },
         RecordedCommand {
-          op: RecordedOp::EndMatte { kind: 4, opacity: 127 },
+          op: RecordedOp::EndMatte {
+            kind: 4,
+            opacity: 127,
+            source_opacity: 255,
+          },
           start: 0,
           end: 0,
         },
@@ -3564,7 +3568,7 @@ mod tests {
     assert_eq!(prepared.paints[2].paint_kind, 4);
     assert_eq!(prepared.paints[3].paint_kind, 5);
     assert_eq!(prepared.paints[4].paint_kind, 6);
-    assert_eq!(prepared.paints[4].argb, 0x7f00_0004);
+    assert_eq!(prepared.paints[4].argb, 0x7f00_ff04);
     assert!(prepared.indirect.is_empty());
     Ok(())
   }

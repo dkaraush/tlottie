@@ -119,10 +119,24 @@ pub unsafe extern "C" fn tlottie_frame_count(inst: *const Instance) -> u32 {
 /// `inst` must be a live instance from `tlottie_new`.
 #[no_mangle]
 pub unsafe extern "C" fn tlottie_render(inst: *mut Instance, frame: f32, width: u32, height: u32, antialias: u32) -> *const u8 {
+  // SAFETY: this function has the same instance contract as the extended API.
+  unsafe { tlottie_render_with_options(inst, frame, width, height, antialias, RenderOptions::default().curve_tolerance) }
+}
+
+/// Like [`tlottie_render`], with an explicit positive maximum curve-flattening
+/// error in device pixels. Returns null for an invalid tolerance.
+///
+/// # Safety
+/// `inst` must be a live instance from `tlottie_new`.
+#[no_mangle]
+pub unsafe extern "C" fn tlottie_render_with_options(inst: *mut Instance, frame: f32, width: u32, height: u32, antialias: u32, curve_tolerance: f32) -> *const u8 {
   // SAFETY: caller contract.
   let Some(inst) = (unsafe { inst.as_mut() }) else {
     return std::ptr::null_mut();
   };
+  if !curve_tolerance.is_finite() || curve_tolerance <= 0.0 {
+    return std::ptr::null_mut();
+  }
   let Some(px) = (width as usize).checked_mul(height as usize) else {
     return std::ptr::null_mut();
   };
@@ -141,6 +155,7 @@ pub unsafe extern "C" fn tlottie_render(inst: *mut Instance, frame: f32, width: 
       height,
       RenderOptions {
         antialias: antialias != 0,
+        curve_tolerance,
         ..RenderOptions::default()
       },
     )

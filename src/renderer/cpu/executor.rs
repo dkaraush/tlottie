@@ -372,18 +372,6 @@ impl RenderCtx<'_> {
       if !self.layer_visible(layer, frame) {
         continue;
       }
-      // Patched rlottie renders a matte consumer ONLY while its matte
-      // source layer is itself visible (`if (matte->visible())
-      // renderMatteLayer(...)` with no else) — a source whose lifetime
-      // ends early takes the consumer with it (JollySanta lollipop,
-      // source op one frame before comp op).
-      if layer.matte.is_some() {
-        if let Some(src) = idx.checked_sub(1).and_then(|j| layers.get(j)) {
-          if !self.layer_visible(src, frame) {
-            continue;
-          }
-        }
-      }
       let (layer_m, layer_opacity) = layer_transform_at(layer, frame);
       let m = base.concat(parent_chain_matrix(layers, layer, frame)).concat(layer_m);
       let combined_opacity = opacity * layer_opacity;
@@ -447,38 +435,39 @@ impl RenderCtx<'_> {
         if layer.matte.is_some() {
           if let Some(src) = idx.checked_sub(1).and_then(|j| layers.get(j)) {
             let mut buf_b = scratch.take_u32(w * h);
-            if self.layer_visible(src, frame) {
-              let (src_m, src_op) = layer_transform_at(src, frame);
-              let sm = base.concat(parent_chain_matrix(layers, src, frame)).concat(src_m);
-              let raster = scratch.take_raster(w, h);
-              let cells = scratch.take_cells(w, h);
-              let mut off = Canvas::with_raster(&mut buf_b, w, h, raster, cells, self.antialias);
-              let res = self.draw_layer_content(scratch, &mut off, src, sm, frame, src_op, clip, precomp_depth);
-              // Source content bounds: buf_b is 0 outside `db`,
-              // where the mask modulate below is a no-op.
-              let db = off.dirty;
-              scratch.put_raster(off.raster);
-              scratch.put_cells(off.cells);
-              res?;
-              if !src.masks.is_empty() && !db.is_empty() {
-                let maskbuf = self.build_mask(scratch, src, sm, frame, w, h, db);
-                // Bound the modulate to `db` too — outside it
-                // buf_b is 0 (modulate maps 0 → 0), so this is
-                // byte-exact vs the former full-plane modulate.
-                for_rows_boxed(&mut buf_b, w, db, |y, row| {
-                  let lo = y * w + db.x0;
-                  if let Some(mask_row) = maskbuf.get(lo..lo + row.len()) {
-                    modulate(row, mask_row);
-                  }
-                });
-                scratch.put_u8(maskbuf);
-              }
+            let (src_m, src_op) = layer_transform_at(src, frame);
+            // A track-matte source is sampled for the consumer's lifetime;
+            // its own in/out range controls standalone drawing only. Some
+            // exports end the source one frame before its consumer.
+            let sm = base.concat(parent_chain_matrix(layers, src, frame)).concat(src_m);
+            let raster = scratch.take_raster(w, h);
+            let cells = scratch.take_cells(w, h);
+            let mut off = Canvas::with_raster(&mut buf_b, w, h, raster, cells, self.antialias);
+            let res = self.draw_layer_content(scratch, &mut off, src, sm, frame, 1.0, clip, precomp_depth);
+            // Source content bounds: buf_b is 0 outside `db`,
+            // where the mask modulate below is a no-op.
+            let db = off.dirty;
+            scratch.put_raster(off.raster);
+            scratch.put_cells(off.cells);
+            res?;
+            if !src.masks.is_empty() && !db.is_empty() {
+              let maskbuf = self.build_mask(scratch, src, sm, frame, w, h, db);
+              // Bound the modulate to `db` too — outside it
+              // buf_b is 0 (modulate maps 0 → 0), so this is
+              // byte-exact vs the former full-plane modulate.
+              for_rows_boxed(&mut buf_b, w, db, |y, row| {
+                let lo = y * w + db.x0;
+                if let Some(mask_row) = maskbuf.get(lo..lo + row.len()) {
+                  modulate(row, mask_row);
+                }
+              });
+              scratch.put_u8(maskbuf);
             }
             let kind = layer.matte.unwrap_or(1);
             for_rows_boxed(&mut buf_a, w, da, |y, row| {
               let lo = y * w + da.x0;
               if let Some(src_row) = buf_b.get(lo..lo + row.len()) {
-                apply_matte(row, src_row, kind);
+                apply_matte(row, src_row, kind, opacity_byte(src_op) as u8);
               }
             });
             scratch.put_u32(buf_b);
@@ -798,11 +787,13 @@ pub(crate) fn modulate(pixels: &mut [u32], mask: &[u8]) {
 
 /// Applies a matte source (`src`) onto `dst` premultiplied pixels.
 /// kind: 1 alpha, 2 inverted alpha, 3 luma, 4 inverted luma.
-pub(crate) fn apply_matte(dst: &mut [u32], src: &[u32], kind: u8) {
+pub(crate) fn apply_matte(dst: &mut [u32], src: &[u32], kind: u8, source_opacity: u8) {
   for (d, &s) in dst.iter_mut().zip(src.iter()) {
+    let alpha = (s >> 24) & 0xff;
+    let scaled_alpha = (alpha * u32::from(source_opacity) + 127) / 255;
     let factor = match kind {
-      1 => (s >> 24) & 0xff,
-      2 => 255 - ((s >> 24) & 0xff),
+      1 => scaled_alpha,
+      2 => 255 - scaled_alpha,
       3 => luma_premult(s),
       _ => 255 - luma_premult(s),
     };

@@ -339,13 +339,8 @@ fn parse_one_keyframe<T: Lerp>(c: &mut Cursor<'_>, parse_val: fn(&mut Cursor<'_>
   let easing = if hold {
     Easing::HOLD
   } else {
-    Easing {
-      ox: o.0,
-      oy: o.1,
-      ix: i.0,
-      iy: i.1,
-      hold: false,
-    }
+    let [ox, oy, ix, iy] = c.intern_easing([o.0, o.1, i.0, i.1]);
+    Easing { ox, oy, ix, iy, hold: false }
   };
   let spatial = match (to, ti) {
     (Some(t0), Some(t1)) if t0 != Vec2::ZERO || t1 != Vec2::ZERO => Some([t0.x, t0.y, t1.x, t1.y]),

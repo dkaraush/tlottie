@@ -291,7 +291,7 @@ mod tests {
 
     assert_eq!(parsed.backend, "cpu");
     assert!(parsed.options.antialias);
-    assert_eq!(parsed.options.curve_tolerance, 0.3);
+    assert_eq!(parsed.options.curve_tolerance, 0.125);
   }
 
   #[test]

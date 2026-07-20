@@ -213,12 +213,13 @@ fn source_over_f32(source: vec4<f32>, destination: vec4<f32>) -> vec4<f32> {
     return source + destination * (1.0 - source.a);
 }
 
-fn matte_factor(matte: vec4<u32>, kind: u32) -> u32 {
+fn matte_factor(matte: vec4<u32>, kind: u32, source_opacity: u32) -> u32 {
+    let scaled_alpha = (matte.a * source_opacity + 127u) / 255u;
     if kind == 1u {
-        return matte.a;
+        return scaled_alpha;
     }
     if kind == 2u {
-        return 255u - matte.a;
+        return 255u - scaled_alpha;
     }
     var luma = 0u;
     if matte.a != 0u {
@@ -289,7 +290,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if paint_kind == 6u {
             if layer_depth > 0u {
                 let metadata = words[paint + 4u];
-                let factor = matte_factor(matte_stack[layer_depth - 1u], metadata & 255u);
+                let factor = matte_factor(
+                    matte_stack[layer_depth - 1u],
+                    metadata & 255u,
+                    (metadata >> 8u) & 255u,
+                );
                 var source = (destination * factor + vec4<u32>(127u)) / 255u;
                 let opacity = (metadata >> 24u) & 255u;
                 source = (source * opacity + vec4<u32>(127u)) / 255u;

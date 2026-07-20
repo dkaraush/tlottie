@@ -18,6 +18,8 @@ const statsRow = document.getElementById('statsrow');
 const globalStats = document.getElementById('stats');
 const capFps = document.getElementById('capfps');
 const antialias = document.getElementById('antialias');
+const curveTolerance = document.getElementById('curvetolerance');
+const curveToleranceVal = document.getElementById('curvetoleranceval');
 const sizeSlider = document.getElementById('sizeslider');
 const sizeVal = document.getElementById('sizeval');
 const err = document.getElementById('err');
@@ -60,7 +62,8 @@ const engines = [
     height: (i) => tl.tlottie_height(i),
     frameRate: (i) => tl.tlottie_frame_rate(i),
     frameCount: (i) => tl.tlottie_frame_count(i),
-    render: (i, f, w, h, aa) => tl.tlottie_render(i, f, w, h, aa ? 1 : 0),
+    render: (i, f, w, h, aa, tolerance) =>
+      tl.tlottie_render_with_options(i, f, w, h, aa ? 1 : 0, tolerance),
   },
   {
     ...engineDom('rl'),
@@ -163,6 +166,11 @@ antialias.addEventListener('change', () => {
   const tlottie = engines.find((e) => e.key === 'tl');
   if (tlottie?.drawMs) tlottie.drawMs.length = 0;
 });
+curveTolerance.addEventListener('input', () => {
+  curveToleranceVal.textContent = `${Number(curveTolerance.value).toFixed(3)} px`;
+  const tlottie = engines.find((e) => e.key === 'tl');
+  if (tlottie?.drawMs) tlottie.drawMs.length = 0;
+});
 
 function loadLottie(bytes, name) {
   cancelAnimationFrame(raf);
@@ -260,7 +268,8 @@ function loadLottie(bytes, name) {
         if (e.inFlight) continue;  // one GPU frame in flight at a time
         const frame = pos % e.frames;
         const d0 = performance.now();
-        const px = e.render(e.inst, frame, e.w, e.h, antialias.checked);
+        const px = e.render(
+          e.inst, frame, e.w, e.h, antialias.checked, +curveTolerance.value);
         if (!px) { e.dead = true; e.statsEl.textContent = 'render failed'; continue; }
         if (e.direct) {
           // GPU submit done; sample completes when the queue drains.

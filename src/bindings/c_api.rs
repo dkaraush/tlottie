@@ -85,10 +85,26 @@ pub unsafe extern "C" fn tlottie_frame_count(anim: *const TLottieInstance) -> u3
 /// `out` must point to at least `out_len` writable `u32`s.
 #[no_mangle]
 pub unsafe extern "C" fn tlottie_render(anim: *mut TLottieInstance, frame: f32, width: u32, height: u32, out: *mut u32, out_len: usize, antialias: u32) -> i32 {
+  // SAFETY: this function has the same pointer contract as the extended API.
+  unsafe { tlottie_render_with_options(anim, frame, width, height, out, out_len, antialias, RenderOptions::default().curve_tolerance) }
+}
+
+/// Renders one frame with an explicit device-space curve tolerance.
+///
+/// `curve_tolerance` is the maximum curve-flattening error in pixels. Smaller
+/// positive values improve geometric accuracy at a performance cost. Returns
+/// -1 when the tolerance is non-finite or not positive; other status codes and
+/// safety requirements are identical to [`tlottie_render`].
+///
+/// # Safety
+/// `anim` must be a live handle returned by [`tlottie_new`].
+/// `out` must point to at least `out_len` writable `u32`s.
+#[no_mangle]
+pub unsafe extern "C" fn tlottie_render_with_options(anim: *mut TLottieInstance, frame: f32, width: u32, height: u32, out: *mut u32, out_len: usize, antialias: u32, curve_tolerance: f32) -> i32 {
   let Some(anim) = (unsafe { anim.as_mut() }) else {
     return -1;
   };
-  if out.is_null() {
+  if out.is_null() || !curve_tolerance.is_finite() || curve_tolerance <= 0.0 {
     return -1;
   }
   let Some(px) = (width as usize).checked_mul(height as usize) else {
@@ -105,6 +121,7 @@ pub unsafe extern "C" fn tlottie_render(anim: *mut TLottieInstance, frame: f32, 
     height,
     RenderOptions {
       antialias: antialias != 0,
+      curve_tolerance,
       ..RenderOptions::default()
     },
   ) {

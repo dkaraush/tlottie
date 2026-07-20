@@ -138,7 +138,7 @@ impl CPURenderer {
         self.state.put_surface_u32(source, self.width, &source_rows);
         self.row_bounds_pool.push(source_rows);
       }
-      Composite::Matte { kind, opacity } => {
+      Composite::Matte { kind, opacity, source_opacity } => {
         let Some(mut target) = self.surfaces.pop() else {
           return;
         };
@@ -149,7 +149,7 @@ impl CPURenderer {
         };
         let _source_dirty = self.surface_dirty.pop().unwrap_or_else(DirtyBox::empty);
         let source_rows = self.surface_rows.pop().unwrap_or_default();
-        apply_matte(&mut target, &source, kind);
+        apply_matte(&mut target, &source, kind, source_opacity);
         let width = self.width;
         composite_over_rows(self.active(), &target, width, &target_rows, target_dirty, opacity);
         if !target_dirty.is_empty() {

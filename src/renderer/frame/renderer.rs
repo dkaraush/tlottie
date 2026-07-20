@@ -130,7 +130,7 @@ pub enum Composite {
   Over { opacity: u8 },
   /// Applies a saved matte source to a saved target and composites it.
   /// This consumes the two most recently saved layers.
-  Matte { kind: u8, opacity: u8 },
+  Matte { kind: u8, opacity: u8, source_opacity: u8 },
 }
 
 /// Backend operations called synchronously while evaluating a frame.

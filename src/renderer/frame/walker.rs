@@ -132,13 +132,6 @@ impl RenderCtx<'_> {
       if consumed_as_matte.get(idx).copied().unwrap_or(false) || layer.matte_src || !self.layer_visible(layer, frame) {
         continue;
       }
-      if layer.matte.is_some() {
-        if let Some(src) = idx.checked_sub(1).and_then(|j| layers.get(j)) {
-          if !self.layer_visible(src, frame) {
-            continue;
-          }
-        }
-      }
       let (layer_m, layer_opacity) = layer_transform_at(layer, frame);
       let m = base.concat(parent_chain_matrix(layers, layer, frame)).concat(layer_m);
       let combined_opacity = opacity * layer_opacity;
@@ -153,12 +146,19 @@ impl RenderCtx<'_> {
         renderer.save_layer();
         let (src_m, src_opacity) = layer_transform_at(src, frame);
         let source_matrix = base.concat(parent_chain_matrix(layers, src, frame)).concat(src_m);
-        self.collect_layer_content(scratch, width, height, antialias, src, source_matrix, frame, src_opacity, clip, precomp_depth, renderer)?;
+        // A matte source's layer opacity applies to its flattened result, not
+        // independently to every child of a precomp. Carry it into the fused
+        // matte composite instead of distributing it through the source tree.
+        self.collect_layer_content(scratch, width, height, antialias, src, source_matrix, frame, 1.0, clip, precomp_depth, renderer)?;
         self.collect_masks(width, height, src, source_matrix, frame, clip, renderer);
         renderer.save_layer();
         self.collect_layer_content(scratch, width, height, antialias, layer, m, frame, 1.0, clip, precomp_depth, renderer)?;
         self.collect_masks(width, height, layer, m, frame, clip, renderer);
-        renderer.end_layer(Composite::Matte { kind, opacity: group_opacity as u8 });
+        renderer.end_layer(Composite::Matte {
+          kind,
+          opacity: group_opacity as u8,
+          source_opacity: opacity_byte(src_opacity) as u8,
+        });
         continue;
       }
       let complex_precomp = if layer.kind == LayerKind::Precomp {
