@@ -148,6 +148,13 @@ impl RenderCtx<'_> {
         let Some(src) = idx.checked_sub(1).and_then(|j| layers.get(j)) else {
           continue;
         };
+        // A track-matte consumer is transparent while its source layer is
+        // outside [ip, op). Evaluating an inactive source leaks stale matte
+        // artwork after its authored lifetime (real files use consecutive
+        // matte sources to hand content off between frame ranges).
+        if !self.layer_visible(src, frame) {
+          continue;
+        }
         renderer.save_layer();
         let (src_m, src_opacity) = layer_transform_at(src, frame);
         let source_matrix = base.concat(parent_chain_matrix(layers, src, frame)).concat(src_m);

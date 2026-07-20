@@ -1044,7 +1044,15 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
       b"ind" => index = parse_f32(c)? as i32,
       b"parent" => parent = Some(parse_f32(c)? as i32),
       b"ip" => in_point = parse_f32(c)?.round(), // patched parser: round()
-      b"op" => out_point = parse_f32(c)?.round(),
+      b"op" => {
+        let authored = parse_f32(c)?;
+        let rounded = authored.round();
+        // rlottie rounds layer boundaries to integers and considers the
+        // rounded out frame visible. Preserve half-open behavior for exact
+        // integer `op` values (the Lottie contract), but include that final
+        // rounded frame for fractional 29.97-fps exports such as 34.034.
+        out_point = rounded + if authored != rounded { 1.0 } else { 0.0 };
+      }
       // rlottie stores start_time as an int (mStartFrame); fractional
       // st truncates, shifting precomp child frames by one otherwise.
       b"st" => start_time = parse_f32(c)?.trunc(),
