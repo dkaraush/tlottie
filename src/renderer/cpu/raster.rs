@@ -8,10 +8,14 @@
 use crate::geometry::Contour;
 use crate::model::FillRule;
 
+#[path = "mapped_accumulator.rs"]
+mod mapped_accumulator;
+use mapped_accumulator::Accumulator;
+
 pub(crate) struct Rasterizer {
   w: usize,
   h: usize,
-  acc: Vec<f32>,
+  acc: Accumulator,
   /// Rows/columns touched: sweep and clear cost scale with the shape's
   /// bounding box, not the canvas (critical: dozens of small paints per
   /// frame at 512px would otherwise each pay full-width row walks).
@@ -35,7 +39,7 @@ impl Rasterizer {
     Rasterizer {
       w,
       h,
-      acc: vec![0.0; (w + 1).saturating_mul(h).saturating_add(1)],
+      acc: Accumulator::new_zeroed((w + 1).saturating_mul(h).saturating_add(1)),
       min_y: usize::MAX,
       max_y: 0,
       rows: vec![ROW_EMPTY; h],
@@ -53,7 +57,7 @@ impl Rasterizer {
   pub fn reshape(&mut self, w: usize, h: usize) {
     let need = (w + 1).saturating_mul(h).saturating_add(1);
     if self.acc.len() < need {
-      self.acc.resize(need, 0.0);
+      self.acc.resize_zeroed(need);
     }
     if self.rows.len() < h {
       self.rows.resize(h, ROW_EMPTY);
