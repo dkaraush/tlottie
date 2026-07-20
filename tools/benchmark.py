@@ -705,7 +705,7 @@ class TlottieVulkan:
     """
 
     FRAME_RE = re.compile(
-        r"VK .*?record_ns=(\d+) submit_wait_ns=(\d+) gpu_elapsed_ns=(\d+)"
+        r"VK .*?record_ns=(\d+) submit_wait_ns=(\d+) gpu_elapsed_ns=(\d+|n/a)"
     )
 
     def __init__(self, path: Path, curve_tolerance: float = 0.125, alpha_only: bool = False) -> None:
@@ -715,6 +715,8 @@ class TlottieVulkan:
         self._batch_process: subprocess.Popen[str] | None = None
         self._batch_stderr: Any = None
         self._batch_size: int | None = None
+        self.last_cpu_prepare_samples_ms: list[float] = []
+        self.last_gpu_draw_samples_ms: list[float | None] = []
 
     def _start_batch(self, size: int) -> subprocess.Popen[str]:
         if (
@@ -820,6 +822,8 @@ class TlottieVulkan:
     def _run_sequence(
         self, file: Path, size: int, start: int, frames: int, capture: bool
     ) -> tuple[bool, list[float], list[list[int]], str, float, float]:
+        self.last_cpu_prepare_samples_ms = []
+        self.last_gpu_draw_samples_ms = []
         with tempfile.TemporaryDirectory(prefix="tlottie-vulkan-") as temp:
             directory = Path(temp)
             raw_path = directory / "frames.argb"
@@ -854,9 +858,18 @@ class TlottieVulkan:
                 detail = stderr.strip()[-500:]
                 error = pipe_error or ": ".join(part for part in (protocol_error, detail) if part)
                 return False, [], [], error or "Vulkan batch exited", mem_avg, mem_max
+            timing_records = self.FRAME_RE.findall(stderr)
             samples = [
                 (int(record_ns) + int(submit_ns)) / 1_000_000.0
-                for record_ns, submit_ns, _gpu_ns in self.FRAME_RE.findall(stderr)
+                for record_ns, submit_ns, _gpu_ns in timing_records
+            ]
+            self.last_cpu_prepare_samples_ms = [
+                int(record_ns) / 1_000_000.0
+                for record_ns, _submit_ns, _gpu_ns in timing_records
+            ]
+            self.last_gpu_draw_samples_ms = [
+                None if gpu_ns == "n/a" else int(gpu_ns) / 1_000_000.0
+                for _record_ns, _submit_ns, gpu_ns in timing_records
             ]
             if len(samples) != frames:
                 error = f"expected {frames} Vulkan samples, got {len(samples)}"
@@ -1477,6 +1490,23 @@ def worker_measure(file_s: str) -> tuple[list[dict[str, Any]], dict[str, Any] | 
                     "ok": ok,
                     "first_frame_ms": first_frame_ms,
                     "frame_ms": frame_ms,
+                    "cpu_prepare_ms": (
+                        avg(_WORKER_RENDERERS[renderer].last_cpu_prepare_samples_ms)
+                        if renderer == "tlottie-vulkan"
+                        and _WORKER_RENDERERS[renderer].last_cpu_prepare_samples_ms
+                        else None
+                    ),
+                    "gpu_draw_ms": (
+                        avg_optional(_WORKER_RENDERERS[renderer].last_gpu_draw_samples_ms)
+                        if renderer == "tlottie-vulkan"
+                        and _WORKER_RENDERERS[renderer].last_gpu_draw_samples_ms
+                        else None
+                    ),
+                    "total_frame_ms": (
+                        measured_ms / (other_frames + 1)
+                        if renderer == "tlottie-vulkan" and ok
+                        else None
+                    ),
                     "other_frames": other_frames,
                     "measured_ms": measured_ms,
                     "memory_avg_mb": mem_avg,
@@ -2374,6 +2404,9 @@ def aggregate_file_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "ok": len(ok),
                 "first_frame_ms": avg([r["first_frame_ms"] for r in ok]),
                 "frame_ms": avg_optional([r["frame_ms"] for r in ok]),
+                "cpu_prepare_ms": avg_optional([r.get("cpu_prepare_ms") for r in ok]),
+                "gpu_draw_ms": avg_optional([r.get("gpu_draw_ms") for r in ok]),
+                "total_frame_ms": avg_optional([r.get("total_frame_ms") for r in ok]),
                 "other_frames": sum(r["other_frames"] for r in ok),
                 "measured_ms": sum(r["measured_ms"] for r in ok),
                 "memory_avg_mb": avg([r["memory_avg_mb"] for r in ok]),
@@ -2403,6 +2436,9 @@ def aggregate_pack_rows(file_rows: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "ok": sum(1 for r in items if r["ok"] > 0),
                 "first_frame_ms": avg([r["first_frame_ms"] for r in ok]),
                 "frame_ms": avg_optional([r["frame_ms"] for r in ok]),
+                "cpu_prepare_ms": avg_optional([r.get("cpu_prepare_ms") for r in ok]),
+                "gpu_draw_ms": avg_optional([r.get("gpu_draw_ms") for r in ok]),
+                "total_frame_ms": avg_optional([r.get("total_frame_ms") for r in ok]),
                 "other_frames": sum(r["other_frames"] for r in ok),
                 "measured_ms": sum(r["measured_ms"] for r in ok),
                 "memory_avg_mb": avg([r["memory_avg_mb"] for r in ok]),
@@ -2426,6 +2462,9 @@ def pivot_aggregate(rows: list[dict[str, Any]], key_cols: tuple[str, ...]) -> li
         out[f"{r}_files"] = row.get("files")
         out[f"{r}_first_frame_ms"] = row["first_frame_ms"] if row["ok"] else None
         out[f"{r}_frame_ms"] = row["frame_ms"] if row["ok"] else None
+        out[f"{r}_cpu_prepare_ms"] = row.get("cpu_prepare_ms") if row["ok"] else None
+        out[f"{r}_gpu_draw_ms"] = row.get("gpu_draw_ms") if row["ok"] else None
+        out[f"{r}_total_frame_ms"] = row.get("total_frame_ms") if row["ok"] else None
         out[f"{r}_other_frames"] = row.get("other_frames")
         out[f"{r}_measured_ms"] = row.get("measured_ms")
         out[f"{r}_memory_avg_mb"] = row["memory_avg_mb"] if row["ok"] else None
@@ -2444,14 +2483,15 @@ def write_tgv(path: Path, rows: list[dict[str, Any]], renderers: tuple[str, ...]
     if include_comparison:
         cols.insert(cols.index("pack") + 1, comparison_col)
     for r in renderers:
-        cols += [
-            f"{r}_first_frame_ms",
-            f"{r}_frame_ms",
-            f"{r}_memory_avg_mb",
-            f"{r}_memory_max_mb",
-            f"{r}_energy_j",
-            f"{r}_error",
-        ]
+        if r == "tlottie-vulkan":
+            cols += [
+                f"{r}_cpu_prepare_ms",
+                f"{r}_gpu_draw_ms",
+                f"{r}_total_frame_ms",
+            ]
+        else:
+            cols += [f"{r}_first_frame_ms", f"{r}_frame_ms"]
+        cols += [f"{r}_memory_avg_mb", f"{r}_memory_max_mb", f"{r}_energy_j", f"{r}_error"]
     with path.open("w", encoding="utf-8") as f:
         f.write("\t".join(cols) + "\n")
         for row in rows:
@@ -2697,14 +2737,24 @@ def write_grouped_table(
     for r in renderers:
         url = RENDERER_URLS.get(r)
         name = f"<a href='{esc(url)}'>{esc(r)}</a>" if url else esc(r)
-        f.write(f"<th colspan='4' class='renderer'>{name}</th>")
+        columns = 5 if r == "tlottie-vulkan" else 4
+        f.write(f"<th colspan='{columns}' class='renderer'>{name}</th>")
     f.write("</tr><tr>")
-    for _ in renderers:
-        f.write(
-            "<th class='metric'>fms</th><th>ms</th>"
-            f"<th>MiB (avg/max)</th>"
-            "<th class='metric-last'>J</th>"
-        )
+    for r in renderers:
+        if r == "tlottie-vulkan":
+            f.write(
+                "<th class='metric' title='Average CPU frame preparation and command-recording time'>CPU, ms</th>"
+                "<th title='Average GPU rendering timestamp'>GPU, ms</th>"
+                "<th title='Average CPU preparation plus queue submit/fence wait'>total, ms</th>"
+                "<th>MiB (avg/max)</th>"
+                "<th class='metric-last'>J</th>"
+            )
+        else:
+            f.write(
+                "<th class='metric'>fms</th><th>ms</th>"
+                "<th>MiB (avg/max)</th>"
+                "<th class='metric-last'>J</th>"
+            )
     f.write("</tr>")
     for row in rows:
         f.write("<tr>")
@@ -2723,12 +2773,23 @@ def write_grouped_table(
         for r in renderers:
             err = row.get(f"{r}_error")
             if err:
-                f.write(f"<td colspan='4' class='loser left'>{esc(err)}</td>")
+                columns = 5 if r == "tlottie-vulkan" else 4
+                f.write(f"<td colspan='{columns}' class='loser left'>{esc(err)}</td>")
                 continue
             first_cls = metric_class(row, r, "first_frame_ms", renderers)
             frame_cls = metric_class(row, r, "frame_ms", renderers)
             mem_cls = metric_class(row, r, "memory_avg_mb", renderers)
             energy_cls = metric_class(row, r, "energy_j", renderers)
+            if r == "tlottie-vulkan":
+                f.write(f"<td class='metric'>{num(row.get(f'{r}_cpu_prepare_ms'))}</td>")
+                f.write(f"<td>{num(row.get(f'{r}_gpu_draw_ms'))}</td>")
+                f.write(f"<td>{num(row.get(f'{r}_total_frame_ms'))}</td>")
+                f.write(
+                    f"<td class='{mem_cls}'>{num(row.get(f'{r}_memory_avg_mb'))} / "
+                    f"{num(row.get(f'{r}_memory_max_mb'))}</td>"
+                )
+                f.write(f"<td class='metric-last {energy_cls}'>{num(row.get(f'{r}_energy_j'))}</td>")
+                continue
             f.write(
                 f"<td class='metric {first_cls}'>{num(row.get(f'{r}_first_frame_ms'))}</td>"
             )
