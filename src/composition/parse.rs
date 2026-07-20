@@ -8,6 +8,7 @@
 //! Unsupported shape/layer types are skipped silently for now; the
 //! supported-feature report lands with a later phase.
 
+use crate::composition::options::{LayerColorReplacement, ParseOptions};
 use crate::error::{Error, JsonErrorKind, Limit, Result};
 use crate::json::Cursor;
 use crate::limits::Limits;
@@ -1038,10 +1039,12 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
   let mut solid_color: Option<Color> = None;
   let mut time_remap_pos: Option<usize> = None;
   let mut auto_orient = false;
+  let mut name = String::new();
 
   for_each_field(c, |c, key| {
     match key {
       b"ty" => ty = parse_f32(c)? as u8,
+      b"nm" => name = String::from_utf8_lossy(c.read_string_bytes()?).into_owned(),
       b"ind" => index = parse_f32(c)? as i32,
       b"parent" => parent = Some(parse_f32(c)? as i32),
       b"ip" => in_point = parse_f32(c)?.round(), // patched parser: round()
@@ -1144,7 +1147,9 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
     (LayerKind::Precomp, Some(pos)) => Some(parse_property(&mut c.fork_at(pos), limits, parse_scalar)?),
     _ => None,
   };
-  Ok(Layer {
+  let layer = Layer {
+    name,
+    color_override: None,
     kind,
     index,
     parent,
@@ -1163,7 +1168,118 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
     solid,
     time_remap,
     auto_orient,
+  };
+  Ok(layer)
+}
+
+fn argb_color(argb: u32) -> Color {
+  Color {
+    r: ((argb >> 16) & 0xff) as f32 / 255.0,
+    g: ((argb >> 8) & 0xff) as f32 / 255.0,
+    b: (argb & 0xff) as f32 / 255.0,
+    a: ((argb >> 24) & 0xff) as f32 / 255.0,
+  }
+}
+
+fn apply_layer_color(layer: &mut Layer, replacement: &LayerColorReplacement) {
+  layer.color_override = Some(argb_color(replacement.color));
+}
+
+#[derive(Clone, Copy)]
+struct FitzEntry {
+  original: u32,
+  replacements: [u32; 5],
+}
+
+fn parse_fitz_entries(c: &mut Cursor<'_>, entries: &mut Vec<FitzEntry>) -> Result<()> {
+  for_each_element(c, |c| {
+    let mut entry = FitzEntry { original: 0, replacements: [0; 5] };
+    for_each_field(c, |c, key| {
+      let target = match key {
+        b"o" => Some(&mut entry.original),
+        b"f12" => entry.replacements.get_mut(0),
+        b"f3" => entry.replacements.get_mut(1),
+        b"f4" => entry.replacements.get_mut(2),
+        b"f5" => entry.replacements.get_mut(3),
+        b"f6" => entry.replacements.get_mut(4),
+        _ => None,
+      };
+      if let Some(target) = target {
+        *target = c.parse_f64()? as u32;
+      } else {
+        c.skip_value()?;
+      }
+      Ok(())
+    })?;
+    entries.push(entry);
+    Ok(())
   })
+}
+
+fn fitz_key(color: Color) -> u32 {
+  let r = (color.r * 255.0).round() as u32 & 0xff;
+  let g = (color.g * 255.0).round() as u32 & 0xff;
+  let b = (color.b * 255.0).round() as u32 & 0xff;
+  (r << 16) | (g << 8) | b
+}
+
+fn fitz_color(encoded: u32) -> Color {
+  Color {
+    r: ((encoded >> 16) & 0xff) as f32 / 255.0,
+    g: ((encoded >> 8) & 0xff) as f32 / 255.0,
+    b: (encoded & 0xff) as f32 / 255.0,
+    a: 1.0,
+  }
+}
+
+fn replace_fitz_color(color: &mut Color, entries: &[FitzEntry], index: usize) {
+  let key = fitz_key(*color);
+  if let Some(replacement) = entries
+    .iter()
+    .find(|entry| entry.original == key)
+    .and_then(|entry| entry.replacements.get(index))
+    .copied()
+    .filter(|value| *value != 0)
+  {
+    let alpha = color.a;
+    *color = fitz_color(replacement);
+    color.a = alpha;
+  }
+}
+
+fn apply_fitz_shapes(shapes: &mut [Shape], entries: &[FitzEntry], index: usize) {
+  for shape in shapes {
+    match shape {
+      Shape::Group(group) => apply_fitz_shapes(&mut group.shapes, entries, index),
+      Shape::Fill(fill) => fill.color.map_values(|color| replace_fitz_color(color, entries, index)),
+      Shape::Stroke(stroke) => stroke.color.map_values(|color| replace_fitz_color(color, entries, index)),
+      _ => {}
+    }
+  }
+}
+
+fn apply_fitz_layers(layers: &mut [Layer], entries: &[FitzEntry], index: usize) {
+  for layer in layers {
+    apply_fitz_shapes(&mut layer.shapes, entries, index);
+    if let Some((_, _, color)) = &mut layer.solid {
+      replace_fitz_color(color, entries, index);
+    }
+  }
+}
+
+fn apply_fitz(layers: &mut [Layer], assets: &mut [Asset], entries: &[FitzEntry], index: usize) {
+  apply_fitz_layers(layers, entries, index);
+  for asset in assets {
+    apply_fitz_layers(&mut asset.layers, entries, index);
+  }
+}
+
+fn apply_layer_replacements(layers: &mut [Layer], replacements: &[LayerColorReplacement]) {
+  for layer in layers {
+    if let Some(replacement) = replacements.iter().find(|replacement| layer.name.starts_with(&replacement.layer_name_prefix)) {
+      apply_layer_color(layer, replacement);
+    }
+  }
 }
 
 /// `#rrggbb` or `#rrggbbaa` solid-layer color.
@@ -1300,7 +1416,7 @@ fn parse_asset(c: &mut Cursor<'_>, limits: &Limits, total_layers: &mut usize) ->
 // Top level
 // ---------------------------------------------------------------------------
 
-pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits) -> Result<Composition> {
+pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOptions) -> Result<Composition> {
   if bytes.len() > limits.max_input_bytes {
     return Err(Error::LimitExceeded(Limit::InputBytes));
   }
@@ -1314,6 +1430,7 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits) -> Result<Composi
   let mut layers: Vec<Layer> = Vec::new();
   let mut assets: Vec<Asset> = Vec::new();
   let mut total_layers = 0usize;
+  let mut fitz_entries = Vec::new();
 
   for_each_field(&mut c, |c, key| {
     match key {
@@ -1343,6 +1460,7 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits) -> Result<Composi
           Ok(())
         })?;
       }
+      b"fitz" => parse_fitz_entries(c, &mut fitz_entries)?,
       _ => c.skip_value()?,
     }
     Ok(())
@@ -1381,6 +1499,14 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits) -> Result<Composi
     && layers
       .iter()
       .all(|layer| layer.hidden || layer.out_point <= in_point as f32 || layer.in_point >= out_point as f32 || (layer.in_point <= in_point as f32 && layer.out_point >= out_point as f32));
+
+  if let Some(index) = options.fitz_modifier.replacement_index() {
+    apply_fitz(&mut layers, &mut assets, &fitz_entries, index);
+  }
+  apply_layer_replacements(&mut layers, &options.layer_color_replacements);
+  for asset in &mut assets {
+    apply_layer_replacements(&mut asset.layers, &options.layer_color_replacements);
+  }
 
   Ok(Composition {
     width: width as u32,

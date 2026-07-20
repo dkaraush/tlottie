@@ -47,6 +47,7 @@ pub mod internal {
   pub use crate::renderer::frame::*;
 }
 
+pub use composition::options::{FitzModifier, LayerColorReplacement, ParseOptions};
 pub use error::{Error, JsonErrorKind, Limit, Result};
 pub use limits::Limits;
 pub use model::Composition;
@@ -58,7 +59,15 @@ impl Composition {
   /// Never panics; any malformed, truncated, or hostile input returns an
   /// [`Error`]. Resource consumption is bounded by `limits`.
   pub fn parse(json: &[u8], limits: &Limits) -> Result<Composition> {
-    parse::parse_composition(json, limits)
+    parse::parse_composition(json, limits, &ParseOptions::default())
+  }
+
+  /// Parses a Lottie composition and applies constructor-time customizations.
+  ///
+  /// Fitz and layer-name color replacements are folded into the immutable
+  /// model once; rendering does not parse or match keypaths again.
+  pub fn parse_with_options(json: &[u8], limits: &Limits, options: &ParseOptions) -> Result<Composition> {
+    parse::parse_composition(json, limits, options)
   }
 }
 

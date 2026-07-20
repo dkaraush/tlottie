@@ -406,3 +406,4 @@ impl Drop for ThorvgGl {
         }
     }
 }
+

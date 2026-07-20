@@ -1,9 +1,10 @@
 use super::*;
+use crate::FitzModifier;
 
 const MINIMAL: &str = r#"{"v":"5.5.2","fr":60,"ip":0,"op":180,"w":512,"h":512,"nm":"t","layers":[]}"#;
 
 fn parse(s: &str) -> Result<Composition> {
-  parse_composition(s.as_bytes(), &Limits::default())
+  parse_composition(s.as_bytes(), &Limits::default(), &ParseOptions::default())
 }
 
 #[test]
@@ -27,7 +28,7 @@ fn rejects_truncated_input() {
   let bytes = MINIMAL.as_bytes();
   for cut in 1..bytes.len() {
     let sliced = &bytes[..cut];
-    assert!(parse_composition(sliced, &Limits::default()).is_err(), "accepted truncation at {cut}");
+    assert!(parse_composition(sliced, &Limits::default(), &ParseOptions::default()).is_err(), "accepted truncation at {cut}");
   }
 }
 
@@ -93,6 +94,93 @@ fn parses_shape_layer() {
   assert!(matches!(g.shapes.get(1), Some(Shape::Fill(_))));
   assert!(comp.is_static());
   assert_eq!(comp.frame_count(), 1);
+}
+
+#[test]
+fn applies_fitz_table_once_during_parse() {
+  let json = r#"{"fr":30,"ip":0,"op":30,"w":16,"h":16,
+    "fitz":[{"o":16711680,"f3":255}],
+    "layers":[{"ty":4,"nm":"Skin","ind":1,"ip":0,"op":30,"ks":{},"shapes":[
+      {"ty":"fl","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100}}
+    ]}]}"#;
+  let options = ParseOptions {
+    fitz_modifier: FitzModifier::Type3,
+    ..ParseOptions::default()
+  };
+  let comp = parse_composition(json.as_bytes(), &Limits::default(), &options).unwrap();
+  let Some(Shape::Fill(fill)) = comp.layers[0].shapes.first() else {
+    panic!("expected fill");
+  };
+  assert_eq!(fill.color.eval(0.0), Color { r: 0.0, g: 0.0, b: 1.0, a: 1.0 });
+}
+
+#[test]
+fn layer_prefix_color_is_full_argb_and_wins_over_fitz() {
+  let json = r#"{"fr":30,"ip":0,"op":30,"w":16,"h":16,
+    "fitz":[{"o":16711680,"f3":255}],
+    "layers":[
+      {"ty":4,"nm":"Accent primary","ind":1,"ip":0,"op":30,"ks":{},"shapes":[
+        {"ty":"fl","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100}}
+      ]},
+      {"ty":4,"nm":"Other","ind":2,"ip":0,"op":30,"ks":{},"shapes":[
+        {"ty":"fl","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100}}
+      ]}
+    ]}"#;
+  let options = ParseOptions {
+    fitz_modifier: FitzModifier::Type3,
+    layer_color_replacements: vec![LayerColorReplacement {
+      layer_name_prefix: "Accent".into(),
+      color: 0x8040_80c0,
+    }],
+  };
+  let comp = parse_composition(json.as_bytes(), &Limits::default(), &options).unwrap();
+  assert_eq!(
+    comp.layers[0].color_override,
+    Some(Color {
+      r: 64.0 / 255.0,
+      g: 128.0 / 255.0,
+      b: 192.0 / 255.0,
+      a: 128.0 / 255.0
+    })
+  );
+  let Some(Shape::Fill(other)) = comp.layers[1].shapes.first() else {
+    panic!("expected other fill");
+  };
+  assert_eq!(other.color.eval(0.0), Color { r: 0.0, g: 0.0, b: 1.0, a: 1.0 });
+}
+
+#[cfg(feature = "cpu")]
+#[test]
+fn layer_prefix_color_propagates_through_a_precomp_instance() {
+  let json = r##"{"fr":30,"ip":0,"op":30,"w":1,"h":1,
+    "assets":[{"id":"asset","layers":[
+      {"ty":1,"nm":"shared solid","ind":1,"ip":0,"op":30,"sw":1,"sh":1,"sc":"#ff0000","ks":{}}
+    ]}],
+    "layers":[{"ty":0,"nm":"Comp 1","ind":1,"ip":0,"op":30,"w":1,"h":1,"refId":"asset","ks":{}}]
+  }"##;
+  let options = ParseOptions {
+    layer_color_replacements: vec![LayerColorReplacement {
+      layer_name_prefix: "Comp 1".into(),
+      color: 0x8000_ff00,
+    }],
+    ..ParseOptions::default()
+  };
+  let comp = parse_composition(json.as_bytes(), &Limits::default(), &options).unwrap();
+  let mut renderer = crate::CPURenderer::new(comp);
+  let mut pixel = [0u32];
+  renderer
+    .render(
+      0.0,
+      &mut pixel,
+      1,
+      1,
+      crate::RenderOptions {
+        antialias: false,
+        ..crate::RenderOptions::default()
+      },
+    )
+    .unwrap();
+  assert_eq!(pixel[0], 0x8000_8000);
 }
 
 #[test]

@@ -4,7 +4,7 @@
 
 use std::process::ExitCode;
 
-use tlottie::{CPURenderer, Composition, Limits, RenderOptions};
+use tlottie::{CPURenderer, Composition, FitzModifier, LayerColorReplacement, Limits, ParseOptions, RenderOptions};
 
 #[path = "../pixel.rs"]
 mod pixel;
@@ -18,11 +18,45 @@ struct RenderArgs<'a> {
   size: &'a str,
   out: &'a str,
   options: RenderOptions,
+  parse_options: ParseOptions,
+}
+
+fn parse_fitz(value: &str) -> Result<FitzModifier, String> {
+  match value.to_ascii_lowercase().as_str() {
+    "none" | "0" => Ok(FitzModifier::None),
+    "12" | "1-2" | "type12" => Ok(FitzModifier::Type12),
+    "3" | "type3" => Ok(FitzModifier::Type3),
+    "4" | "type4" => Ok(FitzModifier::Type4),
+    "5" | "type5" => Ok(FitzModifier::Type5),
+    "6" | "type6" => Ok(FitzModifier::Type6),
+    _ => Err("--fitz requires none, 12, 3, 4, 5, or 6".into()),
+  }
+}
+
+fn parse_layer_color(value: &str) -> Result<LayerColorReplacement, String> {
+  let (prefix, raw_color) = value.split_once('=').ok_or("--layer-color requires PREFIX=AARRGGBB")?;
+  if prefix.is_empty() {
+    return Err("--layer-color prefix cannot be empty".into());
+  }
+  let raw_color = raw_color
+    .strip_prefix("0x")
+    .or_else(|| raw_color.strip_prefix("0X"))
+    .or_else(|| raw_color.strip_prefix('#'))
+    .unwrap_or(raw_color);
+  if raw_color.len() != 8 {
+    return Err("--layer-color requires an 8-digit AARRGGBB color".into());
+  }
+  let color = u32::from_str_radix(raw_color, 16).map_err(|_| "--layer-color requires an 8-digit AARRGGBB color")?;
+  Ok(LayerColorReplacement {
+    layer_name_prefix: prefix.to_owned(),
+    color,
+  })
 }
 
 fn parse_render_args(args: &[String]) -> Result<RenderArgs<'_>, String> {
   let mut backend = "cpu";
   let mut options = RenderOptions::default();
+  let mut parse_options = ParseOptions::default();
   let mut positional = Vec::with_capacity(4);
   let mut args = args.iter();
 
@@ -39,6 +73,10 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs<'_>, String> {
         }
       }
       "--alpha-only" | "--single-color" => options.alpha_only = true,
+      "--fitz" => parse_options.fitz_modifier = parse_fitz(args.next().ok_or("--fitz requires a value")?)?,
+      "--layer-color" => parse_options
+        .layer_color_replacements
+        .push(parse_layer_color(args.next().ok_or("--layer-color requires PREFIX=AARRGGBB")?)?),
       option if option.starts_with("--aa=") || option.starts_with("--antialias=") => {
         let Some((_, value)) = option.split_once('=') else {
           return Err(format!("invalid antialias option: {option}"));
@@ -64,6 +102,7 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs<'_>, String> {
     size,
     out,
     options,
+    parse_options,
   })
 }
 
@@ -80,8 +119,8 @@ fn main() -> ExitCode {
 
 fn usage() -> ExitCode {
   eprintln!("usage: tlottie-cli info <file.json>...");
-  eprintln!("       tlottie-cli render [--backend cpu|vulkan] [--alpha-only] [--curve-tolerance <pixels>] <file.json> <frame> <size> <out.png>");
-  eprintln!("       tlottie-cli bench [--alpha-only] [--curve-tolerance <pixels>] <file.json> <size> <frames>");
+  eprintln!("       tlottie-cli render [--fitz 12|3|4|5|6] [--layer-color PREFIX=AARRGGBB] [render options] <file.json> <frame> <size> <out.png>");
+  eprintln!("       tlottie-cli bench [--fitz 12|3|4|5|6] [--layer-color PREFIX=AARRGGBB] [render options] <file.json> <size> <frames>");
   eprintln!("       tlottie-cli vulkan-batch [--alpha-only] [--curve-tolerance <pixels>] <size>");
   ExitCode::from(2)
 }
@@ -119,6 +158,7 @@ fn vulkan_batch_cmd(args: &[String]) -> ExitCode {
 
 fn bench_cmd(args: &[String]) -> ExitCode {
   let mut options = RenderOptions::default();
+  let mut parse_options = ParseOptions::default();
   let mut positional = Vec::with_capacity(3);
   let mut args = args.iter();
   while let Some(arg) = args.next() {
@@ -139,6 +179,32 @@ fn bench_cmd(args: &[String]) -> ExitCode {
         options.curve_tolerance = value;
       }
       "--alpha-only" | "--single-color" => options.alpha_only = true,
+      "--fitz" => {
+        let Some(value) = args.next() else {
+          eprintln!("bench: --fitz requires a value");
+          return ExitCode::from(2);
+        };
+        match parse_fitz(value) {
+          Ok(value) => parse_options.fitz_modifier = value,
+          Err(error) => {
+            eprintln!("bench: {error}");
+            return ExitCode::from(2);
+          }
+        }
+      }
+      "--layer-color" => {
+        let Some(value) = args.next() else {
+          eprintln!("bench: --layer-color requires PREFIX=AARRGGBB");
+          return ExitCode::from(2);
+        };
+        match parse_layer_color(value) {
+          Ok(value) => parse_options.layer_color_replacements.push(value),
+          Err(error) => {
+            eprintln!("bench: {error}");
+            return ExitCode::from(2);
+          }
+        }
+      }
       option if option.starts_with("--") => {
         eprintln!("bench: unknown option: {option}");
         return ExitCode::from(2);
@@ -166,7 +232,7 @@ fn bench_cmd(args: &[String]) -> ExitCode {
       return ExitCode::FAILURE;
     }
   };
-  let composition = match Composition::parse(&bytes, &Limits::default()) {
+  let composition = match Composition::parse_with_options(&bytes, &Limits::default(), &parse_options) {
     Ok(composition) => composition,
     Err(error) => {
       eprintln!("bench: {file}: parse error: {error}");
@@ -203,7 +269,7 @@ fn render_cmd(args: &[String]) -> ExitCode {
       return usage();
     }
   };
-  render(args.file, args.frame, args.size, args.out, args.backend, args.options)
+  render(args.file, args.frame, args.size, args.out, args.backend, args.options, &args.parse_options)
 }
 
 fn info(files: &[String]) -> ExitCode {
@@ -245,7 +311,7 @@ fn info(files: &[String]) -> ExitCode {
   }
 }
 
-fn render(file: &str, frame: &str, size: &str, out: &str, backend: &str, options: RenderOptions) -> ExitCode {
+fn render(file: &str, frame: &str, size: &str, out: &str, backend: &str, options: RenderOptions, parse_options: &ParseOptions) -> ExitCode {
   let (Ok(frame), Ok(size)) = (frame.parse::<f32>(), size.parse::<u32>()) else {
     eprintln!("bad frame/size");
     return ExitCode::from(2);
@@ -261,7 +327,7 @@ fn render(file: &str, frame: &str, size: &str, out: &str, backend: &str, options
       return ExitCode::FAILURE;
     }
   };
-  let comp = match Composition::parse(&bytes, &Limits::default()) {
+  let comp = match Composition::parse_with_options(&bytes, &Limits::default(), parse_options) {
     Ok(c) => c,
     Err(e) => {
       eprintln!("{file}: parse error: {e}");
@@ -358,5 +424,27 @@ mod tests {
   fn rejects_invalid_antialias_value() {
     let values = args(&["--aa=maybe", "animation.json", "0", "256", "out.png"]);
     assert!(parse_render_args(&values).is_err());
+  }
+
+  #[test]
+  fn parses_fitz_and_full_argb_layer_colors() {
+    let values = args(&[
+      "--fitz",
+      "5",
+      "--layer-color",
+      "Accent=804080c0",
+      "--layer-color",
+      "Other=0xff102030",
+      "animation.json",
+      "0",
+      "256",
+      "out.png",
+    ]);
+    let parsed = parse_render_args(&values).unwrap();
+    assert_eq!(parsed.parse_options.fitz_modifier, FitzModifier::Type5);
+    assert_eq!(parsed.parse_options.layer_color_replacements.len(), 2);
+    assert_eq!(parsed.parse_options.layer_color_replacements[0].layer_name_prefix, "Accent");
+    assert_eq!(parsed.parse_options.layer_color_replacements[0].color, 0x8040_80c0);
+    assert_eq!(parsed.parse_options.layer_color_replacements[1].color, 0xff10_2030);
   }
 }
