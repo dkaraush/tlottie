@@ -73,6 +73,7 @@ fn main() -> ExitCode {
     Some((cmd, files)) if cmd == "info" && !files.is_empty() => info(files),
     Some((cmd, rest)) if cmd == "render" => render_cmd(rest),
     Some((cmd, rest)) if cmd == "bench" => bench_cmd(rest),
+    Some((cmd, rest)) if cmd == "vulkan-batch" => vulkan_batch_cmd(rest),
     _ => usage(),
   }
 }
@@ -81,7 +82,39 @@ fn usage() -> ExitCode {
   eprintln!("usage: tlottie-cli info <file.json>...");
   eprintln!("       tlottie-cli render [--backend cpu|vulkan] [--alpha-only] [--curve-tolerance <pixels>] <file.json> <frame> <size> <out.png>");
   eprintln!("       tlottie-cli bench [--alpha-only] [--curve-tolerance <pixels>] <file.json> <size> <frames>");
+  eprintln!("       tlottie-cli vulkan-batch [--alpha-only] [--curve-tolerance <pixels>] <size>");
   ExitCode::from(2)
+}
+
+fn vulkan_batch_cmd(args: &[String]) -> ExitCode {
+  let mut options = RenderOptions::default();
+  let mut size = None;
+  let mut args = args.iter();
+  while let Some(arg) = args.next() {
+    match arg.as_str() {
+      "--curve-tolerance" => {
+        let Some(value) = args.next().and_then(|value| value.parse::<f32>().ok()).filter(|value| value.is_finite() && *value > 0.0) else {
+          eprintln!("vulkan-batch: --curve-tolerance requires a positive number");
+          return ExitCode::from(2);
+        };
+        options.curve_tolerance = value;
+      }
+      "--alpha-only" | "--single-color" => options.alpha_only = true,
+      option if option.starts_with("--") => {
+        eprintln!("vulkan-batch: unknown option: {option}");
+        return ExitCode::from(2);
+      }
+      value if size.is_none() => size = value.parse::<u32>().ok().filter(|size| *size > 0),
+      value => {
+        eprintln!("vulkan-batch: unexpected argument: {value}");
+        return ExitCode::from(2);
+      }
+    }
+  }
+  let Some(size) = size else {
+    return usage();
+  };
+  vulkan_host::batch(size, size, options)
 }
 
 fn bench_cmd(args: &[String]) -> ExitCode {

@@ -89,27 +89,34 @@ def run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
     subprocess.run(cmd, cwd=cwd, env=env, check=True)
 
 
-def ensure_builds(skip: bool) -> None:
-    validate_project_dirs()
+def ensure_builds(skip: bool, required: set[str]) -> None:
+    validate_project_dirs(required)
     if skip:
-        validate_libs()
+        validate_libs(required)
         return
     env = os.environ.copy()
     env["RUSTFLAGS"] = env.get("RUSTFLAGS", "-C target-cpu=native")
-    run(["cargo", "build", "--release", "--lib", "--features", "c-api"], ROOT, env)
-    run(
-        [
-            "cargo",
-            "build",
-            "--release",
-            "--bin",
-            "tlottie-cli",
-            "--features",
-            "cli,vulkan",
-        ],
-        ROOT,
-        env,
-    )
+    if "tlottie" in required:
+        run(["cargo", "build", "--release", "--lib", "--features", "c-api"], ROOT, env)
+    if "tlottie-vulkan" in required:
+        run(
+            [
+                "cargo",
+                "build",
+                "--release",
+                "--bin",
+                "tlottie-cli",
+                "--features",
+                "cli,vulkan",
+            ],
+            ROOT,
+            env,
+        )
+
+    external = required.intersection(PROJECT_DIRS)
+    if not external:
+        validate_libs(required)
+        return
 
     meson = shutil_which("meson")
     if not meson:
@@ -152,22 +159,26 @@ def ensure_builds(skip: bool) -> None:
         # Apple clang ships without OpenMP; thorvg's default extra=[...,'openmp']
         # defines THORVG_OPENMP_SUPPORT even when meson can't find the runtime.
         thorvg_args.append("-Dextra=lottie_exp")
-    run(
-        setup_cmd(PROJECTS / "thorvg") + thorvg_args,
-        PROJECT_DIRS["thorvg"],
-        meson_env,
-    )
-    run([meson, "compile", "-C", "build-release"], PROJECT_DIRS["thorvg"], meson_env)
+    if "thorvg" in external:
+        run(
+            setup_cmd(PROJECTS / "thorvg") + thorvg_args,
+            PROJECT_DIRS["thorvg"],
+            meson_env,
+        )
+        run([meson, "compile", "-C", "build-release"], PROJECT_DIRS["thorvg"], meson_env)
 
-    run(
-        setup_cmd(PROJECTS / "rlottie", rlottie_cpp_args)
-        + ["-Dexample=false", "-Dtest=false"],
-        PROJECT_DIRS["rlottie"],
-        meson_env,
-    )
-    run([meson, "compile", "-C", "build-release"], PROJECT_DIRS["rlottie"], meson_env)
+    if "rlottie" in external:
+        run(
+            setup_cmd(PROJECTS / "rlottie", rlottie_cpp_args)
+            + ["-Dexample=false", "-Dtest=false"],
+            PROJECT_DIRS["rlottie"],
+            meson_env,
+        )
+        run([meson, "compile", "-C", "build-release"], PROJECT_DIRS["rlottie"], meson_env)
 
     for project_name in ("rlottie_2019", "rlottie_2019_patched"):
+        if project_name not in external:
+            continue
         project = PROJECT_DIRS[project_name]
         run(
             setup_cmd(project, rlottie_cpp_args)
@@ -181,12 +192,14 @@ def ensure_builds(skip: bool) -> None:
             meson_env,
         )
         run([meson, "compile", "-C", "build-release"], project, meson_env)
-    validate_libs()
+    validate_libs(required)
 
 
-def validate_project_dirs() -> None:
+def validate_project_dirs(required: set[str]) -> None:
     resolved: dict[Path, str] = {}
     for renderer, project in PROJECT_DIRS.items():
+        if renderer not in required:
+            continue
         if not project.exists():
             raise SystemExit(f"{renderer} project not found: {project}")
         real = project.resolve()
@@ -198,9 +211,11 @@ def validate_project_dirs() -> None:
         resolved[real] = renderer
 
 
-def validate_libs() -> None:
+def validate_libs(required: set[str]) -> None:
     resolved: dict[Path, str] = {}
     for renderer, lib in LIBS.items():
+        if renderer not in required:
+            continue
         if not lib.exists():
             raise SystemExit(f"{renderer} library not found: {lib}")
         real = lib.resolve()
@@ -694,6 +709,43 @@ class TlottieVulkan:
         self.cli = path
         self.curve_tolerance = curve_tolerance
         self.alpha_only = alpha_only
+        self._batch_process: subprocess.Popen[str] | None = None
+        self._batch_stderr: Any = None
+        self._batch_size: int | None = None
+
+    def _start_batch(self, size: int) -> subprocess.Popen[str]:
+        if (
+            self._batch_process is not None
+            and self._batch_process.poll() is None
+            and self._batch_size == size
+        ):
+            return self._batch_process
+        if self._batch_process is not None and self._batch_process.poll() is None:
+            self._batch_process.terminate()
+            self._batch_process.wait()
+        if self._batch_stderr is not None:
+            self._batch_stderr.close()
+        command = [
+            str(self.cli),
+            "vulkan-batch",
+            "--curve-tolerance",
+            str(self.curve_tolerance),
+            str(size),
+        ]
+        if self.alpha_only:
+            command.insert(2, "--alpha-only")
+        self._batch_stderr = tempfile.TemporaryFile()
+        self._batch_process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self._batch_stderr,
+            text=True,
+            bufsize=1,
+        )
+        self._batch_size = size
+        return self._batch_process
 
     @staticmethod
     def frame_count(file: Path) -> int:
@@ -765,52 +817,40 @@ class TlottieVulkan:
     def _run_sequence(
         self, file: Path, size: int, start: int, frames: int, capture: bool
     ) -> tuple[bool, list[float], list[list[int]], str, float, float]:
-        env = os.environ.copy()
-        env["TLOTTIE_VK_FRAMES"] = str(frames)
         with tempfile.TemporaryDirectory(prefix="tlottie-vulkan-") as temp:
             directory = Path(temp)
-            out = directory / "last.png"
-            raw_dir = directory / "raw"
-            if capture:
-                env["TLOTTIE_VK_RAW_DIR"] = str(raw_dir)
-            memory_samples: list[float] = []
-            with tempfile.TemporaryFile() as stderr_file:
-                command = [
-                        str(self.cli),
-                        "render",
-                        "--backend",
-                        "vulkan",
-                        "--antialias",
-                        "--curve-tolerance",
-                        str(self.curve_tolerance),
-                        str(file),
-                        str(start),
-                        str(size),
-                        str(out),
-                    ]
-                if self.alpha_only:
-                    command.insert(2, "--alpha-only")
-                proc = subprocess.Popen(
-                    command,
-                    cwd=ROOT,
-                    env=env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=stderr_file,
-                )
-                while proc.poll() is None:
-                    memory = process_memory_mb(proc.pid)
-                    if memory > 0.0:
-                        memory_samples.append(memory)
-                    time.sleep(0.001)
-                memory = process_memory_mb(proc.pid)
-                if memory > 0.0:
-                    memory_samples.append(memory)
-                stderr_file.seek(0)
-                stderr = stderr_file.read().decode(errors="replace")
-            mem_avg = avg(memory_samples)
-            mem_max = max(memory_samples, default=0.0)
-            if proc.returncode != 0:
-                return False, [], [], stderr.strip()[-500:], mem_avg, mem_max
+            raw_path = directory / "frames.argb"
+            proc = self._start_batch(size)
+            if proc.stdin is None or proc.stdout is None or self._batch_stderr is None:
+                return False, [], [], "Vulkan batch pipes unavailable", 0.0, 0.0
+            stderr_file = self._batch_stderr
+            stderr_file.seek(0, os.SEEK_END)
+            stderr_start = stderr_file.tell()
+            raw_field = str(raw_path) if capture else "-"
+            if any("\t" in value or "\n" in value for value in (str(file), raw_field)):
+                return False, [], [], "tab or newline in Vulkan batch path", 0.0, 0.0
+            try:
+                proc.stdin.write(f"{file}\t{start}\t{frames}\t{raw_field}\n")
+                proc.stdin.flush()
+                response = proc.stdout.readline().rstrip("\r\n")
+            except (BrokenPipeError, OSError) as error:
+                response = ""
+                pipe_error = str(error)
+            else:
+                pipe_error = ""
+            stderr_file.seek(0, os.SEEK_END)
+            stderr_end = stderr_file.tell()
+            stderr_file.seek(stderr_start)
+            stderr = stderr_file.read(stderr_end - stderr_start).decode(errors="replace")
+            memory = process_memory_mb(proc.pid) if proc.poll() is None else 0.0
+            mem_avg = memory
+            mem_max = memory
+            fields = response.split("\t")
+            if not fields or fields[0] != "OK":
+                protocol_error = "\t".join(fields[1:]) if len(fields) > 1 else ""
+                detail = stderr.strip()[-500:]
+                error = pipe_error or ": ".join(part for part in (protocol_error, detail) if part)
+                return False, [], [], error or "Vulkan batch exited", mem_avg, mem_max
             samples = [
                 (int(record_ns) + int(submit_ns)) / 1_000_000.0
                 for record_ns, submit_ns, _gpu_ns in self.FRAME_RE.findall(stderr)
@@ -822,16 +862,16 @@ class TlottieVulkan:
             if capture:
                 pixel_count = size * size
                 expected_bytes = pixel_count * 4
-                for index in range(frames):
-                    path = raw_dir / f"frame-{index:06}.argb"
-                    try:
-                        data = path.read_bytes()
-                    except OSError as error:
-                        return False, [], [], f"read {path.name}: {error}", mem_avg, mem_max
-                    if len(data) != expected_bytes:
-                        error = f"{path.name}: {len(data)} != {expected_bytes} bytes"
-                        return False, [], [], error, mem_avg, mem_max
-                    pixels.append(data)
+                expected_total = expected_bytes * frames
+                try:
+                    data = raw_path.read_bytes()
+                except OSError as error:
+                    return False, [], [], f"read {raw_path.name}: {error}", mem_avg, mem_max
+                if len(data) != expected_total:
+                    error = f"{raw_path.name}: {len(data)} != {expected_total} bytes"
+                    return False, [], [], error, mem_avg, mem_max
+                raw = memoryview(data)
+                pixels = [raw[offset : offset + expected_bytes] for offset in range(0, expected_total, expected_bytes)]
             return True, samples, pixels, "", mem_avg, mem_max
 
 
@@ -1560,6 +1600,7 @@ _ACCURACY_FRAMES = 0
 _ACCURACY_TOLERANCE = 8
 _ACCURACY_DIFF_THRESHOLD = 1.0
 _ACCURACY_INCLUDE_VULKAN = False
+_ACCURACY_DIRECT_VULKAN = False
 _ACCURACY_CURVE_TOLERANCE = 0.125
 _ACCURACY_ALPHA_ONLY = False
 
@@ -1571,23 +1612,28 @@ def init_accuracy_worker(
     tolerance: int,
     diff_threshold: float,
     include_vulkan: bool,
+    direct_vulkan: bool,
     curve_tolerance: float,
     alpha_only: bool,
 ) -> None:
-    global _ACCURACY_RENDERERS, _ACCURACY_ROOT, _ACCURACY_SIZE, _ACCURACY_FRAMES, _ACCURACY_TOLERANCE, _ACCURACY_DIFF_THRESHOLD, _ACCURACY_INCLUDE_VULKAN, _ACCURACY_CURVE_TOLERANCE, _ACCURACY_ALPHA_ONLY
+    global _ACCURACY_RENDERERS, _ACCURACY_ROOT, _ACCURACY_SIZE, _ACCURACY_FRAMES, _ACCURACY_TOLERANCE, _ACCURACY_DIFF_THRESHOLD, _ACCURACY_INCLUDE_VULKAN, _ACCURACY_DIRECT_VULKAN, _ACCURACY_CURVE_TOLERANCE, _ACCURACY_ALPHA_ONLY
     _ACCURACY_ROOT = Path(root)
     _ACCURACY_SIZE = size
     _ACCURACY_FRAMES = frames
     _ACCURACY_TOLERANCE = tolerance
     _ACCURACY_DIFF_THRESHOLD = diff_threshold
     _ACCURACY_INCLUDE_VULKAN = include_vulkan
+    _ACCURACY_DIRECT_VULKAN = direct_vulkan
     _ACCURACY_CURVE_TOLERANCE = curve_tolerance
     _ACCURACY_ALPHA_ONLY = alpha_only
     _ACCURACY_RENDERERS = {
         "tlottie": Tlottie(LIBS["tlottie"], curve_tolerance, alpha_only),
-        "rlottie": Rlottie(LIBS["rlottie"]),
-        "thorvg": Thorvg(LIBS["thorvg"]),
     }
+    if not direct_vulkan:
+        _ACCURACY_RENDERERS.update({
+            "rlottie": Rlottie(LIBS["rlottie"]),
+            "thorvg": Thorvg(LIBS["thorvg"]),
+        })
     if include_vulkan:
         _ACCURACY_RENDERERS["tlottie-vulkan"] = TlottieVulkan(
             LIBS["tlottie-vulkan"], curve_tolerance, alpha_only
@@ -1600,7 +1646,8 @@ def worker_accuracy(file_s: str) -> dict[str, Any]:
     counts: dict[str, int] = {}
     errors = []
     with ExitStack() as stack:
-        for renderer in ("tlottie", "rlottie", "thorvg"):
+        cpu_renderers = ("tlottie",) if _ACCURACY_DIRECT_VULKAN else ("tlottie", "rlottie", "thorvg")
+        for renderer in cpu_renderers:
             try:
                 stream = stack.enter_context(
                     _ACCURACY_RENDERERS[renderer].frame_stream(file, _ACCURACY_SIZE)
@@ -1686,43 +1733,42 @@ def make_accuracy_row(
     }
     if errors:
         return row
-    if len(set(counts.values())) != 1:
+    consensus_available = all(name in rendered for name in ("tlottie", "rlottie", "thorvg"))
+    if consensus_available and len(set(counts.values())) != 1:
         row["frame_count_note"] = "mismatch:" + ",".join(
             f"{name}={counts[name]}" for name in ("tlottie", "rlottie", "thorvg")
         )
-    available_frames = min(len(rendered.get(name, [])) for name in ("tlottie", "rlottie", "thorvg"))
-    if available_frames <= 0:
-        row["error"] = "no_frames"
-        return row
-    frame_count = available_frames
-
-    diffs: list[float] = []
-    consensus_percentages: list[float] = []
     total = size * size
-    worst_frame = 0
-    for frame in range(frame_count):
-        candidate = rendered["tlottie"][frame]
-        a = rendered["rlottie"][frame]
-        b = rendered["thorvg"][frame]
-        bad, consensus = diff_from_consensus(candidate, a, b, tolerance, alpha_only, total)
-        if consensus == 0:
-            row["error"] = f"missing_consensus@{frame}"
+    if consensus_available:
+        available_frames = min(len(rendered[name]) for name in ("tlottie", "rlottie", "thorvg"))
+        if available_frames <= 0:
+            row["error"] = "no_frames"
             return row
-        diff_percent = 100.0 * bad / consensus
-        diffs.append(diff_percent)
-        consensus_percentages.append(100.0 * consensus / total)
-        if diff_percent > diffs[worst_frame]:
-            worst_frame = frame
-
-    max_diff = max(diffs, default=100.0)
-    row["frames_tested"] = len(diffs)
-    row["max_diff_percent"] = max_diff
-    row["avg_diff_percent"] = avg(diffs)
-    row["worst_frame"] = worst_frame
-    row["min_consensus_percent"] = min(consensus_percentages, default=None)
-    row["ok"] = max_diff <= diff_threshold
-    if not row["ok"]:
-        row["error"] = f"diff>{diff_threshold:.3f}%@{worst_frame}"
+        diffs: list[float] = []
+        consensus_percentages: list[float] = []
+        worst_frame = 0
+        for frame in range(available_frames):
+            candidate = rendered["tlottie"][frame]
+            a = rendered["rlottie"][frame]
+            b = rendered["thorvg"][frame]
+            bad, consensus = diff_from_consensus(candidate, a, b, tolerance, alpha_only, total)
+            if consensus == 0:
+                row["error"] = f"missing_consensus@{frame}"
+                return row
+            diff_percent = 100.0 * bad / consensus
+            diffs.append(diff_percent)
+            consensus_percentages.append(100.0 * consensus / total)
+            if diff_percent > diffs[worst_frame]:
+                worst_frame = frame
+        max_diff = max(diffs, default=100.0)
+        row["frames_tested"] = len(diffs)
+        row["max_diff_percent"] = max_diff
+        row["avg_diff_percent"] = avg(diffs)
+        row["worst_frame"] = worst_frame
+        row["min_consensus_percent"] = min(consensus_percentages, default=None)
+        row["ok"] = max_diff <= diff_threshold
+        if not row["ok"]:
+            row["error"] = f"diff>{diff_threshold:.3f}%@{worst_frame}"
     vulkan = rendered.get("tlottie-vulkan", [])
     cpu = rendered.get("tlottie", [])
     vulkan_frame_count = min(len(cpu), len(vulkan))
@@ -1744,7 +1790,11 @@ def make_accuracy_row(
                 pairs = list(zip(cpu_alpha, vulkan_alpha))
                 distances = [abs(int(a) - int(b)) for a, b in pairs]
             else:
-                pairs = list(zip(cpu[frame], vulkan[frame]))
+                # ctypes exposes native u32 arrays as a ``<I`` memoryview on
+                # little-endian Python builds. Iterating that format raises
+                # ``NotImplementedError``; normalize both sources through the
+                # byte view used by the non-numpy accuracy fallback.
+                pairs = list(zip(frame_pixels(cpu[frame]), frame_pixels(vulkan[frame])))
                 distances = [px_distance(a, b) for a, b in pairs]
             bad_percent = 100.0 * sum(distance > tolerance for distance in distances) / total
             changed_percent = 100.0 * sum(a != b for a, b in pairs) / total
@@ -1780,6 +1830,11 @@ def make_accuracy_row(
         row["vulkan_max_channel_error_vulkan"] = f"0x{max_channel_error_vulkan:08x}"
         row["vulkan_worst_frame"] = vulkan_worst_frame
         row["vulkan_ok"] = row["vulkan_max_diff_percent"] <= diff_threshold
+        if not consensus_available:
+            row["frames_tested"] = vulkan_frame_count
+            row["ok"] = row["vulkan_ok"]
+            if not row["ok"]:
+                row["error"] = f"vulkan diff>{diff_threshold:.3f}%@{vulkan_worst_frame}"
     return row
 
 
@@ -1934,6 +1989,7 @@ def run_accuracy(
     diff_threshold: float,
     jobs: int,
     include_vulkan: bool,
+    direct_vulkan: bool,
     curve_tolerance: float,
     alpha_only: bool,
     progress: ProgressDisplay | None = None,
@@ -1948,7 +2004,7 @@ def run_accuracy(
         initializer=init_accuracy_worker,
         initargs=(
             str(root), size, frames, tolerance, diff_threshold,
-            include_vulkan, curve_tolerance, alpha_only,
+            include_vulkan, direct_vulkan, curve_tolerance, alpha_only,
         ),
     ) as pool:
         for done, row in enumerate(
@@ -2103,17 +2159,18 @@ def save_diff_grids(
         return []
     out_dir.mkdir(parents=True, exist_ok=True)
     clear_diff_dir(out_dir)
-    renderers = {
-        "tlottie": Tlottie(LIBS["tlottie"], curve_tolerance, alpha_only),
-        "rlottie": Rlottie(LIBS["rlottie"]),
-        "thorvg": Thorvg(LIBS["thorvg"]),
-    }
+    direct_vulkan = all(row.get("vulkan_ok") is not None and row.get("max_diff_percent") is None for row in selected)
+    renderers = {"tlottie": Tlottie(LIBS["tlottie"], curve_tolerance, alpha_only)}
+    if direct_vulkan:
+        renderers["tlottie-vulkan"] = TlottieVulkan(LIBS["tlottie-vulkan"], curve_tolerance, alpha_only)
+    else:
+        renderers.update({"rlottie": Rlottie(LIBS["rlottie"]), "thorvg": Thorvg(LIBS["thorvg"])})
     written: list[Path] = []
     used_names: set[str] = set()
     for row in selected:
         rel = Path(row["file"])
         file = root / rel
-        frame = int(row.get("worst_frame") or 0)
+        frame = int(row.get("vulkan_worst_frame") if direct_vulkan else row.get("worst_frame") or 0)
         images: dict[str, list[int]] = {}
         errors = []
         for name, renderer in renderers.items():
@@ -2132,20 +2189,21 @@ def save_diff_grids(
                     (int(alpha) << 24) | (int(alpha) << 16) | (int(alpha) << 8) | int(alpha)
                     for alpha in values
                 ]
-        grid = make_diff_grid(
-            images["tlottie"],
-            images["rlottie"],
-            images["thorvg"],
-            size,
-            tolerance,
-        )
+        if direct_vulkan:
+            grid = make_vulkan_diff_grid(images["tlottie"], images["tlottie-vulkan"], size, tolerance)
+            grid_width = 2 * size
+            diff_percent = float(row.get("vulkan_max_diff_percent") or 0.0)
+        else:
+            grid = make_diff_grid(images["tlottie"], images["rlottie"], images["thorvg"], size, tolerance)
+            grid_width = 3 * size
+            diff_percent = float(row.get("max_diff_percent") or 0.0)
         base = (
             f"{sanitize_name(rel.stem)}"
-            f"__frame{frame}__diff{float(row.get('max_diff_percent') or 0.0):.2f}.png"
+            f"__frame{frame}__diff{diff_percent:.2f}.png"
         )
         name = unique_name(base, used_names)
         path = out_dir / name
-        write_png_rgb(path, 3 * size, 2 * size, grid)
+        write_png_rgb(path, grid_width, 2 * size, grid)
         written.append(path)
     return written
 
@@ -2155,14 +2213,17 @@ def select_diff_rows(rows: list[dict[str, Any]], limit: int) -> list[dict[str, A
         return []
     by_pack: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        if row.get("ok") or row.get("max_diff_percent") is None:
+        direct_vulkan = row.get("vulkan_ok") is not None and row.get("max_diff_percent") is None
+        ok = row.get("vulkan_ok") if direct_vulkan else row.get("ok")
+        diff = row.get("vulkan_max_diff_percent") if direct_vulkan else row.get("max_diff_percent")
+        if ok or diff is None:
             continue
         by_pack.setdefault(row["pack"], []).append(row)
     for items in by_pack.values():
-        items.sort(key=lambda r: float(r.get("max_diff_percent") or 0.0), reverse=True)
+        items.sort(key=accuracy_row_diff, reverse=True)
     packs = sorted(
         by_pack,
-        key=lambda p: float(by_pack[p][0].get("max_diff_percent") or 0.0),
+        key=lambda p: accuracy_row_diff(by_pack[p][0]),
         reverse=True,
     )
     selected: list[dict[str, Any]] = []
@@ -2179,6 +2240,11 @@ def select_diff_rows(rows: list[dict[str, Any]], limit: int) -> list[dict[str, A
             break
         index += 1
     return selected
+
+
+def accuracy_row_diff(row: dict[str, Any]) -> float:
+    value = row.get("vulkan_max_diff_percent") if row.get("max_diff_percent") is None else row.get("max_diff_percent")
+    return float(value or 0.0)
 
 
 def clear_diff_dir(out_dir: Path) -> None:
@@ -2199,6 +2265,16 @@ def make_diff_grid(
     paste_diff(out, width, tlottie, rlottie, size, 0, size, tolerance)
     paste_diff(out, width, rlottie, thorvg, size, size, size, tolerance)
     paste_diff(out, width, tlottie, thorvg, size, size * 2, size, tolerance)
+    return bytes(out)
+
+
+def make_vulkan_diff_grid(cpu: list[int], vulkan: list[int], size: int, tolerance: int) -> bytes:
+    width = 2 * size
+    out = bytearray(width * 2 * size * 3)
+    paste_image(out, width, cpu, size, 0, 0)
+    paste_image(out, width, vulkan, size, size, 0)
+    paste_diff(out, width, cpu, vulkan, size, 0, size, tolerance)
+    paste_diff(out, width, cpu, vulkan, size, size, size, 0)
     return bytes(out)
 
 
@@ -2674,15 +2750,6 @@ def pack_label(pack: str, accuracy: dict[str, Any] | None) -> str:
     ratio = accuracy.get("ratio")
     if not total or ratio is None:
         return linked_pack
-    cls = "acc-ok"
-    if ratio < 0.5:
-        cls = "acc-bad"
-    elif good < total:
-        cls = "acc-warn"
-    label = (
-        f"{linked_pack} "
-        f"<span class='acc-badge {cls}'>{good}/{total}</span>"
-    )
     vulkan_total = int(accuracy.get("vulkan_total", 0))
     vulkan_ratio = accuracy.get("vulkan_ratio")
     if vulkan_total and vulkan_ratio is not None:
@@ -2690,12 +2757,16 @@ def pack_label(pack: str, accuracy: dict[str, Any] | None) -> str:
         vulkan_cls = "acc-ok" if vulkan_good == vulkan_total else "acc-warn"
         if vulkan_ratio < 0.5:
             vulkan_cls = "acc-bad"
-        vulkan_max = float(accuracy.get("vulkan_max_diff_percent") or 0.0)
-        label += (
-            f" <span class='acc-badge {vulkan_cls}'>"
-            f"VK {vulkan_good}/{vulkan_total}, max {vulkan_max:.2f}%</span>"
+        return (
+            f"{linked_pack} "
+            f"<span class='acc-badge {vulkan_cls}'>{vulkan_good}/{vulkan_total}</span>"
         )
-    return label
+    cls = "acc-ok"
+    if ratio < 0.5:
+        cls = "acc-bad"
+    elif good < total:
+        cls = "acc-warn"
+    return f"{linked_pack} <span class='acc-badge {cls}'>{good}/{total}</span>"
 
 
 def current_machine_details() -> str:
@@ -2843,6 +2914,10 @@ def main() -> int:
     bad = [r for r in renderers if r not in RENDERERS]
     if bad:
         raise SystemExit(f"unknown renderers: {', '.join(bad)}")
+    if not args.no_accuracy and renderers == ("tlottie-vulkan",):
+        # CPU tlottie is already required as the Vulkan accuracy reference, so
+        # expose its performance in the report instead of running it invisibly.
+        renderers = ("tlottie", "tlottie-vulkan")
     sizes = tuple(int(s) for s in args.sizes.split(",") if s)
     if args.reps <= 0:
         raise SystemExit("--reps must be positive")
@@ -2858,7 +2933,13 @@ def main() -> int:
         raise SystemExit("--save-diffs must be non-negative")
     if args.no_accuracy and args.save_diffs:
         raise SystemExit("--save-diffs requires accuracy; remove --no-accuracy")
-    ensure_builds(args.skip_build)
+    direct_vulkan_accuracy = "tlottie-vulkan" in renderers and set(renderers) <= {"tlottie", "tlottie-vulkan"}
+    required_renderers = set(renderers)
+    if not args.no_accuracy:
+        required_renderers.add("tlottie")
+        if not direct_vulkan_accuracy:
+            required_renderers.update(("rlottie", "thorvg"))
+    ensure_builds(args.skip_build, required_renderers)
     for r in renderers:
         if not LIBS[r].exists():
             raise SystemExit(f"missing {r} library: {LIBS[r]}")
@@ -2885,13 +2966,14 @@ def main() -> int:
     accuracy_by_pack: dict[str, dict[str, Any]] | None = None
     accuracy_size = args.accuracy_size or max(sizes)
     accuracy_frame_label = "all frames" if args.frames == 0 else f"first {args.frames} frame(s)"
-    accuracy_renderers = ("tlottie", "rlottie", "thorvg")
+    accuracy_renderers = ("tlottie",) if direct_vulkan_accuracy else ("tlottie", "rlottie", "thorvg")
     if not args.no_accuracy:
         for required in accuracy_renderers:
             if not LIBS[required].exists():
                 raise SystemExit(f"missing {required} library for accuracy: {LIBS[required]}")
         print(
-            f"== accuracy {accuracy_size}px {accuracy_frame_label}: {len(files)} files, "
+            f"== {'CPU/Vulkan accuracy' if direct_vulkan_accuracy else 'accuracy'} "
+            f"{accuracy_size}px {accuracy_frame_label}: {len(files)} files, "
             f"pixel tolerance {args.accuracy_tolerance}, "
             f"broken if diff > {args.accuracy_diff_threshold:g}% (separate pass)",
             flush=True,
@@ -2945,6 +3027,7 @@ def main() -> int:
                 args.accuracy_diff_threshold,
                 args.jobs,
                 "tlottie-vulkan" in renderers,
+                direct_vulkan_accuracy,
                 args.curve_tolerance,
                 args.alpha_only,
                 overall_progress,

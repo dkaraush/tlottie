@@ -202,15 +202,13 @@ fn center_coverage(paint_index: u32, paint: u32, tile_y: u32, center: vec2<f32>)
 }
 
 fn source_over(source: vec4<u32>, destination: vec4<u32>) -> vec4<u32> {
-    let inverse = 255u - source.a;
+    // Match the CPU span kernels' byte blend: destination attenuation uses
+    // (256 - alpha) / 256 rather than rounded division by 255.
+    let inverse = 256u - source.a;
     return min(
-        source + (destination * inverse + vec4<u32>(127u)) / 255u,
+        source + (destination * inverse) / 256u,
         vec4<u32>(255u),
     );
-}
-
-fn source_over_f32(source: vec4<f32>, destination: vec4<f32>) -> vec4<f32> {
-    return source + destination * (1.0 - source.a);
 }
 
 fn matte_factor(matte: vec4<u32>, kind: u32, source_opacity: u32) -> u32 {
@@ -235,6 +233,11 @@ fn matte_factor(matte: vec4<u32>, kind: u32, source_opacity: u32) -> u32 {
     return select(255u - luma, luma, kind == 3u);
 }
 
+// FrameWalker accepts precomp depths 0 through 16 inclusive. An isolated
+// precomp at every accepted depth can therefore have 17 saved destinations
+// live at once. Keep this in sync with MAX_PRECOMP_DEPTH in the frame walker.
+const MAX_LAYER_DEPTH = 17u;
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if gid.x >= push.width || gid.y >= push.height {
@@ -242,8 +245,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let center = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
     var destination = vec4<u32>(0u);
-    var layer_stack: array<vec4<u32>, 16>;
-    var matte_stack: array<vec4<u32>, 16>;
+    var layer_stack: array<vec4<u32>, 17>;
+    var matte_stack: array<vec4<u32>, 17>;
     var layer_depth = 0u;
     var mask_accumulator = 0u;
     let tile_x = gid.x / 16u;
@@ -256,7 +259,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let paint = push.paint_word + paint_index * 24u;
         let paint_kind = words[paint + 2u];
         if paint_kind == 2u {
-            if layer_depth < 16u {
+            if layer_depth < MAX_LAYER_DEPTH {
                 layer_stack[layer_depth] = destination;
                 layer_depth += 1u;
                 destination = vec4<u32>(0u);
@@ -273,7 +276,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             continue;
         }
         if paint_kind == 4u {
-            if layer_depth < 16u {
+            if layer_depth < MAX_LAYER_DEPTH {
                 layer_stack[layer_depth] = destination;
                 layer_depth += 1u;
                 destination = vec4<u32>(0u);
@@ -383,7 +386,7 @@ fn simple_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let center = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
-    var destination = vec4<f32>(0.0);
+    var destination = vec4<u32>(0u);
     let tile_x = gid.x / 16u;
     let tile_y = gid.y / 16u;
     let tile = push.tile_word + (tile_y * push.tiles_x + tile_x) * 2u;
@@ -407,21 +410,20 @@ fn simple_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             coverage = analytic_coverage(paint_index, paint, tile_y, pixel_min);
         }
         if coverage > 0.0 {
-            let source = vec4<f32>(sample_paint(paint, center)) *
-                (clamp(coverage, 0.0, 1.0) / 255.0);
-            destination = source_over_f32(source, destination);
+            let coverage_byte = u32(clamp(coverage, 0.0, 1.0) * 255.0 + 0.5);
+            let source = (sample_paint(paint, center) * coverage_byte + vec4<u32>(127u)) / 255u;
+            destination = source_over(source, destination);
         }
     }
-    let quantized = vec4<u32>(clamp(destination, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0 + 0.5);
     var packed = select(
-        (quantized.a << 24u) | (quantized.r << 16u) |
-            (quantized.g << 8u) | quantized.b,
-        (quantized.a << 24u) | (quantized.b << 16u) |
-            (quantized.g << 8u) | quantized.r,
+        (destination.a << 24u) | (destination.r << 16u) |
+            (destination.g << 8u) | destination.b,
+        (destination.a << 24u) | (destination.b << 16u) |
+            (destination.g << 8u) | destination.r,
         (push.compact_flags & 4u) != 0u,
     );
     if (push.compact_flags & 8u) != 0u {
-        packed = quantized.a << 24u;
+        packed = destination.a << 24u;
     }
     words[push.output_word + gid.y * push.width + gid.x] = packed;
 }
