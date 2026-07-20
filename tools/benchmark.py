@@ -1633,6 +1633,175 @@ _ACCURACY_INCLUDE_VULKAN = False
 _ACCURACY_DIRECT_VULKAN = False
 _ACCURACY_CURVE_TOLERANCE = 0.125
 _ACCURACY_ALPHA_ONLY = False
+_ACCURACY_NATIVE: NativeAccuracy | None = None
+
+
+ACCURACY_HELPER_SOURCE = r"""
+#include <stddef.h>
+#include <stdint.h>
+
+static uint32_t delta(uint32_t a, uint32_t b) {
+    return a > b ? a - b : b - a;
+}
+
+static uint32_t channel(uint32_t pixel, unsigned shift) {
+    return (pixel >> shift) & 255u;
+}
+
+static uint32_t max3(uint32_t a, uint32_t b, uint32_t c) {
+    uint32_t value = a > b ? a : b;
+    return value > c ? value : c;
+}
+
+static int close_argb(uint32_t a, uint32_t b, uint32_t tolerance) {
+    uint32_t aa = channel(a, 24), ba = channel(b, 24);
+    uint32_t rgb = max3(
+        delta(channel(a, 16), channel(b, 16)),
+        delta(channel(a, 8), channel(b, 8)),
+        delta(channel(a, 0), channel(b, 0))
+    );
+    uint32_t opacity = aa > ba ? aa : ba;
+    return delta(aa, ba) <= tolerance
+        && (uint64_t)rgb * opacity <= (uint64_t)tolerance * 255u;
+}
+
+static uint32_t average_argb(uint32_t a, uint32_t b) {
+    return ((channel(a, 24) + channel(b, 24)) / 2u << 24)
+        | ((channel(a, 16) + channel(b, 16)) / 2u << 16)
+        | ((channel(a, 8) + channel(b, 8)) / 2u << 8)
+        | ((channel(a, 0) + channel(b, 0)) / 2u);
+}
+
+int benchmark_accuracy_diff(
+    const void *candidate_buffer,
+    const uint32_t *reference_a,
+    const uint32_t *reference_b,
+    size_t len,
+    uint32_t tolerance,
+    uint32_t candidate_alpha8,
+    size_t *bad_out,
+    size_t *consensus_out
+) {
+    if (!candidate_buffer || !reference_a || !reference_b || !bad_out || !consensus_out)
+        return -1;
+    const uint32_t *candidate_argb = candidate_buffer;
+    const uint8_t *candidate_alpha = candidate_buffer;
+    size_t bad = 0, consensus = 0;
+    for (size_t i = 0; i < len; ++i) {
+        uint32_t a = reference_a[i], b = reference_b[i];
+        if (candidate_alpha8) {
+            uint32_t aa = channel(a, 24), ba = channel(b, 24);
+            if (delta(aa, ba) > tolerance)
+                continue;
+            ++consensus;
+            bad += delta(candidate_alpha[i], (aa + ba) / 2u) > tolerance;
+        } else if (close_argb(a, b, tolerance)) {
+            ++consensus;
+            bad += !close_argb(candidate_argb[i], average_argb(a, b), tolerance);
+        }
+    }
+    *bad_out = bad;
+    *consensus_out = consensus;
+    return 0;
+}
+"""
+
+
+class NativeAccuracy:
+    """Small benchmark-local native loop for stdlib-only Python installs."""
+
+    def __init__(self, path: Path) -> None:
+        self.lib = C.CDLL(str(path))
+        self.diff = self.lib.benchmark_accuracy_diff
+        self.diff.argtypes = [
+            C.c_void_p,
+            C.POINTER(C.c_uint32),
+            C.POINTER(C.c_uint32),
+            C.c_size_t,
+            C.c_uint32,
+            C.c_uint32,
+            C.POINTER(C.c_size_t),
+            C.POINTER(C.c_size_t),
+        ]
+        self.diff.restype = C.c_int
+
+    @staticmethod
+    def frame_pointer(frame: Any, ctype: Any, count: int) -> tuple[Any, Any]:
+        raw = memoryview(frame).cast("B")
+        required = C.sizeof(ctype) * count
+        if raw.nbytes < required:
+            raise ValueError(f"pixel buffer has {raw.nbytes} bytes; expected {required}")
+        owner = (
+            C.create_string_buffer(raw[:required].tobytes())
+            if raw.readonly
+            else (C.c_uint8 * required).from_buffer(raw)
+        )
+        return owner, C.cast(owner, C.POINTER(ctype))
+
+    def compare(
+        self,
+        candidate: Any,
+        reference_a: Any,
+        reference_b: Any,
+        tolerance: int,
+        alpha_only: bool,
+        total: int,
+    ) -> tuple[int, int]:
+        candidate_type = C.c_uint8 if alpha_only else C.c_uint32
+        candidate_owner, candidate_ptr = self.frame_pointer(candidate, candidate_type, total)
+        a_owner, a_ptr = self.frame_pointer(reference_a, C.c_uint32, total)
+        b_owner, b_ptr = self.frame_pointer(reference_b, C.c_uint32, total)
+        bad = C.c_size_t()
+        consensus = C.c_size_t()
+        rc = self.diff(
+            candidate_ptr,
+            a_ptr,
+            b_ptr,
+            total,
+            tolerance,
+            int(alpha_only),
+            C.byref(bad),
+            C.byref(consensus),
+        )
+        # These references keep writable buffers pinned through the C call.
+        _ = candidate_owner, a_owner, b_owner
+        if rc != 0:
+            raise RuntimeError(f"native accuracy comparison failed: {rc}")
+        return int(bad.value), int(consensus.value)
+
+
+def ensure_accuracy_helper() -> Path | None:
+    if platform.system() not in ("Linux", "Darwin"):
+        return None
+    compiler = shutil_which("cc")
+    if not compiler:
+        return None
+    checksum = zlib.crc32(ACCURACY_HELPER_SOURCE.encode())
+    directory = ROOT / "target" / "benchmark-tools"
+    directory.mkdir(parents=True, exist_ok=True)
+    output = directory / f"accuracy-diff-{checksum:08x}{LIB_SUFFIX}"
+    if output.exists():
+        return output
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    command = [compiler, "-O3", "-x", "c", "-", "-o", str(temporary)]
+    command[1:1] = ["-dynamiclib"] if platform.system() == "Darwin" else ["-shared", "-fPIC"]
+    try:
+        subprocess.run(
+            command,
+            input=ACCURACY_HELPER_SOURCE,
+            text=True,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        os.replace(temporary, output)
+        return output
+    except (OSError, subprocess.CalledProcessError):
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        return None
 
 
 def init_accuracy_worker(
@@ -1645,8 +1814,9 @@ def init_accuracy_worker(
     direct_vulkan: bool,
     curve_tolerance: float,
     alpha_only: bool,
+    native_accuracy_path: str | None,
 ) -> None:
-    global _ACCURACY_RENDERERS, _ACCURACY_ROOT, _ACCURACY_SIZE, _ACCURACY_FRAMES, _ACCURACY_TOLERANCE, _ACCURACY_DIFF_THRESHOLD, _ACCURACY_INCLUDE_VULKAN, _ACCURACY_DIRECT_VULKAN, _ACCURACY_CURVE_TOLERANCE, _ACCURACY_ALPHA_ONLY
+    global _ACCURACY_RENDERERS, _ACCURACY_ROOT, _ACCURACY_SIZE, _ACCURACY_FRAMES, _ACCURACY_TOLERANCE, _ACCURACY_DIFF_THRESHOLD, _ACCURACY_INCLUDE_VULKAN, _ACCURACY_DIRECT_VULKAN, _ACCURACY_CURVE_TOLERANCE, _ACCURACY_ALPHA_ONLY, _ACCURACY_NATIVE
     _ACCURACY_ROOT = Path(root)
     _ACCURACY_SIZE = size
     _ACCURACY_FRAMES = frames
@@ -1656,6 +1826,7 @@ def init_accuracy_worker(
     _ACCURACY_DIRECT_VULKAN = direct_vulkan
     _ACCURACY_CURVE_TOLERANCE = curve_tolerance
     _ACCURACY_ALPHA_ONLY = alpha_only
+    _ACCURACY_NATIVE = NativeAccuracy(Path(native_accuracy_path)) if native_accuracy_path else None
     _ACCURACY_RENDERERS = {
         "tlottie": Tlottie(LIBS["tlottie"], curve_tolerance, alpha_only),
     }
@@ -1876,6 +2047,8 @@ def diff_from_consensus(
     alpha_only: bool = False,
     total: int | None = None,
 ) -> tuple[int, int]:
+    if _ACCURACY_NATIVE is not None and total is not None:
+        return _ACCURACY_NATIVE.compare(candidate, a, b, tolerance, alpha_only, total)
     if alpha_only:
         if total is None:
             raise ValueError("alpha-only accuracy requires a pixel count")
@@ -2024,29 +2197,42 @@ def run_accuracy(
     alpha_only: bool,
     progress: ProgressDisplay | None = None,
 ) -> list[dict[str, Any]]:
+    global _ACCURACY_NATIVE
     rows: list[dict[str, Any]] = []
     total = len(files)
     progress_every = progress_interval(total)
     owns_progress = progress is None
     progress = progress or ProgressDisplay(f"accuracy {size}px", total)
+    native_accuracy_path = ensure_accuracy_helper()
+    _ACCURACY_NATIVE = NativeAccuracy(native_accuracy_path) if native_accuracy_path else None
+    if native_accuracy_path is None and np is None:
+        print(
+            "== warning: no C compiler or NumPy; accuracy will use the slow Python fallback",
+            flush=True,
+        )
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=jobs,
         initializer=init_accuracy_worker,
         initargs=(
             str(root), size, frames, tolerance, diff_threshold,
             include_vulkan, direct_vulkan, curve_tolerance, alpha_only,
+            str(native_accuracy_path) if native_accuracy_path else None,
         ),
     ) as pool:
-        for done, row in enumerate(
-            pool.map(worker_accuracy, [str(p) for p in files], chunksize=1), 1
-        ):
+        futures = {
+            pool.submit(worker_accuracy, str(file)): file
+            for file in files
+        }
+        for done, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            row = future.result()
             rows.append(row)
             if progress.interactive:
-                progress.advance(f"accuracy {size}px", display_file(files[done - 1], root))
+                progress.advance(f"accuracy {size}px", display_file(futures[future], root))
             elif should_report_progress(done, total, progress_every):
                 print(f"   accuracy {done}/{total} files", flush=True)
     if owns_progress:
         progress.finish()
+    rows.sort(key=lambda row: row["file"])
     return rows
 
 
