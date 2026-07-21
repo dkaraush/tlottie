@@ -1,4 +1,4 @@
-//! Native C ABI for rendering into caller-owned ARGB32 buffers.
+//! Native C ABI for rendering into caller-owned premultiplied RGBA8 buffers.
 
 #![allow(unsafe_code)]
 
@@ -162,7 +162,8 @@ pub unsafe extern "C" fn tlottie_frame_count(anim: *const TLottieInstance) -> u3
   unsafe { anim.as_ref() }.map_or(0, |a| a.renderer.composition().frame_count())
 }
 
-/// Renders one frame into caller-owned premultiplied ARGB32 pixels.
+/// Renders one frame into caller-owned premultiplied RGBA8 pixels. Each word
+/// is `0xAABBGGRR`, giving `[R, G, B, A]` bytes on little-endian targets.
 ///
 /// Returns 0 on success and a negative value on error:
 /// - -1: null handle or buffer

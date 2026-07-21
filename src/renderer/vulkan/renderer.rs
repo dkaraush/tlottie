@@ -169,10 +169,10 @@ pub struct Rect {
   pub h: u32,
 }
 
-/// Host-owned ARGB32 buffer target.
+/// Host-owned premultiplied RGBA8 buffer target.
 ///
 /// The buffer is interpreted as `width * height` tightly packed `u32` pixels in
-/// tlottie's premultiplied ARGB32 convention.
+/// tlottie's `0xAABBGGRR` convention (`[R, G, B, A]` in little-endian memory).
 #[derive(Clone, Copy, Debug)]
 pub struct BufferTarget {
   /// Vulkan buffer supplied and owned by the host.
@@ -458,7 +458,7 @@ impl<'a> VulkanRenderer<'a> {
     Ok((framebuffer, group_framebuffer, group_view))
   }
 
-  /// Records a simple ARGB32 rectangle draw into a host-owned buffer.
+  /// Records a simple premultiplied RGBA8 rectangle draw into a host-owned buffer.
   ///
   /// This is a phase-0 bring-up primitive, not the final vector renderer.
   ///
@@ -467,12 +467,12 @@ impl<'a> VulkanRenderer<'a> {
   /// this renderer. `cmd` must be in recording state. `target.buffer` must be
   /// large enough for `target.width * target.height * 4` bytes and have
   /// `VK_BUFFER_USAGE_TRANSFER_DST_BIT`.
-  pub unsafe fn record_argb_rect(&mut self, cmd: vk::CommandBuffer, target: BufferTarget, rect: Rect, argb: u32) -> Result<()> {
+  pub unsafe fn record_rgba_rect(&mut self, cmd: vk::CommandBuffer, target: BufferTarget, rect: Rect, rgba: u32) -> Result<()> {
     // SAFETY: forwarded from this method's caller contract.
-    unsafe { cmd_draw_argb_rect(self.device, cmd, target.buffer, target.width, target.height, rect, argb) }
+    unsafe { cmd_draw_rgba_rect(self.device, cmd, target.buffer, target.width, target.height, rect, rgba) }
   }
 
-  /// Records a simple ARGB32 rectangle draw into a host-owned image.
+  /// Records a simple premultiplied RGBA8 rectangle draw into a host-owned image.
   ///
   /// This is a phase-0 bring-up primitive. It uses `scratch` as temporary
   /// transfer storage, copies it into `target.image`, and leaves the image in
@@ -486,14 +486,14 @@ impl<'a> VulkanRenderer<'a> {
   /// `target.image` must be a `VK_FORMAT_B8G8R8A8_UNORM` 2D image with
   /// transfer source/destination usage, one mip level, one array layer, and
   /// the layout declared by `target.layout`.
-  pub unsafe fn record_argb_rect_image(&mut self, cmd: vk::CommandBuffer, scratch: BufferTarget, target: ImageTarget, rect: Rect, argb: u32) -> Result<()> {
+  pub unsafe fn record_rgba_rect_image(&mut self, cmd: vk::CommandBuffer, scratch: BufferTarget, target: ImageTarget, rect: Rect, rgba: u32) -> Result<()> {
     if scratch.width != target.width || scratch.height != target.height {
       return Err(Error::BadTarget);
     }
     // SAFETY: forwarded from this method's caller contract.
     unsafe {
-      cmd_draw_argb_rect(self.device, cmd, scratch.buffer, scratch.width, scratch.height, rect, argb)?;
-      cmd_copy_argb_buffer_to_image(self.device, cmd, scratch.buffer, target)
+      cmd_draw_rgba_rect(self.device, cmd, scratch.buffer, scratch.width, scratch.height, rect, rgba)?;
+      cmd_copy_rgba_buffer_to_image(self.device, cmd, scratch.buffer, target)
     }
   }
 
@@ -620,7 +620,7 @@ impl<'a> VulkanRenderer<'a> {
       &mut self.scene_layout,
     )?;
     match target.format {
-      vk::Format::B8G8R8A8_UNORM => {}
+      vk::Format::B8G8R8A8_UNORM => scene.push.compact_flags &= !4,
       vk::Format::R8G8B8A8_UNORM => scene.push.compact_flags |= 4,
       _ => return Err(Error::BadTarget),
     }
@@ -787,7 +787,7 @@ impl<'a> VulkanRenderer<'a> {
         &[barrier],
         &[],
       );
-      cmd_copy_argb_buffer_to_image(self.device, cmd, scratch.buffer, target)
+      cmd_copy_rgba_buffer_to_image(self.device, cmd, scratch.buffer, target)
     }?;
     if let Some(profile) = profile {
       unsafe {
@@ -1124,7 +1124,7 @@ impl<'a> VulkanRenderer<'a> {
         }
         let composite = TrianglePush {
           viewport: [target.width as f32, target.height as f32],
-          argb: paint.argb,
+          rgba: paint.argb,
           point_offset: 0,
           paint_kind: paint.paint_kind,
           gradient_kind: 0,
@@ -1151,7 +1151,7 @@ impl<'a> VulkanRenderer<'a> {
       if use_indirect && draw_count > 1 {
         let stencil = TrianglePush {
           viewport: [target.width as f32, target.height as f32],
-          argb: paint.argb,
+          rgba: paint.argb,
           point_offset: draw_word_base,
           paint_kind: paint.paint_kind,
           gradient_kind: paint.gradient_kind,
@@ -1188,7 +1188,7 @@ impl<'a> VulkanRenderer<'a> {
         for draw in &prepared.draw_data[draw_start..draw_cursor] {
           let stencil = TrianglePush {
             viewport: [target.width as f32, target.height as f32],
-            argb: paint.argb,
+            rgba: paint.argb,
             point_offset: draw.point_offset,
             paint_kind: paint.paint_kind,
             gradient_kind: paint.gradient_kind,
@@ -1213,7 +1213,7 @@ impl<'a> VulkanRenderer<'a> {
 
       let cover = TrianglePush {
         viewport: [target.width as f32, target.height as f32],
-        argb: paint.argb,
+        rgba: paint.argb,
         point_offset: 0,
         paint_kind: paint.paint_kind,
         gradient_kind: paint.gradient_kind,
@@ -1306,7 +1306,7 @@ impl Drop for VulkanRenderer<'_> {
 #[repr(C)]
 struct TrianglePush {
   viewport: [f32; 2],
-  argb: u32,
+  rgba: u32,
   point_offset: u32,
   paint_kind: u32,
   gradient_kind: u32,
@@ -2544,7 +2544,7 @@ fn build_compute_scene(
       edge_bin_word: layout.offset(EDGE_BIN_SECTION)?,
       edge_word: layout.offset(EDGE_SECTION)?,
       tiles_y,
-      compact_flags: u32::from(compact_tile_indices) | (u32::from(compact_edge_indices) << 1) | (u32::from(alpha_only) << 3),
+      compact_flags: u32::from(compact_tile_indices) | (u32::from(compact_edge_indices) << 1) | (1 << 2) | (u32::from(alpha_only) << 3),
     },
   })
 }
@@ -2845,7 +2845,7 @@ impl GeometryCache {
         RecordedOp::Solid(solid) => (
           solid.rule,
           PreparedPaint {
-            argb: solid.argb,
+            argb: solid.rgba,
             ..PreparedPaint::default()
           },
         ),
@@ -3073,31 +3073,31 @@ fn contour_bounds(points: &[tlottie_internal::Point]) -> [f32; 4] {
   }
 }
 
-/// Records a simple ARGB32 rectangle draw into a linear pixel buffer.
+/// Records a simple premultiplied RGBA8 rectangle draw into a linear pixel buffer.
 ///
 /// The target buffer is interpreted as `width * height` tightly packed `u32`
 /// pixels. The command stream first clears the full target to transparent,
-/// then fills each rectangle row with `argb`.
+/// then fills each rectangle row with `rgba` (`0xAABBGGRR`).
 ///
 /// # Safety
 /// `device`, `cmd`, and `target` must belong to the same live Vulkan device.
 /// `cmd` must be in recording state. `target` must be large enough for
 /// `width * height * 4` bytes and have `VK_BUFFER_USAGE_TRANSFER_DST_BIT`.
-pub unsafe fn cmd_draw_argb_rect(device: &ash::Device, cmd: vk::CommandBuffer, target: vk::Buffer, width: u32, height: u32, rect: Rect, argb: u32) -> Result<()> {
+pub unsafe fn cmd_draw_rgba_rect(device: &ash::Device, cmd: vk::CommandBuffer, target: vk::Buffer, width: u32, height: u32, rect: Rect, rgba: u32) -> Result<()> {
   // SAFETY: forwarded from this function's caller contract.
   unsafe {
-    cmd_clear_argb_buffer(device, cmd, target, width, height)?;
-    cmd_fill_argb_rect(device, cmd, target, width, height, rect, argb)
+    cmd_clear_rgba_buffer(device, cmd, target, width, height)?;
+    cmd_fill_rgba_rect(device, cmd, target, width, height, rect, rgba)
   }
 }
 
-/// Records a full transparent clear into an ARGB32 linear pixel buffer.
+/// Records a full transparent clear into a premultiplied RGBA8 linear pixel buffer.
 ///
 /// # Safety
 /// `device`, `cmd`, and `target` must belong to the same live Vulkan device.
 /// `cmd` must be in recording state. `target` must be large enough for
 /// `width * height * 4` bytes and have `VK_BUFFER_USAGE_TRANSFER_DST_BIT`.
-pub unsafe fn cmd_clear_argb_buffer(device: &ash::Device, cmd: vk::CommandBuffer, target: vk::Buffer, width: u32, height: u32) -> Result<()> {
+pub unsafe fn cmd_clear_rgba_buffer(device: &ash::Device, cmd: vk::CommandBuffer, target: vk::Buffer, width: u32, height: u32) -> Result<()> {
   let pixels = width.checked_mul(height).and_then(|n| n.checked_mul(4)).ok_or(Error::BadTarget)?;
   if width == 0 || height == 0 {
     return Err(Error::BadTarget);
@@ -3109,7 +3109,7 @@ pub unsafe fn cmd_clear_argb_buffer(device: &ash::Device, cmd: vk::CommandBuffer
   Ok(())
 }
 
-/// Records a rectangle fill into an ARGB32 linear pixel buffer.
+/// Records a rectangle fill into a premultiplied RGBA8 linear pixel buffer.
 ///
 /// Existing pixels outside the rectangle are left unchanged.
 ///
@@ -3117,7 +3117,7 @@ pub unsafe fn cmd_clear_argb_buffer(device: &ash::Device, cmd: vk::CommandBuffer
 /// `device`, `cmd`, and `target` must belong to the same live Vulkan device.
 /// `cmd` must be in recording state. `target` must be large enough for
 /// `width * height * 4` bytes and have `VK_BUFFER_USAGE_TRANSFER_DST_BIT`.
-pub unsafe fn cmd_fill_argb_rect(device: &ash::Device, cmd: vk::CommandBuffer, target: vk::Buffer, width: u32, height: u32, rect: Rect, argb: u32) -> Result<()> {
+pub unsafe fn cmd_fill_rgba_rect(device: &ash::Device, cmd: vk::CommandBuffer, target: vk::Buffer, width: u32, height: u32, rect: Rect, rgba: u32) -> Result<()> {
   let x1 = rect.x.checked_add(rect.w).ok_or(Error::BadTarget)?;
   let y1 = rect.y.checked_add(rect.h).ok_or(Error::BadTarget)?;
   if width == 0 || height == 0 || x1 > width || y1 > height {
@@ -3131,13 +3131,13 @@ pub unsafe fn cmd_fill_argb_rect(device: &ash::Device, cmd: vk::CommandBuffer, t
     // SAFETY: guaranteed by this function's caller contract; offsets and
     // sizes are 4-byte aligned and bounded by the validated target rect.
     unsafe {
-      device.cmd_fill_buffer(cmd, target, offset as vk::DeviceSize, bytes as vk::DeviceSize, argb);
+      device.cmd_fill_buffer(cmd, target, offset as vk::DeviceSize, bytes as vk::DeviceSize, rgba);
     }
   }
   Ok(())
 }
 
-/// Copies a tightly packed ARGB32 buffer into a `B8G8R8A8_UNORM` image and
+/// Copies a tightly packed premultiplied RGBA8 buffer into an image and
 /// leaves the image ready for transfer readback.
 ///
 /// # Safety
@@ -3146,7 +3146,7 @@ pub unsafe fn cmd_fill_argb_rect(device: &ash::Device, cmd: vk::CommandBuffer, t
 /// `target.layout` on entry and have transfer source/destination usage.
 /// `buffer` must have transfer source usage and contain at least
 /// `target.width * target.height * 4` bytes.
-pub unsafe fn cmd_copy_argb_buffer_to_image(device: &ash::Device, cmd: vk::CommandBuffer, buffer: vk::Buffer, target: ImageTarget) -> Result<()> {
+pub unsafe fn cmd_copy_rgba_buffer_to_image(device: &ash::Device, cmd: vk::CommandBuffer, buffer: vk::Buffer, target: ImageTarget) -> Result<()> {
   if target.width == 0 || target.height == 0 {
     return Err(Error::BadTarget);
   }
@@ -3254,7 +3254,7 @@ mod tests {
       commands: vec![RecordedCommand {
         op: RecordedOp::Solid(tlottie_internal::SolidPaint {
           rule,
-          argb,
+          rgba: argb,
           color: crate::math::Color::BLACK,
           opacity: 1.0,
         }),
@@ -3619,8 +3619,8 @@ mod tests {
 
   #[test]
   fn matte_factors_match_cpu_integer_semantics() {
-    fn factor(argb: u32, kind: u8) -> u32 {
-      let alpha = (argb >> 24) & 255;
+    fn factor(rgba: u32, kind: u8) -> u32 {
+      let alpha = (rgba >> 24) & 255;
       if kind == 1 {
         return alpha;
       }
@@ -3630,9 +3630,9 @@ mod tests {
       let luma = if alpha == 0 {
         0
       } else {
-        let mut red = (argb >> 16) & 255;
-        let mut green = (argb >> 8) & 255;
-        let mut blue = argb & 255;
+        let mut red = rgba & 255;
+        let mut green = (rgba >> 8) & 255;
+        let mut blue = (rgba >> 16) & 255;
         if alpha != 255 {
           red = red * 255 / alpha;
           green = green * 255 / alpha;
@@ -3647,7 +3647,7 @@ mod tests {
       }
     }
 
-    let matte = 0x8040_2010;
+    let matte = 0x8010_2040;
     assert_eq!(factor(matte, 1), 128);
     assert_eq!(factor(matte, 2), 127);
     assert_eq!(factor(matte, 3), 78);

@@ -1,38 +1,45 @@
-//! Pixel-format conversion shared by browser and development-tool output.
+//! Pixel-format helpers shared by renderers, browser output, and tools.
 
 #![allow(unsafe_code)]
 
-/// Converts one premultiplied ARGB32 word to straight-alpha RGBA8.
+/// Packs premultiplied channels as `0xAABBGGRR`, which is RGBA byte order
+/// in little-endian memory.
 #[inline]
-pub(crate) fn argb_to_rgba(pixel: u32) -> [u8; 4] {
+pub(crate) const fn pack_premultiplied_rgba(red: u32, green: u32, blue: u32, alpha: u32) -> u32 {
+  (alpha << 24) | (blue << 16) | (green << 8) | red
+}
+
+/// Converts one premultiplied RGBA8 word to straight-alpha RGBA8.
+#[inline]
+pub(crate) fn premultiplied_rgba_to_straight(pixel: u32) -> [u8; 4] {
   let alpha = pixel >> 24;
   let (red, green, blue) = if alpha == 0 {
     (0, 0, 0)
   } else if alpha == 255 {
-    ((pixel >> 16) & 0xff, (pixel >> 8) & 0xff, pixel & 0xff)
+    (pixel & 0xff, (pixel >> 8) & 0xff, (pixel >> 16) & 0xff)
   } else {
     let straight = |channel: u32| (((channel * 255) + alpha / 2) / alpha).min(255);
-    (straight((pixel >> 16) & 0xff), straight((pixel >> 8) & 0xff), straight(pixel & 0xff))
+    (straight(pixel & 0xff), straight((pixel >> 8) & 0xff), straight((pixel >> 16) & 0xff))
   };
   [red as u8, green as u8, blue as u8, alpha as u8]
 }
 
-/// Converts premultiplied ARGB32 pixels to straight-alpha RGBA8.
+/// Converts premultiplied RGBA8 pixels to straight-alpha RGBA8.
 ///
 /// WebAssembly uses a SIMD fast path for four-pixel groups containing only
 /// transparent and opaque pixels. Groups containing partial alpha use the
 /// scalar oracle because simd128 has no integer division instruction for
 /// the un-premultiplication step.
-pub(crate) fn argb_to_rgba_slice(src: &[u32], dst: &mut [u8]) {
+pub(crate) fn premultiplied_rgba_to_straight_slice(src: &[u32], dst: &mut [u8]) {
   #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-  argb_to_rgba_slice_wasm(src, dst);
+  premultiplied_rgba_to_straight_slice_wasm(src, dst);
   #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-  argb_to_rgba_slice_scalar(src, dst);
+  premultiplied_rgba_to_straight_slice_scalar(src, dst);
 }
 
-pub(crate) fn argb_to_rgba_slice_scalar(src: &[u32], dst: &mut [u8]) {
+pub(crate) fn premultiplied_rgba_to_straight_slice_scalar(src: &[u32], dst: &mut [u8]) {
   for (&pixel, rgba) in src.iter().zip(dst.chunks_exact_mut(4)) {
-    rgba.copy_from_slice(&argb_to_rgba(pixel));
+    rgba.copy_from_slice(&premultiplied_rgba_to_straight(pixel));
   }
 }
 
@@ -89,10 +96,8 @@ fn alpha8_to_rgba_slice_wasm(src: &[u8], dst: &mut [u8], color: u32) {
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-fn argb_to_rgba_slice_wasm(src: &[u32], dst: &mut [u8]) {
+fn premultiplied_rgba_to_straight_slice_wasm(src: &[u32], dst: &mut [u8]) {
   use core::arch::wasm32::{u8x16, u8x16_swizzle, v128, v128_and, v128_load, v128_store};
-
-  let bgra_to_rgba = u8x16(2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15);
   let replicate_alpha = u8x16(3, 3, 3, 3, 7, 7, 7, 7, 11, 11, 11, 11, 15, 15, 15, 15);
   let pixels = src.len().min(dst.len() / 4);
   let full = pixels - pixels % 4;
@@ -108,20 +113,19 @@ fn argb_to_rgba_slice_wasm(src: &[u32], dst: &mut [u8]) {
         // SAFETY: the exact chunks above provide 16 readable source bytes
         // and 16 writable destination bytes; wasm v128 permits unaligned
         // accesses.
-        let bgra = unsafe { v128_load(input.as_ptr().cast::<v128>()) };
-        let rgba = u8x16_swizzle(bgra, bgra_to_rgba);
+        let rgba = unsafe { v128_load(input.as_ptr().cast::<v128>()) };
         // Transparent pixels must become canonical zero even if a hostile
         // input word contains non-zero RGB channels with alpha zero.
         let alpha = u8x16_swizzle(rgba, replicate_alpha);
         unsafe { v128_store(output.as_mut_ptr().cast::<v128>(), v128_and(rgba, alpha)) };
       } else {
-        argb_to_rgba_slice_scalar(input, output);
+        premultiplied_rgba_to_straight_slice_scalar(input, output);
       }
     }
   }
 
   if let (Some(src_tail), Some(dst_tail)) = (src.get(full..pixels), dst.get_mut(full * 4..pixels * 4)) {
-    argb_to_rgba_slice_scalar(src_tail, dst_tail);
+    premultiplied_rgba_to_straight_slice_scalar(src_tail, dst_tail);
   }
 }
 

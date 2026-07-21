@@ -32,7 +32,7 @@ impl FrameRenderer for Counter {
 #[test]
 fn solid_premultiplication_matches_cpu_byte_math() {
   let color = Color { r: 0.5, g: 0.25, b: 1.0, a: 0.5 };
-  assert_eq!(premul_argb(color, 0.5), 0x3f1f_103f);
+  assert_eq!(premul_rgba(color, 0.5), 0x3f3f_101f);
 }
 
 #[test]
@@ -69,7 +69,7 @@ impl FrameRenderer for Trace {
     match paint {
       Paint::Solid(paint) => words.extend([
         0,
-        paint.argb,
+        paint.rgba,
         paint.opacity.to_bits(),
         paint.color.r.to_bits(),
         paint.color.g.to_bits(),

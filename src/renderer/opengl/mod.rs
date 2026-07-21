@@ -117,7 +117,7 @@ impl OpenGlRenderer {
     if self.rgba.len() != byte_count {
       self.rgba.resize(byte_count, 0);
     }
-    argb_to_premultiplied_rgba(&self.pixels, &mut self.rgba);
+    copy_premultiplied_rgba(&self.pixels, &mut self.rgba);
 
     // SAFETY: resources belong to the current context by the constructor
     // contract, dimensions fit GL's i32 API, and `rgba` has width*height*4
@@ -195,12 +195,12 @@ fn target_lengths(width: u32, height: u32) -> Result<(usize, usize)> {
   Ok((pixels, bytes))
 }
 
-fn argb_to_premultiplied_rgba(src: &[u32], dst: &mut [u8]) {
+fn copy_premultiplied_rgba(src: &[u32], dst: &mut [u8]) {
   for (&pixel, rgba) in src.iter().zip(dst.chunks_exact_mut(4)) {
     if let [red, green, blue, alpha] = rgba {
-      *red = (pixel >> 16) as u8;
+      *red = pixel as u8;
       *green = (pixel >> 8) as u8;
-      *blue = pixel as u8;
+      *blue = (pixel >> 16) as u8;
       *alpha = (pixel >> 24) as u8;
     }
   }
@@ -331,12 +331,12 @@ pub use web::WebGlRenderer;
 
 #[cfg(test)]
 mod tests {
-  use super::{argb_to_premultiplied_rgba, target_lengths, Error};
+  use super::{copy_premultiplied_rgba, target_lengths, Error};
 
   #[test]
-  fn converts_argb_to_premultiplied_rgba_without_unpremultiplying() {
+  fn copies_premultiplied_rgba_without_unpremultiplying() {
     let mut output = [0; 8];
-    argb_to_premultiplied_rgba(&[0x8040_2000, 0xff12_3456], &mut output);
+    copy_premultiplied_rgba(&[0x8000_2040, 0xff56_3412], &mut output);
     assert_eq!(output, [0x40, 0x20, 0x00, 0x80, 0x12, 0x34, 0x56, 0xff]);
   }
 

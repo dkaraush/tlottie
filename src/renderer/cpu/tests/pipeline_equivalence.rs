@@ -142,6 +142,23 @@ fn fractional_matte_out_point_includes_rounded_boundary_frame() {
   assert_eq!(pixels[5], 0xff00_ff00);
 }
 
+#[test]
+fn full_color_output_is_premultiplied_rgba_in_memory() {
+  fn center_pixel(color: &str) -> u32 {
+    let json = format!(
+      r##"{{"fr":30,"ip":0,"op":1,"w":4,"h":4,"layers":[{{"ty":1,"ind":1,"sw":4,"sh":4,"sc":"#{color}","ip":0,"op":1,"st":0,"ks":{{"o":{{"a":0,"k":100}},"p":{{"a":0,"k":[2,2]}},"a":{{"a":0,"k":[2,2]}},"s":{{"a":0,"k":[100,100]}}}}}}]}}"##,
+    );
+    let composition = Composition::parse(json.as_bytes(), &Limits::default()).unwrap();
+    let mut renderer = crate::CPURenderer::new(composition);
+    let mut pixels = [0u32; 16];
+    renderer.render(0.0, &mut pixels, 4, 4, RenderOptions::default()).unwrap();
+    pixels[5]
+  }
+
+  assert_eq!(center_pixel("ff0000"), 0xff00_00ff);
+  assert_eq!(center_pixel("0000ff"), 0xffff_0000);
+}
+
 fn assert_matches_direct(json: &[u8]) {
   let composition = Composition::parse(json, &Limits::default()).unwrap();
   let mut direct = vec![0u32; 64 * 64];
@@ -153,21 +170,21 @@ fn assert_matches_direct(json: &[u8]) {
   assert_eq!(streamed, direct);
 }
 
-fn assert_alpha8_matches_argb(json: &[u8]) {
+fn assert_alpha8_matches_rgba(json: &[u8]) {
   let composition = Composition::parse(json, &Limits::default()).unwrap();
   let mut renderer = crate::CPURenderer::new(composition);
-  let mut argb = vec![0u32; 32 * 32];
+  let mut rgba = vec![0u32; 32 * 32];
   let mut alpha8 = vec![0u8; 32 * 32];
-  renderer.render(0.0, &mut argb, 32, 32, RenderOptions::default()).unwrap();
+  renderer.render(0.0, &mut rgba, 32, 32, RenderOptions::default()).unwrap();
   renderer.render_alpha8(0.0, &mut alpha8, 32, 32, RenderOptions::default()).unwrap();
-  for (index, (&pixel, &alpha)) in argb.iter().zip(&alpha8).enumerate() {
+  for (index, (&pixel, &alpha)) in rgba.iter().zip(&alpha8).enumerate() {
     assert_eq!(alpha, (pixel >> 24) as u8, "pixel {index}");
   }
 }
 
 #[test]
-fn alpha8_matches_argb_alpha_for_opaque_and_varying_opacity_gradients() {
-  assert_alpha8_matches_argb(
+fn alpha8_matches_rgba_alpha_for_opaque_and_varying_opacity_gradients() {
+  assert_alpha8_matches_rgba(
     br#"{"fr":30,"ip":0,"op":1,"w":32,"h":32,"layers":[
       {"ty":4,"ind":1,"ip":0,"op":1,"st":0,
        "ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}},

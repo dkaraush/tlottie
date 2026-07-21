@@ -66,8 +66,9 @@ float tlottie_frame_rate(const TLottieInstance *renderer);
 uint32_t tlottie_frame_count(const TLottieInstance *renderer);
 
 /*
- * Renders width * height premultiplied 0xAARRGGBB pixels into out.
- * out_len is measured in uint32_t pixels. Nonzero antialias enables AA.
+ * Renders width * height premultiplied RGBA8 pixels into out. Each word is
+ * 0xAABBGGRR, giving [R, G, B, A] bytes on little-endian targets. out_len is
+ * measured in uint32_t pixels. Nonzero antialias enables AA.
  */
 int32_t tlottie_render(
     TLottieInstance *renderer,
@@ -95,7 +96,7 @@ int32_t tlottie_render_with_options(
 
 /*
  * Renders width * height bytes directly into an Alpha8 bitmap. Unlike the
- * ARGB APIs above, out_len is measured in bytes and no color conversion is
+ * RGBA APIs above, out_len is measured in bytes and no color conversion is
  * performed.
  */
 int32_t tlottie_render_alpha8(

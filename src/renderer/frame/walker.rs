@@ -339,7 +339,7 @@ fn rule_of(rule: FillRule) -> Rule {
   }
 }
 
-fn premul_argb(color: Color, opacity: f32) -> u32 {
+fn premul_rgba(color: Color, opacity: f32) -> u32 {
   let a = (color.a * opacity).clamp(0.0, 1.0);
   // Match Canvas::fill exactly: straight channels and paint alpha truncate
   // independently, then premultiplication uses rounded byte division.
@@ -351,7 +351,7 @@ fn premul_argb(color: Color, opacity: f32) -> u32 {
   let ri = premul(color.r);
   let gi = premul(color.g);
   let bi = premul(color.b);
-  (ai.min(255) << 24) | (ri.min(255) << 16) | (gi.min(255) << 8) | bi.min(255)
+  crate::pixel::pack_premultiplied_rgba(ri.min(255), gi.min(255), bi.min(255), ai.min(255))
 }
 
 fn geometry_key(contours: &[Contour], rule: Rule, width: usize, height: usize, antialias: bool) -> u128 {
@@ -585,7 +585,7 @@ impl RenderCtx<'_> {
             Geometry::new(contours, key),
             Paint::Solid(SolidPaint {
               rule: Rule::NonZero,
-              argb: premul_argb(color, content_opacity),
+              rgba: premul_rgba(color, content_opacity),
               color,
               opacity: content_opacity,
             }),
@@ -679,7 +679,7 @@ impl ShapeWalker<'_> {
           let geometry = borrowed.and_then(|index| arena.get(index).map(|(contour, _)| core::slice::from_ref(contour))).unwrap_or(&contours);
           let paint = SolidPaint {
             rule: rule_of(rule),
-            argb: premul_argb(color, opacity),
+            rgba: premul_rgba(color, opacity),
             color,
             opacity,
           };

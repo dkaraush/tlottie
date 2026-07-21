@@ -1,6 +1,6 @@
 struct PushConstants {
     viewport: vec2<f32>,
-    argb: u32,
+    rgba: u32,
     point_offset: u32,
     paint_kind: u32,
     gradient_kind: u32,
@@ -76,7 +76,7 @@ fn vs_cover(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4
 fn fs_stencil() {}
 
 fn paint_color(position: vec4<f32>) -> vec4<f32> {
-    var argb = push.argb;
+    var rgba = push.rgba;
     if push.paint_kind == 1u {
         let local = vec2<f32>(
             push.inverse0.x * position.x + push.inverse0.z * position.y + push.inverse1.x,
@@ -108,14 +108,14 @@ fn paint_color(position: vec4<f32>) -> vec4<f32> {
             }
         }
         let lut_index = u32(clamp(t, 0.0, 1.0) * 1023.0 + 0.5);
-        argb = point_words[push.lut_word_offset + lut_index];
+        rgba = point_words[push.lut_word_offset + lut_index];
     }
     let scale = 1.0 / 255.0;
     return vec4<f32>(
-        f32((argb >> 16u) & 255u) * scale,
-        f32((argb >> 8u) & 255u) * scale,
-        f32(argb & 255u) * scale,
-        f32((argb >> 24u) & 255u) * scale,
+        f32(rgba & 255u) * scale,
+        f32((rgba >> 8u) & 255u) * scale,
+        f32((rgba >> 16u) & 255u) * scale,
+        f32((rgba >> 24u) & 255u) * scale,
     );
 }
 

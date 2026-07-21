@@ -330,14 +330,14 @@ pub(super) fn fill_span_solid_neon(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32
     let s_g = div255_round(vmulq_u16(sg, ca));
     let s_b = div255_round(vmulq_u16(sb, ca));
     let inv = vsubq_u16(full, ca);
-    let d_b = vmovl_u8(planes.0);
+    let d_r = vmovl_u8(planes.0);
     let d_g = vmovl_u8(planes.1);
-    let d_r = vmovl_u8(planes.2);
+    let d_b = vmovl_u8(planes.2);
     let d_a = vmovl_u8(planes.3);
     let out = uint8x8x4_t(
-      vmovn_u16(over(d_b, s_b, inv)),
-      vmovn_u16(over(d_g, s_g, inv)),
       vmovn_u16(over(d_r, s_r, inv)),
+      vmovn_u16(over(d_g, s_g, inv)),
+      vmovn_u16(over(d_b, s_b, inv)),
       vmovn_u16(over(d_a, ca, inv)),
     );
     // SAFETY: same 32-byte span as the load above.
@@ -379,9 +379,9 @@ pub(super) fn fill_span_uniform_neon(dst: &mut [u32], ca: u32, s_r: u32, s_g: u3
     #[allow(unsafe_code)]
     let planes = unsafe { vld4_u8(dpx.as_ptr().cast::<u8>()) };
     let out = uint8x8x4_t(
-      vmovn_u16(over(vmovl_u8(planes.0), sb, inv)),
+      vmovn_u16(over(vmovl_u8(planes.0), sr, inv)),
       vmovn_u16(over(vmovl_u8(planes.1), sg, inv)),
-      vmovn_u16(over(vmovl_u8(planes.2), sr, inv)),
+      vmovn_u16(over(vmovl_u8(planes.2), sb, inv)),
       vmovn_u16(over(vmovl_u8(planes.3), sa, inv)),
     );
     // SAFETY: same 32-byte span as the load above.

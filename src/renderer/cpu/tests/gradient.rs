@@ -10,7 +10,7 @@ fn opacity_stops_do_not_shift_color_interpolation() {
   ]);
   let lut = build_gradient_lut(&stops, 3, 1.0);
   let pixel = lut[GRADIENT_LUT_SIZE / 4];
-  let (a, r, g, b) = ((pixel >> 24) & 0xff, (pixel >> 16) & 0xff, (pixel >> 8) & 0xff, pixel & 0xff);
+  let (a, r, g, b) = ((pixel >> 24) & 0xff, pixel & 0xff, (pixel >> 8) & 0xff, (pixel >> 16) & 0xff);
   assert_eq!(a, 255);
   assert!((126..=128).contains(&r), "red={r}");
   assert!((127..=129).contains(&g), "green={g}");

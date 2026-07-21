@@ -152,10 +152,10 @@ pub(super) fn alpha_mask_combine_wasm(dst: &mut [u8], src: &[u8], mode: u8, inve
 }
 
 pub(super) fn fill_span_solid_wasm(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb: u32, sa: u32) {
-  // Source pattern per pixel is [B,G,R,255]: the 255 alpha lane makes
+  // Source pattern per pixel is [R,G,B,255]: the 255 alpha lane makes
   // `div255(255*ca+127) == ca` hold exactly, so one multiply yields
   // s_r/s_g/s_b AND s_a = ca in their lanes.
-  let src = u16x8(sb as u16, sg as u16, sr as u16, 255, sb as u16, sg as u16, sr as u16, 255);
+  let src = u16x8(sr as u16, sg as u16, sb as u16, 255, sr as u16, sg as u16, sb as u16, 255);
   let sa_w = u16x8_splat(sa as u16);
   let full = u16x8_splat(255);
   for (dpx, cpx) in dst.chunks_exact_mut(4).zip(cov.chunks_exact(4)) {
@@ -185,7 +185,7 @@ pub(super) fn fill_span_solid_wasm(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32
 }
 
 pub(super) fn fill_span_uniform_wasm(dst: &mut [u32], ca: u32, s_r: u32, s_g: u32, s_b: u32) {
-  let s = u16x8(s_b as u16, s_g as u16, s_r as u16, ca as u16, s_b as u16, s_g as u16, s_r as u16, ca as u16);
+  let s = u16x8(s_r as u16, s_g as u16, s_b as u16, ca as u16, s_r as u16, s_g as u16, s_b as u16, ca as u16);
   let inv = u16x8_splat(255 - ca as u16);
   for dpx in dst.chunks_exact_mut(4) {
     // SAFETY: chunks_exact_mut(4) guarantees exactly 4 u32
@@ -261,8 +261,8 @@ fn lut_store(chunk: &mut [u32], lut: &[u32], idx: v128) {
 
 #[inline]
 fn blend4_over_k255(dpx: &mut [u32], src: &[u32; 4]) {
-  // Source and destination are premultiplied ARGB32-LE bytes
-  // [B,G,R,A]. k=255 means source channels pass through unchanged.
+  // Source and destination are premultiplied RGBA bytes. k=255 means
+  // source channels pass through unchanged.
   let arep_pat = u8x16(3, 3, 3, 3, 7, 7, 7, 7, 11, 11, 11, 11, 15, 15, 15, 15);
   let full = u16x8_splat(255);
   // SAFETY: callers pass 4-pixel chunks: exactly 16 readable/writable

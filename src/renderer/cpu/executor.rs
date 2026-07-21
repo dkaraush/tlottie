@@ -1,5 +1,5 @@
 //! Frame rendering: evaluate the model at a frame, flatten geometry,
-//! rasterize, and composite into a premultiplied ARGB32 buffer.
+//! rasterize, and composite into a premultiplied RGBA8 buffer.
 
 use super::mapped_surface::Surface;
 use crate::cells::CellRaster;
@@ -752,7 +752,7 @@ fn fill_rows_u8(buf: &mut [u8], w: usize, b: DirtyBox, v: u8) {
   }
 }
 
-/// Multiplies premultiplied ARGB pixels by a u8 coverage buffer.
+/// Multiplies premultiplied RGBA pixels by a u8 coverage buffer.
 /// Calls `f(y, row)` for each row of the dirty box, with `row` being the
 /// box's column span `[b.x0, b.x1]` of that row.
 #[cfg(test)]
@@ -827,9 +827,9 @@ fn luma_premult(p: u32) -> u32 {
   if a == 0 {
     return 0;
   }
-  let mut r = (p >> 16) & 0xff;
+  let mut r = p & 0xff;
   let mut g = (p >> 8) & 0xff;
-  let mut b = p & 0xff;
+  let mut b = (p >> 16) & 0xff;
   if a != 255 {
     r = (r * 255) / a;
     g = (g * 255) / a;

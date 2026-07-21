@@ -148,7 +148,7 @@ mod imp {
       Ok(GpuBuffer { buffer, memory, bytes })
     }
 
-    fn read_argb(&self, ctx: &VkCtx, out: &mut [u32]) -> Result<(), String> {
+    fn read_rgba(&self, ctx: &VkCtx, out: &mut [u32]) -> Result<(), String> {
       let byte_len = out.len().checked_mul(4).ok_or_else(|| "readback size overflow".to_string())?;
       if byte_len as vk::DeviceSize > self.bytes {
         return Err("readback target too small".to_string());
@@ -646,8 +646,8 @@ mod imp {
         break;
       }
       if let Some(dir) = &raw_dir {
-        let path = dir.join(format!("frame-{index:06}.argb"));
-        if let Err(error) = write_argb_raw(&path, pixels) {
+        let path = dir.join(format!("frame-{index:06}.rgba"));
+        if let Err(error) = write_rgba_raw(&path, pixels) {
           eprintln!("vulkan raw output error: {error}");
           code = ExitCode::FAILURE;
           break;
@@ -667,7 +667,7 @@ mod imp {
     code
   }
 
-  fn write_argb_raw(path: &std::path::Path, pixels: &[u32]) -> std::io::Result<()> {
+  fn write_rgba_raw(path: &std::path::Path, pixels: &[u32]) -> std::io::Result<()> {
     let mut bytes = Vec::with_capacity(pixels.len().saturating_mul(4));
     for pixel in pixels {
       bytes.extend_from_slice(&pixel.to_le_bytes());
@@ -784,7 +784,7 @@ mod imp {
     }
     let submit_wait_ns = submit_t0.elapsed().as_nanos() as u64;
     let gpu_ns = query_pool.and_then(|qp| read_timestamps_ns(ctx, qp));
-    if let Err(e) = staging.read_argb(ctx, pixels) {
+    if let Err(e) = staging.read_rgba(ctx, pixels) {
       eprintln!("vulkan readback error: {e}");
       return ExitCode::FAILURE;
     }

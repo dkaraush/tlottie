@@ -18,7 +18,6 @@
 mod composition;
 mod error;
 mod math;
-#[cfg(any(all(feature = "wasm", target_arch = "wasm32"), test))]
 mod pixel;
 mod renderer;
 

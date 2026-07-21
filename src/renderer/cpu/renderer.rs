@@ -153,7 +153,7 @@ impl CPURenderer {
       });
     };
     // Luma mattes depend on source RGB, so they are the one case that cannot
-    // be evaluated by an alpha-only backend. Keep a reusable ARGB fallback
+    // be evaluated by an alpha-only backend. Keep a reusable RGBA fallback
     // for those uncommon compositions; ordinary Alpha8 rendering never
     // allocates or converts a color bitmap.
     if composition_uses_luma_matte(&self.comp) {

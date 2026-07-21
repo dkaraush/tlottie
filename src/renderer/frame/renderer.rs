@@ -29,8 +29,8 @@ pub enum Rule {
 pub struct SolidPaint {
   /// Fill rule used by this paint.
   pub rule: Rule,
-  /// Premultiplied ARGB color after paint opacity has been folded in.
-  pub argb: u32,
+  /// Premultiplied RGBA8 color packed as `0xAABBGGRR`.
+  pub rgba: u32,
   pub(crate) color: crate::math::Color,
   pub(crate) opacity: f32,
 }

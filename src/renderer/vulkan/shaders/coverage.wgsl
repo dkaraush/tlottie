@@ -53,18 +53,18 @@ fn load_tile_paint(index: u32) -> u32 {
     return select(packed & 65535u, packed >> 16u, (index & 1u) != 0u);
 }
 
-fn unpack_argb(argb: u32) -> vec4<u32> {
+fn unpack_rgba(rgba: u32) -> vec4<u32> {
     return vec4<u32>(
-        (argb >> 16u) & 255u,
-        (argb >> 8u) & 255u,
-        argb & 255u,
-        (argb >> 24u) & 255u,
+        rgba & 255u,
+        (rgba >> 8u) & 255u,
+        (rgba >> 16u) & 255u,
+        (rgba >> 24u) & 255u,
     );
 }
 
 fn sample_paint(base: u32, position: vec2<f32>) -> vec4<u32> {
     if words[base + 2u] == 0u {
-        return unpack_argb(words[base + 4u]);
+        return unpack_rgba(words[base + 4u]);
     }
     let local = vec2<f32>(
         load_f32(base + 8u) * position.x + load_f32(base + 10u) * position.y + load_f32(base + 12u),
@@ -100,7 +100,7 @@ fn sample_paint(base: u32, position: vec2<f32>) -> vec4<u32> {
         }
     }
     let index = u32(clamp(t, 0.0, 1.0) * 1023.0 + 0.5);
-    return unpack_argb(words[push.lut_word + words[base + 6u] + index]);
+    return unpack_rgba(words[push.lut_word + words[base + 6u] + index]);
 }
 
 fn edge_pixel_area(a: vec2<f32>, b: vec2<f32>, pixel: vec2<f32>) -> f32 {

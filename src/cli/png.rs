@@ -22,7 +22,7 @@ pub fn write_png(path: &str, size: u32, pixels: &[u32]) -> std::io::Result<()> {
   for row in pixels.chunks(w.max(1)) {
     raw.push(0u8);
     for &pixel in row {
-      raw.extend_from_slice(&crate::pixel::argb_to_rgba(pixel));
+      raw.extend_from_slice(&crate::pixel::premultiplied_rgba_to_straight(pixel));
     }
   }
   // zlib: header, stored blocks (<=65535 bytes), adler32

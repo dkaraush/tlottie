@@ -5,8 +5,8 @@
 //! without the feature, wasm without `-Ctarget-feature=+simd128`) uses the
 //! scalar path unconditionally.
 //!
-//! Pixel format everywhere: premultiplied ARGB32 words (0xAARRGGBB), which
-//! in little-endian memory is byte order [B, G, R, A] — exactly what
+//! Pixel format everywhere: premultiplied RGBA8 words (0xAABBGGRR), which
+//! in little-endian memory is byte order [R, G, B, A] — exactly what
 //! `vld4_u8` de-interleaves into planes. The wasm kernels skip the
 //! de-interleave: the blend math is per-channel independent, so they widen
 //! the interleaved bytes to u16 lanes in place and swizzle per-pixel
@@ -30,7 +30,7 @@ pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb:
   // (ca=255 -> s_x=x, inv=0 -> o=s), so interior runs become plain stores
   // — large fills are memory-bound and interiors dominate at 320/720px.
   if sa == 255 {
-    let color = (255u32 << 24) | (sr << 16) | (sg << 8) | sb;
+    let color = crate::pixel::pack_premultiplied_rgba(sr, sg, sb, 255);
     #[cfg(target_arch = "aarch64")]
     if large_canvas && dst.len() >= SIMD_MIN_SPAN {
       let n = dst.len().min(cov.len());
@@ -117,10 +117,10 @@ fn fill_span_solid_scalar(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb: u32
     let d = *dst;
     let inv = 256 - s_a;
     let o_a = s_a + (((d >> 24) & 0xff) * inv >> 8);
-    let o_r = s_r + (((d >> 16) & 0xff) * inv >> 8);
+    let o_r = s_r + ((d & 0xff) * inv >> 8);
     let o_g = s_g + (((d >> 8) & 0xff) * inv >> 8);
-    let o_b = s_b + ((d & 0xff) * inv >> 8);
-    *dst = (o_a.min(255) << 24) | (o_r.min(255) << 16) | (o_g.min(255) << 8) | o_b.min(255);
+    let o_b = s_b + (((d >> 16) & 0xff) * inv >> 8);
+    *dst = crate::pixel::pack_premultiplied_rgba(o_r.min(255), o_g.min(255), o_b.min(255), o_a.min(255));
   }
 }
 
@@ -134,7 +134,7 @@ pub(crate) fn fill_span_uniform_opaque(dst: &mut [u32], cov: u8, sr: u32, sg: u3
     return;
   }
   if cov == 255 {
-    dst.fill((255u32 << 24) | (sr << 16) | (sg << 8) | sb);
+    dst.fill(crate::pixel::pack_premultiplied_rgba(sr, sg, sb, 255));
     return;
   }
   let ca = u32::from(cov);
@@ -161,7 +161,7 @@ pub(crate) fn fill_span_uniform(dst: &mut [u32], cov: u8, sr: u32, sg: u32, sb: 
   let s_b = (sb * ca + 127) / 255;
   if ca == 255 {
     // Fully opaque source: over() degenerates to the source itself.
-    dst.fill((255u32 << 24) | (s_r << 16) | (s_g << 8) | s_b);
+    dst.fill(crate::pixel::pack_premultiplied_rgba(s_r, s_g, s_b, 255));
     return;
   }
   if let [dst] = dst {
@@ -200,10 +200,10 @@ fn fill_one_uniform(dst: &mut u32, ca: u32, s_r: u32, s_g: u32, s_b: u32) {
   let value = *dst;
   let inv = 256 - ca;
   let o_a = ca + (((value >> 24) & 0xff) * inv >> 8);
-  let o_r = s_r + (((value >> 16) & 0xff) * inv >> 8);
+  let o_r = s_r + ((value & 0xff) * inv >> 8);
   let o_g = s_g + (((value >> 8) & 0xff) * inv >> 8);
-  let o_b = s_b + ((value & 0xff) * inv >> 8);
-  *dst = (o_a.min(255) << 24) | (o_r.min(255) << 16) | (o_g.min(255) << 8) | o_b.min(255);
+  let o_b = s_b + (((value >> 16) & 0xff) * inv >> 8);
+  *dst = crate::pixel::pack_premultiplied_rgba(o_r.min(255), o_g.min(255), o_b.min(255), o_a.min(255));
 }
 
 fn fill_span_uniform_scalar(dst: &mut [u32], ca: u32, s_r: u32, s_g: u32, s_b: u32) {
@@ -211,10 +211,10 @@ fn fill_span_uniform_scalar(dst: &mut [u32], ca: u32, s_r: u32, s_g: u32, s_b: u
   for dst in dst.iter_mut() {
     let d = *dst;
     let o_a = ca + (((d >> 24) & 0xff) * inv >> 8);
-    let o_r = s_r + (((d >> 16) & 0xff) * inv >> 8);
+    let o_r = s_r + ((d & 0xff) * inv >> 8);
     let o_g = s_g + (((d >> 8) & 0xff) * inv >> 8);
-    let o_b = s_b + ((d & 0xff) * inv >> 8);
-    *dst = (o_a.min(255) << 24) | (o_r.min(255) << 16) | (o_g.min(255) << 8) | o_b.min(255);
+    let o_b = s_b + (((d >> 16) & 0xff) * inv >> 8);
+    *dst = crate::pixel::pack_premultiplied_rgba(o_r.min(255), o_g.min(255), o_b.min(255), o_a.min(255));
   }
 }
 

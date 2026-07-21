@@ -18,8 +18,8 @@ pub struct LayerColorReplacementAbi {
 /// A playing instance plus its conversion buffers.
 pub struct Instance {
   anim: CPURenderer,
-  /// Premultiplied ARGB32 render target (what the renderer writes).
-  argb: Vec<u32>,
+  /// Premultiplied RGBA8 render target (what the renderer writes).
+  premultiplied_rgba: Vec<u32>,
   /// Un-premultiplied RGBA8 copy handed to the canvas `ImageData`.
   rgba: Vec<u8>,
   /// Direct one-byte-per-pixel alpha render target.
@@ -122,7 +122,7 @@ pub unsafe extern "C" fn tlottie_new_with_options(
   match Composition::parse_with_options(json, &Limits::default(), &options) {
     Ok(comp) => Box::into_raw(Box::new(Instance {
       anim: CPURenderer::new(comp),
-      argb: Vec::new(),
+      premultiplied_rgba: Vec::new(),
       rgba: Vec::new(),
       alpha8: Vec::new(),
     })),
@@ -206,15 +206,15 @@ pub unsafe extern "C" fn tlottie_render_with_options(inst: *mut Instance, frame:
   };
   // Resize-only: render() fully overwrites all px pixels, so re-zeroing
   // an already-sized buffer is pure memset waste (profiled ~1MB/frame).
-  if inst.argb.len() != px {
-    inst.argb.clear();
-    inst.argb.resize(px, 0);
+  if inst.premultiplied_rgba.len() != px {
+    inst.premultiplied_rgba.clear();
+    inst.premultiplied_rgba.resize(px, 0);
   }
   if inst
     .anim
     .render(
       frame,
-      &mut inst.argb,
+      &mut inst.premultiplied_rgba,
       width,
       height,
       RenderOptions {
@@ -236,7 +236,7 @@ pub unsafe extern "C" fn tlottie_render_with_options(inst: *mut Instance, frame:
     inst.rgba.clear();
     inst.rgba.resize(bytes, 0);
   }
-  crate::pixel::argb_to_rgba_slice(&inst.argb, &mut inst.rgba);
+  crate::pixel::premultiplied_rgba_to_straight_slice(&inst.premultiplied_rgba, &mut inst.rgba);
   inst.rgba.as_ptr()
 }
 

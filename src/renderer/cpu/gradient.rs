@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// Builds a premultiplied ARGB lookup table from independently interpolated
+/// Builds a premultiplied RGBA8 lookup table from independently interpolated
 /// Lottie color and opacity stops.
 pub(crate) fn build_gradient_lut(stops: &FloatList, color_count: usize, opacity: f32) -> [u32; GRADIENT_LUT_SIZE] {
   let data = &stops.0;
@@ -75,7 +75,7 @@ pub(crate) fn build_gradient_lut(stops: &FloatList, color_count: usize, opacity:
     let pr = (r.clamp(0.0, 1.0) * a * 255.0 + 0.5) as u32;
     let pg = (g.clamp(0.0, 1.0) * a * 255.0 + 0.5) as u32;
     let pb = (b.clamp(0.0, 1.0) * a * 255.0 + 0.5) as u32;
-    *slot = (pa << 24) | (pr << 16) | (pg << 8) | pb;
+    *slot = crate::pixel::pack_premultiplied_rgba(pr, pg, pb, pa);
   }
   lut
 }
