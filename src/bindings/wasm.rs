@@ -253,12 +253,44 @@ pub unsafe extern "C" fn tlottie_render_alpha8_with_options(inst: *mut Instance,
   let Some(inst) = (unsafe { inst.as_mut() }) else {
     return std::ptr::null();
   };
-  if !curve_tolerance.is_finite() || curve_tolerance <= 0.0 {
+  if render_alpha8(inst, frame, width, height, antialias, curve_tolerance).is_none() {
     return std::ptr::null();
   }
-  let Some(px) = (width as usize).checked_mul(height as usize) else {
+  inst.alpha8.as_ptr()
+}
+
+/// Renders Alpha8 and expands it into straight-alpha RGBA8 using the constant
+/// RGB color encoded as `0x00RRGGBB`. The returned instance-owned buffer has
+/// `width * height * 4` bytes and is overwritten by the next render call.
+#[no_mangle]
+pub unsafe extern "C" fn tlottie_render_alpha8_color(inst: *mut Instance, frame: f32, width: u32, height: u32, antialias: u32, color: u32) -> *const u8 {
+  unsafe { tlottie_render_alpha8_color_with_options(inst, frame, width, height, antialias, color, RenderOptions::default().curve_tolerance) }
+}
+
+/// Like [`tlottie_render_alpha8_color`], with an explicit curve tolerance.
+#[no_mangle]
+pub unsafe extern "C" fn tlottie_render_alpha8_color_with_options(inst: *mut Instance, frame: f32, width: u32, height: u32, antialias: u32, color: u32, curve_tolerance: f32) -> *const u8 {
+  let Some(inst) = (unsafe { inst.as_mut() }) else {
     return std::ptr::null();
   };
+  let Some(px) = render_alpha8(inst, frame, width, height, antialias, curve_tolerance) else {
+    return std::ptr::null();
+  };
+  let Some(bytes) = px.checked_mul(4) else {
+    return std::ptr::null();
+  };
+  if inst.rgba.len() != bytes {
+    inst.rgba.resize(bytes, 0);
+  }
+  crate::pixel::alpha8_to_rgba_slice(&inst.alpha8, &mut inst.rgba, color);
+  inst.rgba.as_ptr()
+}
+
+fn render_alpha8(inst: &mut Instance, frame: f32, width: u32, height: u32, antialias: u32, curve_tolerance: f32) -> Option<usize> {
+  if !curve_tolerance.is_finite() || curve_tolerance <= 0.0 {
+    return None;
+  }
+  let px = (width as usize).checked_mul(height as usize)?;
   if inst.alpha8.len() != px {
     inst.alpha8.resize(px, 0);
   }
@@ -277,7 +309,7 @@ pub unsafe extern "C" fn tlottie_render_alpha8_with_options(inst: *mut Instance,
     )
     .is_err()
   {
-    return std::ptr::null();
+    return None;
   }
-  inst.alpha8.as_ptr()
+  Some(px)
 }

@@ -222,6 +222,10 @@ impl CellRaster {
   }
 
   pub fn fill_contours(&mut self, contours: &[Contour]) {
+    self.fill_contours_translated(contours, 0.0, 0.0);
+  }
+
+  pub fn fill_contours_translated(&mut self, contours: &[Contour], tx: f32, ty: f32) {
     for contour in contours {
       let pts = &contour.points;
       if pts.len() < 3 {
@@ -230,7 +234,7 @@ impl CellRaster {
       for (i, cur) in pts.iter().enumerate() {
         let next = pts.get(i + 1).or_else(|| pts.first());
         if let Some(next) = next {
-          self.draw_line(cur.x, cur.y, next.x, next.y);
+          self.draw_line(cur.x + tx, cur.y + ty, next.x + tx, next.y + ty);
         }
       }
     }
@@ -275,15 +279,43 @@ impl CellRaster {
   /// blit gate and tripling cache entry sizes. Zero-coverage gaps are
   /// not emitted and naturally break merge runs.
   pub fn sweep_spans(&mut self, rule: FillRule, antialias: bool, mut f: impl FnMut(usize, usize, usize, u8)) {
+    self.sweep_spans_impl::<false>(rule, antialias, &mut |y, span| {
+      if let Some((x0, len, cov)) = span {
+        f(y, x0, len, cov);
+      }
+    });
+  }
+
+  /// Like [`Self::sweep_spans`], but also calls `row_end` for every canvas
+  /// row. This lets sparse consumers process zero-coverage gaps without
+  /// materializing a full width×height coverage plane.
+  pub fn sweep_span_rows(&mut self, rule: FillRule, antialias: bool, mut f: impl FnMut(usize, Option<(usize, usize, u8)>)) {
+    self.sweep_spans_impl::<true>(rule, antialias, &mut f);
+  }
+
+  fn sweep_spans_impl<const ALL_ROWS: bool>(&mut self, rule: FillRule, antialias: bool, f: &mut impl FnMut(usize, Option<(usize, usize, u8)>)) {
     if self.min_y > self.max_y {
+      if ALL_ROWS {
+        for y in 0..self.h {
+          f(y, None);
+        }
+      }
       return;
     }
     let w = self.w;
-    for y in self.min_y..=self.max_y.min(self.h.saturating_sub(1)) {
+    let y0 = if ALL_ROWS { 0 } else { self.min_y };
+    let y1 = if ALL_ROWS { self.h.saturating_sub(1) } else { self.max_y.min(self.h.saturating_sub(1)) };
+    for y in y0..=y1 {
       let Some(row) = self.rows.get_mut(y) else {
+        if ALL_ROWS {
+          f(y, None);
+        }
         continue;
       };
       if row.is_empty() {
+        if ALL_ROWS {
+          f(y, None);
+        }
         continue;
       }
       row.sort_unstable_by_key(|c| c.x);
@@ -297,7 +329,7 @@ impl CellRaster {
               *plen += len;
             }
             Some((px0, plen, pcov)) => {
-              f(y, *px0, *plen, *pcov);
+              f(y, Some((*px0, *plen, *pcov)));
               pend = Some((x0, len, cov));
             }
             None => pend = Some((x0, len, cov)),
@@ -341,7 +373,10 @@ impl CellRaster {
         prev_end = x + 1;
       }
       if let Some((px0, plen, pcov)) = pend.take() {
-        f(y, px0, plen, pcov);
+        f(y, Some((px0, plen, pcov)));
+      }
+      if ALL_ROWS {
+        f(y, None);
       }
     }
   }

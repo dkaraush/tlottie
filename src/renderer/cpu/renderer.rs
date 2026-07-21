@@ -4,6 +4,9 @@ use crate::{Composition, Result};
 
 use super::executor::RenderScratch;
 
+/// Avoid retaining an arbitrarily large second copy of the output bitmap.
+const STATIC_BITMAP_CACHE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Stateful CPU renderer for a parsed [`Composition`].
 ///
 /// The composition is immutable and shareable while this renderer owns the
@@ -25,6 +28,17 @@ pub struct CPURenderer {
   pub(super) row_bounds_pool: Vec<Vec<super::executor::RowBounds>>,
   pub(super) mask_accumulator: Option<Vec<u8>>,
   pub(super) alpha_fallback: Vec<u32>,
+  /// Final bitmap for a composition proven static by the parser. Repeated
+  /// renders are common for players and benchmarks even when frame_count is
+  /// one; replaying the complete shape tree in that case only burns CPU.
+  static_bitmap: Option<StaticBitmap>,
+}
+
+struct StaticBitmap {
+  width: u32,
+  height: u32,
+  options: crate::RenderOptions,
+  pixels: Vec<u32>,
 }
 
 impl CPURenderer {
@@ -46,6 +60,7 @@ impl CPURenderer {
       row_bounds_pool: Vec::new(),
       mask_accumulator: None,
       alpha_fallback: Vec::new(),
+      static_bitmap: None,
     }
   }
 
@@ -67,6 +82,7 @@ impl CPURenderer {
       row_bounds_pool: Vec::new(),
       mask_accumulator: None,
       alpha_fallback: Vec::new(),
+      static_bitmap: None,
     }
   }
 
@@ -77,10 +93,41 @@ impl CPURenderer {
 
   /// Renders a frame with explicit [`crate::RenderOptions`].
   pub fn render(&mut self, frame: f32, pixels: &mut [u32], width: u32, height: u32, options: crate::RenderOptions) -> Result<()> {
+    if self.comp.is_static() {
+      if let Some(cached) = &self.static_bitmap {
+        if cached.width == width && cached.height == height && cached.options == options {
+          let Some(target) = pixels.get_mut(..cached.pixels.len()) else {
+            return Err(crate::Error::InvalidLottie {
+              offset: 0,
+              what: "pixel buffer too small",
+            });
+          };
+          target.copy_from_slice(&cached.pixels);
+          return Ok(());
+        }
+      }
+    }
     let composition = std::sync::Arc::clone(&self.comp);
     let mut walker = core::mem::take(&mut self.walker);
     let result = self.with_bitmap(pixels, width, height, options, |renderer| walker.render(&composition, frame, width, height, options, renderer));
     self.walker = walker;
+    if result.is_ok() && self.comp.is_static() {
+      let pixel_count = (width as usize).saturating_mul(height as usize);
+      let cache_fits = pixel_count.checked_mul(core::mem::size_of::<u32>()).is_some_and(|bytes| bytes <= STATIC_BITMAP_CACHE_BYTES);
+      if cache_fits {
+        let Some(rendered) = pixels.get(..pixel_count) else {
+          return result;
+        };
+        self.static_bitmap = Some(StaticBitmap {
+          width,
+          height,
+          options,
+          pixels: rendered.to_vec(),
+        });
+      } else {
+        self.static_bitmap = None;
+      }
+    }
     result
   }
 

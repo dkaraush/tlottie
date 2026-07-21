@@ -3,8 +3,9 @@
 //! stays <= 65407.
 
 use core::arch::aarch64::{
-  uint16x8_t, uint32x4_t, uint8x8x4_t, vabsq_f32, vaddq_f32, vaddq_u16, vandq_u32, vbslq_u32, vcgeq_f32, vcltq_f32, vcvtq_u32_f32, vdupq_n_f32, vdupq_n_u16, vdupq_n_u32, vgetq_lane_u32, vld1_u8,
-  vld1q_f32, vld4_u8, vmaxq_f32, vminq_f32, vminq_u16, vminv_u8, vmovl_u8, vmovn_u16, vmulq_f32, vmulq_u16, vnegq_f32, vshrq_n_u16, vsqrtq_f32, vst1q_u32, vst4_u8, vsubq_f32, vsubq_u16,
+  uint16x8_t, uint32x4_t, uint8x16_t, uint8x8x4_t, vabsq_f32, vaddq_f32, vaddq_u16, vandq_u32, vbslq_u32, vcgeq_f32, vcltq_f32, vcombine_u8, vcvtq_u32_f32, vdupq_n_f32, vdupq_n_u16, vdupq_n_u32,
+  vget_high_u8, vget_low_u8, vgetq_lane_u32, vld1_u8, vld1q_f32, vld1q_u8, vld4_u8, vmaxq_f32, vmaxq_u16, vminq_f32, vminq_u16, vminv_u8, vmovl_u8, vmovn_u16, vmulq_f32, vmulq_u16, vnegq_f32,
+  vshrq_n_u16, vsqrtq_f32, vst1q_u32, vst1q_u8, vst4_u8, vsubq_f32, vsubq_u16,
 };
 
 /// Exact `(n + 127) / 255` on u16 lanes (n <= 65025).
@@ -14,6 +15,153 @@ fn div255_round(n: uint16x8_t) -> uint16x8_t {
   let t = vaddq_u16(n, vdupq_n_u16(127));
   let u = vaddq_u16(vaddq_u16(t, vshrq_n_u16::<8>(t)), vdupq_n_u16(1));
   vshrq_n_u16::<8>(u)
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn alpha_unpack(v: uint8x16_t) -> (uint16x8_t, uint16x8_t) {
+  (vmovl_u8(vget_low_u8(v)), vmovl_u8(vget_high_u8(v)))
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn alpha_pack(lo: uint16x8_t, hi: uint16x8_t) -> uint8x16_t {
+  vcombine_u8(vmovn_u16(lo), vmovn_u16(hi))
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn alpha_over8(dst: uint16x8_t, source: uint16x8_t) -> uint16x8_t {
+  over(dst, source, vsubq_u16(vdupq_n_u16(255), source))
+}
+
+#[target_feature(enable = "neon")]
+pub(super) fn alpha_blend_solid_neon(dst: &mut [u8], coverage: &[u8], alpha: u8) {
+  let alpha = vdupq_n_u16(u16::from(alpha));
+  for (dst, coverage) in dst.chunks_exact_mut(16).zip(coverage.chunks_exact(16)) {
+    #[allow(unsafe_code)]
+    let (d, c) = unsafe { (vld1q_u8(dst.as_ptr()), vld1q_u8(coverage.as_ptr())) };
+    let (dl, dh) = alpha_unpack(d);
+    let (cl, ch) = alpha_unpack(c);
+    let sl = div255_round(vmulq_u16(cl, alpha));
+    let sh = div255_round(vmulq_u16(ch, alpha));
+    #[allow(unsafe_code)]
+    unsafe {
+      vst1q_u8(dst.as_mut_ptr(), alpha_pack(alpha_over8(dl, sl), alpha_over8(dh, sh)))
+    };
+  }
+}
+
+#[target_feature(enable = "neon")]
+pub(super) fn alpha_blend_product_neon(dst: &mut [u8], lhs: &[u8], rhs: &[u8]) {
+  for ((dst, lhs), rhs) in dst.chunks_exact_mut(16).zip(lhs.chunks_exact(16)).zip(rhs.chunks_exact(16)) {
+    #[allow(unsafe_code)]
+    let (d, l, r) = unsafe { (vld1q_u8(dst.as_ptr()), vld1q_u8(lhs.as_ptr()), vld1q_u8(rhs.as_ptr())) };
+    let (dl, dh) = alpha_unpack(d);
+    let (ll, lh) = alpha_unpack(l);
+    let (rl, rh) = alpha_unpack(r);
+    let sl = div255_round(vmulq_u16(ll, rl));
+    let sh = div255_round(vmulq_u16(lh, rh));
+    #[allow(unsafe_code)]
+    unsafe {
+      vst1q_u8(dst.as_mut_ptr(), alpha_pack(alpha_over8(dl, sl), alpha_over8(dh, sh)))
+    };
+  }
+}
+
+#[target_feature(enable = "neon")]
+pub(super) fn alpha_blend_uniform_neon(dst: &mut [u8], source: u8) {
+  let source = vdupq_n_u16(u16::from(source));
+  for dst in dst.chunks_exact_mut(16) {
+    #[allow(unsafe_code)]
+    let d = unsafe { vld1q_u8(dst.as_ptr()) };
+    let (dl, dh) = alpha_unpack(d);
+    #[allow(unsafe_code)]
+    unsafe {
+      vst1q_u8(dst.as_mut_ptr(), alpha_pack(alpha_over8(dl, source), alpha_over8(dh, source)))
+    };
+  }
+}
+
+#[target_feature(enable = "neon")]
+pub(super) fn alpha_composite_over_neon(dst: &mut [u8], src: &[u8], opacity: u8) {
+  let opacity = vdupq_n_u16(u16::from(opacity));
+  for (dst, src) in dst.chunks_exact_mut(16).zip(src.chunks_exact(16)) {
+    #[allow(unsafe_code)]
+    let (d, s) = unsafe { (vld1q_u8(dst.as_ptr()), vld1q_u8(src.as_ptr())) };
+    let (dl, dh) = alpha_unpack(d);
+    let (sl, sh) = alpha_unpack(s);
+    let sl = div255_round(vmulq_u16(sl, opacity));
+    let sh = div255_round(vmulq_u16(sh, opacity));
+    #[allow(unsafe_code)]
+    unsafe {
+      vst1q_u8(dst.as_mut_ptr(), alpha_pack(alpha_over8(dl, sl), alpha_over8(dh, sh)))
+    };
+  }
+}
+
+#[target_feature(enable = "neon")]
+pub(super) fn alpha_multiply_neon(dst: &mut [u8], factors: &[u8]) {
+  for (dst, factors) in dst.chunks_exact_mut(16).zip(factors.chunks_exact(16)) {
+    #[allow(unsafe_code)]
+    let (d, f) = unsafe { (vld1q_u8(dst.as_ptr()), vld1q_u8(factors.as_ptr())) };
+    let (dl, dh) = alpha_unpack(d);
+    let (fl, fh) = alpha_unpack(f);
+    #[allow(unsafe_code)]
+    unsafe {
+      vst1q_u8(dst.as_mut_ptr(), alpha_pack(div255_round(vmulq_u16(dl, fl)), div255_round(vmulq_u16(dh, fh))))
+    };
+  }
+}
+
+#[target_feature(enable = "neon")]
+pub(super) fn alpha_matte_neon(dst: &mut [u8], src: &[u8], opacity: u8, inverted: bool) {
+  let opacity = vdupq_n_u16(u16::from(opacity));
+  let full = vdupq_n_u16(255);
+  for (dst, src) in dst.chunks_exact_mut(16).zip(src.chunks_exact(16)) {
+    #[allow(unsafe_code)]
+    let (d, s) = unsafe { (vld1q_u8(dst.as_ptr()), vld1q_u8(src.as_ptr())) };
+    let (dl, dh) = alpha_unpack(d);
+    let (sl, sh) = alpha_unpack(s);
+    let mut fl = div255_round(vmulq_u16(sl, opacity));
+    let mut fh = div255_round(vmulq_u16(sh, opacity));
+    if inverted {
+      fl = vsubq_u16(full, fl);
+      fh = vsubq_u16(full, fh);
+    }
+    #[allow(unsafe_code)]
+    unsafe {
+      vst1q_u8(dst.as_mut_ptr(), alpha_pack(div255_round(vmulq_u16(dl, fl)), div255_round(vmulq_u16(dh, fh))))
+    };
+  }
+}
+
+#[target_feature(enable = "neon")]
+pub(super) fn alpha_mask_combine_neon(dst: &mut [u8], src: &[u8], mode: u8, inverted: bool, opacity: u8) {
+  let opacity = vdupq_n_u16(u16::from(opacity));
+  let full = vdupq_n_u16(255);
+  for (dst, src) in dst.chunks_exact_mut(16).zip(src.chunks_exact(16)) {
+    #[allow(unsafe_code)]
+    let (d, s) = unsafe { (vld1q_u8(dst.as_ptr()), vld1q_u8(src.as_ptr())) };
+    let (dl, dh) = alpha_unpack(d);
+    let (mut sl, mut sh) = alpha_unpack(s);
+    if inverted {
+      sl = vsubq_u16(full, sl);
+      sh = vsubq_u16(full, sh);
+    }
+    let cl = div255_round(vmulq_u16(sl, opacity));
+    let ch = div255_round(vmulq_u16(sh, opacity));
+    let combine = |old, contribution| match mode {
+      b's' => div255_round(vmulq_u16(old, vsubq_u16(full, contribution))),
+      b'i' => div255_round(vmulq_u16(old, contribution)),
+      b'f' => vsubq_u16(vmaxq_u16(old, contribution), vminq_u16(old, contribution)),
+      _ => vaddq_u16(contribution, div255_round(vmulq_u16(vsubq_u16(full, contribution), old))),
+    };
+    #[allow(unsafe_code)]
+    unsafe {
+      vst1q_u8(dst.as_mut_ptr(), alpha_pack(combine(dl, cl), combine(dh, ch)))
+    };
+  }
 }
 
 /// 4-lane radial gradient LUT fill for full-coverage runs. Lane math:

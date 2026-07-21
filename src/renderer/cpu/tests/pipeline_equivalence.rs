@@ -2,6 +2,34 @@ use crate::renderer::cpu::executor::{render_pooled, RenderScratch};
 use crate::renderer::frame::FrameRenderer;
 use crate::{Composition, Limits, RenderOptions};
 
+#[test]
+fn single_mask_fast_path_matches_accumulator_formula() {
+  for &mode in b"asif" {
+    for inverted in [false, true] {
+      for opacity in [0u8, 1, 63, 128, 254, 255] {
+        for sample in [0u8, 1, 63, 127, 128, 254, 255] {
+          let mut actual = [sample];
+          super::prepare_single_mask(&mut actual, mode, inverted, opacity);
+
+          let mut contribution = u32::from(sample);
+          if inverted {
+            contribution = 255 - contribution;
+          }
+          contribution = (contribution * u32::from(opacity) + 127) / 255;
+          let initial = if matches!(mode, b'a' | b'f') { 0u32 } else { 255 };
+          let expected = match mode {
+            b's' => (initial * (255 - contribution) + 127) / 255,
+            b'i' => (initial * contribution + 127) / 255,
+            b'f' => initial.abs_diff(contribution),
+            _ => contribution + ((255 - contribution) * initial + 127) / 255,
+          } as u8;
+          assert_eq!(actual[0], expected, "mode={} inverted={inverted} opacity={opacity} sample={sample}", mode as char);
+        }
+      }
+    }
+  }
+}
+
 fn empty_renderer() -> crate::CPURenderer {
   let composition = Composition::parse(br#"{"fr":30,"ip":0,"op":1,"w":2,"h":2,"layers":[]}"#, &Limits::default()).unwrap();
   crate::CPURenderer::new(composition)

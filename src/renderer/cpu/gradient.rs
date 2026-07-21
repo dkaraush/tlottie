@@ -186,12 +186,27 @@ pub(crate) fn radial_map(start: Vec2, end: Vec2, inv: Mat2x3, hl_len_pct: f32, h
 }
 
 impl Canvas<'_> {
+  #[cfg(test)]
   pub(crate) fn fill_gradient<const TRACK_ROWS: bool>(
     &mut self,
     cache: &mut CovCache,
     key: u128,
     src_key: u128,
     contours: &[Contour],
+    rule: FillRule,
+    lut: &[u32; GRADIENT_LUT_SIZE],
+    map: &GradientMap,
+  ) {
+    self.fill_gradient_translated::<TRACK_ROWS>(cache, key, src_key, contours, crate::renderer::frame::Point::default(), rule, lut, map);
+  }
+
+  pub(crate) fn fill_gradient_translated<const TRACK_ROWS: bool>(
+    &mut self,
+    cache: &mut CovCache,
+    key: u128,
+    src_key: u128,
+    contours: &[Contour],
+    translation: crate::renderer::frame::Point,
     rule: FillRule,
     lut: &[u32; GRADIENT_LUT_SIZE],
     map: &GradientMap,
@@ -348,14 +363,15 @@ impl Canvas<'_> {
       // Mode S: spans feed the same gradient_row math through a
       // synthesized uniform cov row.
       drop(src_entry);
-      self.cells.reset();
-      self.cells.fill_contours(contours);
+      let cells = self.cells.as_mut().expect("fresh gradient requires cell rasterizer");
+      cells.reset();
+      cells.fill_contours_translated(contours, translation.x, translation.y);
       let capture = cache.capture_enabled();
       let mut spans: Vec<u64> = core::mem::take(&mut self.span_buf);
       spans.clear();
       let mut px_total = 0usize;
       let mut overflow = false;
-      self.cells.sweep_spans(rule, antialias, |y, x0, len, cov| {
+      cells.sweep_spans(rule, antialias, |y, x0, len, cov| {
         let lo = y.saturating_mul(w).saturating_add(x0);
         let Some(dst_row) = pixels.get_mut(lo..lo.saturating_add(len)) else {
           return;
@@ -394,11 +410,12 @@ impl Canvas<'_> {
       cache.insert(key, entry);
       return;
     }
-    self.raster.reset();
-    self.raster.fill_contours(contours);
+    let raster = self.raster.as_mut().expect("fresh gradient requires dense rasterizer");
+    raster.reset();
+    raster.fill_contours_translated(contours, translation.x, translation.y);
     let capture = cache.capture_enabled();
     let mut entry = if capture && w.saturating_mul(self.h) <= 160 * 160 {
-      let (row_cap, data_cap) = self.raster.capture_capacities();
+      let (row_cap, data_cap) = raster.capture_capacities();
       CovEntry {
         rows: Vec::with_capacity(row_cap),
         data: PlaneData::Cov(Vec::with_capacity(data_cap)),
@@ -412,7 +429,7 @@ impl Canvas<'_> {
     // 320px frames. The src plane is captured on the first COV hit
     // instead, i.e. only for geometry proven to repeat.
     drop(src_entry);
-    self.raster.sweep(rule, antialias, |y, x0, cov_row| {
+    raster.sweep(rule, antialias, |y, x0, cov_row| {
       let lo = y.saturating_mul(w).saturating_add(x0);
       let hi = lo.saturating_add(cov_row.len());
       let Some(dst_row) = pixels.get_mut(lo..hi) else {

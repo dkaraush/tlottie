@@ -36,6 +36,58 @@ pub(crate) fn argb_to_rgba_slice_scalar(src: &[u32], dst: &mut [u8]) {
   }
 }
 
+/// Expands Alpha8 pixels into straight-alpha RGBA8 using one constant RGB
+/// color encoded as `0x00RRGGBB`.
+pub(crate) fn alpha8_to_rgba_slice(src: &[u8], dst: &mut [u8], color: u32) {
+  #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+  alpha8_to_rgba_slice_wasm(src, dst, color);
+  #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+  alpha8_to_rgba_slice_scalar(src, dst, color);
+}
+
+pub(crate) fn alpha8_to_rgba_slice_scalar(src: &[u8], dst: &mut [u8], color: u32) {
+  let red = (color >> 16) as u8;
+  let green = (color >> 8) as u8;
+  let blue = color as u8;
+  for (&alpha, rgba) in src.iter().zip(dst.chunks_exact_mut(4)) {
+    rgba.copy_from_slice(&[red, green, blue, alpha]);
+  }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn alpha8_to_rgba_slice_wasm(src: &[u8], dst: &mut [u8], color: u32) {
+  use core::arch::wasm32::{u8x16, u8x16_swizzle, v128, v128_load, v128_or, v128_store};
+
+  let red = (color >> 16) as u8;
+  let green = (color >> 8) as u8;
+  let blue = color as u8;
+  let rgb = u8x16(red, green, blue, 0, red, green, blue, 0, red, green, blue, 0, red, green, blue, 0);
+  // WebAssembly swizzle indices outside 0..16 produce zero. Each mask
+  // places four source alpha bytes into the A positions of four RGBA pixels.
+  let alpha0 = u8x16(16, 16, 16, 0, 16, 16, 16, 1, 16, 16, 16, 2, 16, 16, 16, 3);
+  let alpha1 = u8x16(16, 16, 16, 4, 16, 16, 16, 5, 16, 16, 16, 6, 16, 16, 16, 7);
+  let alpha2 = u8x16(16, 16, 16, 8, 16, 16, 16, 9, 16, 16, 16, 10, 16, 16, 16, 11);
+  let alpha3 = u8x16(16, 16, 16, 12, 16, 16, 16, 13, 16, 16, 16, 14, 16, 16, 16, 15);
+  let pixels = src.len().min(dst.len() / 4);
+  let full = pixels - pixels % 16;
+
+  if let (Some(src16), Some(dst64)) = (src.get(..full), dst.get_mut(..full * 4)) {
+    for (input, output) in src16.chunks_exact(16).zip(dst64.chunks_exact_mut(64)) {
+      // SAFETY: the exact chunks provide 16 readable input bytes and four
+      // disjoint 16-byte output ranges. wasm v128 permits unaligned access.
+      let alpha = unsafe { v128_load(input.as_ptr().cast::<v128>()) };
+      for (offset, mask) in [(0, alpha0), (16, alpha1), (32, alpha2), (48, alpha3)] {
+        let rgba = v128_or(rgb, u8x16_swizzle(alpha, mask));
+        unsafe { v128_store(output.as_mut_ptr().add(offset).cast::<v128>(), rgba) };
+      }
+    }
+  }
+
+  if let (Some(src_tail), Some(dst_tail)) = (src.get(full..pixels), dst.get_mut(full * 4..pixels * 4)) {
+    alpha8_to_rgba_slice_scalar(src_tail, dst_tail, color);
+  }
+}
+
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 fn argb_to_rgba_slice_wasm(src: &[u32], dst: &mut [u8]) {
   use core::arch::wasm32::{u8x16, u8x16_swizzle, v128, v128_and, v128_load, v128_store};
@@ -74,23 +126,5 @@ fn argb_to_rgba_slice_wasm(src: &[u32], dst: &mut [u8]) {
 }
 
 #[cfg(test)]
-mod tests {
-  use super::{argb_to_rgba, argb_to_rgba_slice, argb_to_rgba_slice_scalar};
-
-  #[test]
-  fn converts_transparent_opaque_and_partial_pixels() {
-    assert_eq!(argb_to_rgba(0), [0, 0, 0, 0]);
-    assert_eq!(argb_to_rgba(0xff12_3456), [0x12, 0x34, 0x56, 0xff]);
-    assert_eq!(argb_to_rgba(0x8040_2000), [128, 64, 0, 128]);
-  }
-
-  #[test]
-  fn slice_conversion_matches_scalar_pixels() {
-    let src = [0, 0x0012_3456, 0xff12_3456, 0x8040_2000, 0x7f01_0203, 0xffffffff, 0x0101_0000];
-    let mut expected = [0u8; 28];
-    let mut actual = [0u8; 28];
-    argb_to_rgba_slice_scalar(&src, &mut expected);
-    argb_to_rgba_slice(&src, &mut actual);
-    assert_eq!(actual, expected);
-  }
-}
+#[path = "tests/pixel.rs"]
+mod tests;

@@ -193,6 +193,10 @@ impl Rasterizer {
   }
 
   pub fn fill_contours(&mut self, contours: &[Contour]) {
+    self.fill_contours_translated(contours, 0.0, 0.0);
+  }
+
+  pub fn fill_contours_translated(&mut self, contours: &[Contour], tx: f32, ty: f32) {
     for contour in contours {
       let pts = &contour.points;
       if pts.len() < 3 {
@@ -200,11 +204,11 @@ impl Rasterizer {
       }
       for pair in pts.windows(2) {
         if let [cur, next] = pair {
-          self.draw_line(cur.x, cur.y, next.x, next.y);
+          self.draw_line(cur.x + tx, cur.y + ty, next.x + tx, next.y + ty);
         }
       }
       if let (Some(last), Some(first)) = (pts.last(), pts.first()) {
-        self.draw_line(last.x, last.y, first.x, first.y);
+        self.draw_line(last.x + tx, last.y + ty, first.x + tx, first.y + ty);
       }
     }
   }

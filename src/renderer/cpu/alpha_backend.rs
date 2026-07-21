@@ -14,6 +14,7 @@ pub(super) struct Alpha8Renderer<'a> {
   surfaces: Vec<Vec<u8>>,
   mask: Option<Vec<u8>>,
   gradient_row: Vec<u32>,
+  gradient_alpha: Vec<u8>,
 }
 
 impl<'a> Alpha8Renderer<'a> {
@@ -28,6 +29,7 @@ impl<'a> Alpha8Renderer<'a> {
       surfaces: Vec::new(),
       mask: None,
       gradient_row: Vec::new(),
+      gradient_alpha: Vec::new(),
     }
   }
 
@@ -39,6 +41,7 @@ impl<'a> Alpha8Renderer<'a> {
     let width = self.width;
     let antialias = self.antialias;
     let key = geometry.cache_key;
+    let translation = geometry.raw_translation();
     let uniform_gradient_alpha = match paint {
       Paint::Gradient(gradient) => {
         let alpha = (gradient.lut.first().copied().unwrap_or(0) >> 24) as u8;
@@ -48,7 +51,7 @@ impl<'a> Alpha8Renderer<'a> {
     };
 
     if let Some(entry) = self.state.cov_cache.get(key) {
-      let gradient_row = &mut self.gradient_row;
+      let (gradient_row, gradient_alpha) = (&mut self.gradient_row, &mut self.gradient_alpha);
       let target = match self.surfaces.last_mut() {
         Some(surface) => surface.as_mut_slice(),
         None => &mut *self.pixels,
@@ -60,7 +63,7 @@ impl<'a> Alpha8Renderer<'a> {
             let (y, x0, len) = (y as usize, x0 as usize, len as usize);
             let start = y.saturating_mul(width).saturating_add(x0);
             if let (Some(row), Some(coverage)) = (target.get_mut(start..start.saturating_add(len)), data.get(offset..offset.saturating_add(len))) {
-              blend_paint(row, coverage, y, x0, paint, uniform_gradient_alpha, gradient_row);
+              blend_paint(row, coverage, y, x0, paint, uniform_gradient_alpha, gradient_row, gradient_alpha);
             }
             offset = offset.saturating_add(len);
           }
@@ -71,7 +74,7 @@ impl<'a> Alpha8Renderer<'a> {
             let (y, x0, len, coverage) = unpack_span(span);
             let start = y.saturating_mul(width).saturating_add(x0);
             if let Some(row) = target.get_mut(start..start.saturating_add(len)) {
-              blend_uniform_paint(row, coverage, y, x0, paint, uniform_gradient_alpha, gradient_row);
+              blend_uniform_paint(row, coverage, y, x0, paint, uniform_gradient_alpha, gradient_row, gradient_alpha);
             }
           }
           return;
@@ -82,11 +85,11 @@ impl<'a> Alpha8Renderer<'a> {
 
     if mode_s_wins(geometry.raw_contours(), width.saturating_mul(self.height)) {
       let mut cells = self.state.take_cells(width, self.height);
-      cells.fill_contours(geometry.raw_contours());
+      cells.fill_contours_translated(geometry.raw_contours(), translation.x, translation.y);
       let capture = self.state.cov_cache.capture_enabled();
       let mut spans = Vec::new();
       let mut capture_overflow = false;
-      let gradient_row = &mut self.gradient_row;
+      let (gradient_row, gradient_alpha) = (&mut self.gradient_row, &mut self.gradient_alpha);
       let target = match self.surfaces.last_mut() {
         Some(surface) => surface.as_mut_slice(),
         None => &mut *self.pixels,
@@ -100,7 +103,7 @@ impl<'a> Alpha8Renderer<'a> {
         |y, x0, len, coverage| {
           let start = y.saturating_mul(width).saturating_add(x0);
           if let Some(row) = target.get_mut(start..start.saturating_add(len)) {
-            blend_uniform_paint(row, coverage, y, x0, paint, uniform_gradient_alpha, gradient_row);
+            blend_uniform_paint(row, coverage, y, x0, paint, uniform_gradient_alpha, gradient_row, gradient_alpha);
           }
           if capture {
             if spans.len() < SPAN_CAPTURE_MAX {
@@ -125,10 +128,10 @@ impl<'a> Alpha8Renderer<'a> {
     }
 
     let mut raster = self.state.take_raster(width, self.height);
-    raster.fill_contours(geometry.raw_contours());
+    raster.fill_contours_translated(geometry.raw_contours(), translation.x, translation.y);
     let capture = self.state.cov_cache.capture_enabled();
     let mut entry = CovEntry::default();
-    let gradient_row = &mut self.gradient_row;
+    let (gradient_row, gradient_alpha) = (&mut self.gradient_row, &mut self.gradient_alpha);
     let target = match self.surfaces.last_mut() {
       Some(surface) => surface.as_mut_slice(),
       None => &mut *self.pixels,
@@ -144,7 +147,7 @@ impl<'a> Alpha8Renderer<'a> {
         let Some(row) = target.get_mut(start..start.saturating_add(coverage.len())) else {
           return;
         };
-        blend_paint(row, coverage, y, x0, paint, uniform_gradient_alpha, gradient_row);
+        blend_paint(row, coverage, y, x0, paint, uniform_gradient_alpha, gradient_row, gradient_alpha);
         if capture {
           entry.rows.push((y as u32, x0 as u32, coverage.len() as u32));
           if let PlaneData::Cov(data) = &mut entry.data {
@@ -179,27 +182,12 @@ impl<'a> Alpha8Renderer<'a> {
     });
     self.state.put_raster(raster);
     if let Some(mask) = self.mask.as_mut() {
-      for (current, &sample) in mask.iter_mut().zip(&coverage) {
-        let mut contribution = u32::from(sample);
-        if inverted {
-          contribution = 255 - contribution;
-        }
-        contribution = (contribution * u32::from(opacity) + 127) / 255;
-        let old = u32::from(*current);
-        *current = match mode {
-          b's' => ((old * (255 - contribution) + 127) / 255) as u8,
-          b'i' => ((old * contribution + 127) / 255) as u8,
-          b'f' => old.abs_diff(contribution) as u8,
-          _ => (contribution + ((255 - contribution) * old + 127) / 255) as u8,
-        };
-      }
+      crate::simd::alpha_mask_combine(mask, &coverage, mode, inverted, opacity);
     }
     self.state.put_u8(coverage);
     if last {
       if let Some(mask) = self.mask.take() {
-        for (pixel, &factor) in self.active().iter_mut().zip(&mask) {
-          *pixel = ((u32::from(*pixel) * u32::from(factor) + 127) / 255) as u8;
-        }
+        crate::simd::alpha_multiply(self.active(), &mask);
         self.state.put_u8(mask);
       }
     }
@@ -242,11 +230,7 @@ impl FrameRenderer for Alpha8Renderer<'_> {
           self.state.put_u8(target);
           return;
         };
-        for (dst, &src) in target.iter_mut().zip(&source) {
-          let scaled = (u32::from(src) * u32::from(source_opacity) + 127) / 255;
-          let factor = if kind == 1 { scaled } else { 255 - scaled };
-          *dst = ((u32::from(*dst) * factor + 127) / 255) as u8;
-        }
+        crate::simd::alpha_matte(&mut target, &source, source_opacity, kind != 1);
         composite_over(self.active(), &target, opacity);
         self.state.put_u8(target);
         self.state.put_u8(source);
@@ -267,13 +251,10 @@ fn fill_rule(rule: Rule) -> FillRule {
 }
 
 fn blend_solid(destination: &mut [u8], coverage: &[u8], alpha: u8) {
-  for (dst, &cov) in destination.iter_mut().zip(coverage) {
-    let source = (u32::from(alpha) * u32::from(cov) + 127) / 255;
-    over(dst, source);
-  }
+  crate::simd::alpha_blend_solid(destination, coverage, alpha);
 }
 
-fn blend_paint(destination: &mut [u8], coverage: &[u8], y: usize, x0: usize, paint: Paint<'_>, uniform_gradient_alpha: Option<u8>, gradient_row: &mut Vec<u32>) {
+fn blend_paint(destination: &mut [u8], coverage: &[u8], y: usize, x0: usize, paint: Paint<'_>, uniform_gradient_alpha: Option<u8>, gradient_row: &mut Vec<u32>, gradient_alpha: &mut Vec<u8>) {
   match paint {
     Paint::Solid(solid) => {
       let alpha = (solid.color.a * solid.opacity).clamp(0.0, 1.0);
@@ -282,12 +263,12 @@ fn blend_paint(destination: &mut [u8], coverage: &[u8], y: usize, x0: usize, pai
     Paint::Gradient(gradient) => match uniform_gradient_alpha {
       Some(255) => blend_coverage(destination, coverage),
       Some(alpha) => blend_solid(destination, coverage, alpha),
-      None => blend_gradient(destination, coverage, y, x0, gradient, gradient_row),
+      None => blend_gradient(destination, coverage, y, x0, gradient, gradient_row, gradient_alpha),
     },
   }
 }
 
-fn blend_uniform_paint(destination: &mut [u8], coverage: u8, y: usize, x0: usize, paint: Paint<'_>, uniform_gradient_alpha: Option<u8>, gradient_row: &mut Vec<u32>) {
+fn blend_uniform_paint(destination: &mut [u8], coverage: u8, y: usize, x0: usize, paint: Paint<'_>, uniform_gradient_alpha: Option<u8>, gradient_row: &mut Vec<u32>, gradient_alpha: &mut Vec<u8>) {
   match paint {
     Paint::Solid(solid) => {
       let alpha = (solid.color.a * solid.opacity).clamp(0.0, 1.0);
@@ -298,47 +279,34 @@ fn blend_uniform_paint(destination: &mut [u8], coverage: u8, y: usize, x0: usize
       Some(alpha) => blend_uniform(destination, coverage, alpha),
       None => {
         sample_gradient_row(gradient_row, destination.len(), y, x0, gradient);
-        for (dst, &sample) in destination.iter_mut().zip(gradient_row.iter()) {
-          let alpha = sample >> 24;
-          let source = (alpha * u32::from(coverage) + 127) / 255;
-          over(dst, source);
-        }
+        extract_gradient_alpha(gradient_alpha, gradient_row);
+        crate::simd::alpha_blend_solid(destination, gradient_alpha, coverage);
       }
     },
   }
 }
 
 fn blend_uniform(destination: &mut [u8], coverage: u8, alpha: u8) {
-  let source = (u32::from(alpha) * u32::from(coverage) + 127) / 255;
-  if source == 255 {
-    destination.fill(255);
-    return;
-  }
-  for dst in destination {
-    over(dst, source);
-  }
+  crate::simd::alpha_blend_uniform(destination, coverage, alpha);
 }
 
 fn blend_coverage(destination: &mut [u8], coverage: &[u8]) {
-  for (dst, &source) in destination.iter_mut().zip(coverage) {
-    over(dst, u32::from(source));
-  }
+  crate::simd::alpha_blend_solid(destination, coverage, 255);
 }
 
 fn composite_over(destination: &mut [u8], source: &[u8], opacity: u8) {
-  for (dst, &src) in destination.iter_mut().zip(source) {
-    let source = (u32::from(src) * u32::from(opacity) + 127) / 255;
-    over(dst, source);
-  }
+  crate::simd::alpha_composite_over(destination, source, opacity);
 }
 
-fn blend_gradient(destination: &mut [u8], coverage: &[u8], y: usize, x0: usize, paint: &GradientPaint, gradient_row: &mut Vec<u32>) {
+fn blend_gradient(destination: &mut [u8], coverage: &[u8], y: usize, x0: usize, paint: &GradientPaint, gradient_row: &mut Vec<u32>, gradient_alpha: &mut Vec<u8>) {
   sample_gradient_row(gradient_row, destination.len().min(coverage.len()), y, x0, paint);
-  for ((dst, &cov), &sample) in destination.iter_mut().zip(coverage).zip(gradient_row.iter()) {
-    let alpha = sample >> 24;
-    let source = (alpha * u32::from(cov) + 127) / 255;
-    over(dst, source);
-  }
+  extract_gradient_alpha(gradient_alpha, gradient_row);
+  crate::simd::alpha_blend_product(destination, coverage, gradient_alpha);
+}
+
+fn extract_gradient_alpha(out: &mut Vec<u8>, samples: &[u32]) {
+  out.clear();
+  out.extend(samples.iter().map(|sample| (sample >> 24) as u8));
 }
 
 fn sample_gradient_row(out: &mut Vec<u32>, len: usize, y: usize, x0: usize, paint: &GradientPaint) {
@@ -365,10 +333,4 @@ fn sample_gradient_row(out: &mut Vec<u32>, len: usize, y: usize, x0: usize, pain
       }
     }
   }
-}
-
-#[inline]
-fn over(destination: &mut u8, source: u32) {
-  let out = source + ((u32::from(*destination) * (256 - source)) >> 8);
-  *destination = out.min(255) as u8;
 }

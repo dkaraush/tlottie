@@ -69,11 +69,24 @@ pub struct GradientPaint {
 pub struct Geometry<'a> {
   contours: &'a [Contour],
   pub(crate) cache_key: u128,
+  translation: Point,
 }
 
 impl<'a> Geometry<'a> {
   pub(super) fn new(contours: &'a [Contour], cache_key: u128) -> Self {
-    Self { contours, cache_key }
+    Self {
+      contours,
+      cache_key,
+      translation: Point::default(),
+    }
+  }
+
+  pub(super) fn translated(contours: &'a [Contour], cache_key: u128, x: f32, y: f32) -> Self {
+    Self {
+      contours,
+      cache_key,
+      translation: Point { x, y },
+    }
   }
 
   /// Number of contours participating in this draw.
@@ -88,11 +101,18 @@ impl<'a> Geometry<'a> {
 
   /// Iterates contours without copying their point storage.
   pub fn contours(self) -> impl ExactSizeIterator<Item = ContourRef<'a>> {
-    self.contours.iter().map(|contour| ContourRef { contour })
+    self.contours.iter().map(move |contour| ContourRef {
+      contour,
+      translation: self.translation,
+    })
   }
 
   pub(crate) fn raw_contours(self) -> &'a [Contour] {
     self.contours
+  }
+
+  pub(crate) fn raw_translation(self) -> Point {
+    self.translation
   }
 }
 
@@ -100,12 +120,16 @@ impl<'a> Geometry<'a> {
 #[derive(Clone, Copy)]
 pub struct ContourRef<'a> {
   contour: &'a Contour,
+  translation: Point,
 }
 
 impl<'a> ContourRef<'a> {
   /// Iterates device-space points without copying them.
   pub fn points(self) -> impl ExactSizeIterator<Item = Point> + 'a {
-    self.contour.points.iter().map(|point| Point { x: point.x, y: point.y })
+    self.contour.points.iter().map(move |point| Point {
+      x: point.x + self.translation.x,
+      y: point.y + self.translation.y,
+    })
   }
 
   /// Expanded fills and strokes currently always produce closed contours.

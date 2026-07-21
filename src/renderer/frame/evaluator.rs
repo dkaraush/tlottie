@@ -11,6 +11,10 @@ pub(crate) struct ShapeWalker<'a> {
   pub(crate) height: usize,
   pub(crate) antialias: bool,
   pub(crate) color_override: Option<Color>,
+  /// Retains complete canonical contours for translation-parametric replay.
+  /// Only used with an empty authored clip stack; the rasterizer still clips
+  /// translated edges to the target bounds while depositing coverage.
+  pub(crate) unbounded: bool,
 }
 
 /// A paint recorded during the walk. `range` indexes the geometry arena;
@@ -759,6 +763,9 @@ impl ShapeWalker<'_> {
   /// heavy files 100% of clip calls were fully inside — this one bbox
   /// pass replaces `1 + |clip|` full S-H passes and their allocations.
   fn clip_is_noop(&self, c: &Contour) -> bool {
+    if self.unbounded {
+      return true;
+    }
     let wf = self.width as f32;
     let hf = self.height as f32;
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -890,6 +897,9 @@ impl ShapeWalker<'_> {
   /// extend up to `margin` beyond it (stroke pieces): tests the inflated
   /// bbox against the same non-strict viewport + quad conditions.
   fn contour_clip_is_noop_inflated(&self, c: &Contour, margin: f32) -> bool {
+    if self.unbounded {
+      return true;
+    }
     if !margin.is_finite() {
       return false;
     }
@@ -930,7 +940,7 @@ impl ShapeWalker<'_> {
   /// through unchanged when nothing clips — the borrowing variant clones
   /// every piece, which the profiler showed as pure allocator churn.
   fn clip_all_owned(&self, c: Contour) -> Contour {
-    if self.clip_is_noop(&c) {
+    if self.unbounded || self.clip_is_noop(&c) {
       return c;
     }
     let wf = self.width as f32;
