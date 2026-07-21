@@ -2,7 +2,7 @@
 
 #![allow(unsafe_code)]
 
-use crate::{CPURenderer, Composition, FitzModifier, LayerColorReplacement, Limits, ParseOptions, RenderOptions};
+use crate::{CPURenderer, Composition, FitzModifier, LayerColorReplacement, Limits, ParseOptions, RenderOptions, SourceColorReplacement};
 
 /// One constructor-time layer-prefix color override.
 #[repr(C)]
@@ -13,6 +13,15 @@ pub struct TLottieLayerColorReplacement {
   pub layer_name_prefix_len: usize,
   /// Straight-alpha color in `0xAARRGGBB` form.
   pub color: u32,
+}
+
+/// One constructor-time exact source-color replacement.
+#[repr(C)]
+pub struct TLottieColorReplacement {
+  /// Source color in Android `0xAARRGGBB` form. The alpha byte is ignored.
+  pub source_color: u32,
+  /// Target color in Android `0xAARRGGBB` form. The animation's original alpha is preserved.
+  pub target_color: u32,
 }
 
 /// Opaque renderer handle owned by C callers.
@@ -26,7 +35,7 @@ pub struct TLottieInstance {
 /// `json_ptr..json_ptr+json_len` must be readable for the duration of the call.
 #[no_mangle]
 pub unsafe extern "C" fn tlottie_new(json_ptr: *const u8, json_len: usize) -> *mut TLottieInstance {
-  unsafe { tlottie_new_with_options(json_ptr, json_len, 0, core::ptr::null(), 0) }
+  unsafe { tlottie_new_with_options(json_ptr, json_len, 0, core::ptr::null(), 0, core::ptr::null(), 0) }
 }
 
 /// Parses Lottie JSON with a Fitz modifier and layer-prefix color overrides.
@@ -43,6 +52,8 @@ pub unsafe extern "C" fn tlottie_new_with_options(
   fitz_modifier: u32,
   replacements_ptr: *const TLottieLayerColorReplacement,
   replacements_len: usize,
+  color_replacements_ptr: *const TLottieColorReplacement,
+  color_replacements_len: usize,
 ) -> *mut TLottieInstance {
   if json_ptr.is_null() {
     return core::ptr::null_mut();
@@ -51,6 +62,9 @@ pub unsafe extern "C" fn tlottie_new_with_options(
     return core::ptr::null_mut();
   };
   if replacements_len != 0 && replacements_ptr.is_null() {
+    return core::ptr::null_mut();
+  }
+  if color_replacements_len != 0 && color_replacements_ptr.is_null() {
     return core::ptr::null_mut();
   }
   let json = unsafe { core::slice::from_raw_parts(json_ptr, json_len) };
@@ -77,9 +91,22 @@ pub unsafe extern "C" fn tlottie_new_with_options(
       color: replacement.color,
     });
   }
+  let raw_color_replacements = if color_replacements_len == 0 {
+    &[]
+  } else {
+    unsafe { core::slice::from_raw_parts(color_replacements_ptr, color_replacements_len) }
+  };
+  let source_color_replacements = raw_color_replacements
+    .iter()
+    .map(|replacement| SourceColorReplacement {
+      source_color: replacement.source_color,
+      target_color: replacement.target_color,
+    })
+    .collect();
   let options = ParseOptions {
     fitz_modifier,
     layer_color_replacements,
+    source_color_replacements,
   };
   match Composition::parse_with_options(json, &Limits::default(), &options) {
     Ok(comp) => Box::into_raw(Box::new(TLottieInstance { renderer: CPURenderer::new(comp) })),

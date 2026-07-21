@@ -26,6 +26,13 @@ typedef struct TLottieLayerColorReplacement {
   uint32_t color;
 } TLottieLayerColorReplacement;
 
+typedef struct TLottieColorReplacement {
+  /* Android 0xAARRGGBB values are accepted. Alpha bytes are ignored and the
+     animation's original alpha is preserved. */
+  uint32_t source_color;
+  uint32_t target_color;
+} TLottieColorReplacement;
+
 enum TlottieStatus {
   TLOTTIE_OK = 0,
   TLOTTIE_ERROR_INVALID_ARGUMENT = -1,
@@ -46,7 +53,9 @@ TLottieInstance *tlottie_new_with_options(
     size_t json_len,
     uint32_t fitz_modifier,
     const TLottieLayerColorReplacement *replacements,
-    size_t replacements_len);
+    size_t replacements_len,
+    const TLottieColorReplacement *color_replacements,
+    size_t color_replacements_len);
 
 /* NULL is accepted. Other pointers must have come from tlottie_new. */
 void tlottie_drop(TLottieInstance *renderer);

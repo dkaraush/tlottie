@@ -53,6 +53,16 @@ pub struct LayerColorReplacement {
   pub color: u32,
 }
 
+/// A parse-time replacement for a color used by fills, strokes, gradients,
+/// and solid layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceColorReplacement {
+  /// Source color in Android `0xAARRGGBB` form. The alpha byte is ignored.
+  pub source_color: u32,
+  /// Target color in Android `0xAARRGGBB` form. The animation's original alpha is preserved.
+  pub target_color: u32,
+}
+
 /// Options applied while a [`crate::Composition`] is parsed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParseOptions {
@@ -60,4 +70,6 @@ pub struct ParseOptions {
   pub fitz_modifier: FitzModifier,
   /// Layer-name-prefix color overrides, resolved once during parsing.
   pub layer_color_replacements: Vec<LayerColorReplacement>,
+  /// Exact source-color replacements, resolved once during parsing.
+  pub source_color_replacements: Vec<SourceColorReplacement>,
 }

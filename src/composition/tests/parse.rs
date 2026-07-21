@@ -115,6 +115,49 @@ fn applies_fitz_table_once_during_parse() {
 }
 
 #[test]
+fn replaces_exact_source_colors_once_during_parse() {
+  let json = r#"{"fr":30,"ip":0,"op":30,"w":16,"h":16,
+    "layers":[
+      {"ty":4,"nm":"Paints","ind":1,"ip":0,"op":30,"ks":{},"shapes":[
+        {"ty":"fl","c":{"a":0,"k":[0.2,0.4,0.6,0.5]},"o":{"a":0,"k":100}},
+        {"ty":"st","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"w":{"a":0,"k":1}},
+        {"ty":"gf","s":{"a":0,"k":[0,0]},"e":{"a":0,"k":[16,0]},
+         "g":{"p":2,"k":{"a":0,"k":[0,0.2,0.4,0.6,1,1,0,0]}},"o":{"a":0,"k":100},"r":1}
+      ]}
+    ]}"#;
+  let options = ParseOptions {
+    source_color_replacements: vec![SourceColorReplacement {
+      source_color: 0x7f33_6699,
+      target_color: 0x80aa_bbcc,
+    }],
+    ..ParseOptions::default()
+  };
+  let comp = parse_composition(json.as_bytes(), &Limits::default(), &options).unwrap();
+  let Shape::Fill(fill) = &comp.layers[0].shapes[0] else {
+    panic!("expected fill");
+  };
+  assert_eq!(
+    fill.color.eval(0.0),
+    Color {
+      r: 0xaa as f32 / 255.0,
+      g: 0xbb as f32 / 255.0,
+      b: 0xcc as f32 / 255.0,
+      a: 1.0
+    }
+  );
+  let Shape::Stroke(stroke) = &comp.layers[0].shapes[1] else {
+    panic!("expected stroke");
+  };
+  assert_eq!(stroke.color.eval(0.0), Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 });
+  let Shape::GradientFill(gradient) = &comp.layers[0].shapes[2] else {
+    panic!("expected gradient");
+  };
+  let stops = gradient.stops.eval(0.0);
+  assert_eq!(&stops.0[1..4], &[0xaa as f32 / 255.0, 0xbb as f32 / 255.0, 0xcc as f32 / 255.0]);
+  assert_eq!(&stops.0[5..8], &[1.0, 0.0, 0.0]);
+}
+
+#[test]
 fn layer_prefix_color_is_full_argb_and_wins_over_fitz() {
   let json = r#"{"fr":30,"ip":0,"op":30,"w":16,"h":16,
     "fitz":[{"o":16711680,"f3":255}],
@@ -132,6 +175,7 @@ fn layer_prefix_color_is_full_argb_and_wins_over_fitz() {
       layer_name_prefix: "Accent".into(),
       color: 0x8040_80c0,
     }],
+    ..ParseOptions::default()
   };
   let comp = parse_composition(json.as_bytes(), &Limits::default(), &options).unwrap();
   assert_eq!(

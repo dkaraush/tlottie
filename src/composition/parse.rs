@@ -8,7 +8,7 @@
 //! Unsupported shape/layer types are skipped silently for now; the
 //! supported-feature report lands with a later phase.
 
-use crate::composition::options::{LayerColorReplacement, ParseOptions};
+use crate::composition::options::{LayerColorReplacement, ParseOptions, SourceColorReplacement};
 use crate::error::{Error, JsonErrorKind, Limit, Result};
 use crate::json::Cursor;
 use crate::limits::Limits;
@@ -1232,6 +1232,59 @@ fn fitz_color(encoded: u32) -> Color {
   }
 }
 
+fn replace_source_color(color: &mut Color, replacements: &[SourceColorReplacement]) {
+  let key = fitz_key(*color);
+  if let Some(replacement) = replacements.iter().find(|replacement| replacement.source_color & 0x00ff_ffff == key) {
+    let alpha = color.a;
+    *color = fitz_color(replacement.target_color & 0x00ff_ffff);
+    color.a = alpha;
+  }
+}
+
+fn replace_gradient_colors(stops: &mut FloatList, color_count: usize, replacements: &[SourceColorReplacement]) {
+  for stop in stops.0.chunks_exact_mut(4).take(color_count) {
+    let mut color = Color {
+      r: stop[1],
+      g: stop[2],
+      b: stop[3],
+      a: 1.0,
+    };
+    replace_source_color(&mut color, replacements);
+    stop[1] = color.r;
+    stop[2] = color.g;
+    stop[3] = color.b;
+  }
+}
+
+fn apply_source_colors_shapes(shapes: &mut [Shape], replacements: &[SourceColorReplacement]) {
+  for shape in shapes {
+    match shape {
+      Shape::Group(group) => apply_source_colors_shapes(&mut group.shapes, replacements),
+      Shape::Fill(fill) => fill.color.map_values(|color| replace_source_color(color, replacements)),
+      Shape::Stroke(stroke) => stroke.color.map_values(|color| replace_source_color(color, replacements)),
+      Shape::GradientFill(fill) => fill.stops.map_values(|stops| replace_gradient_colors(stops, fill.color_count, replacements)),
+      Shape::GradientStroke(stroke) => stroke.stops.map_values(|stops| replace_gradient_colors(stops, stroke.color_count, replacements)),
+      _ => {}
+    }
+  }
+}
+
+fn apply_source_colors_layers(layers: &mut [Layer], replacements: &[SourceColorReplacement]) {
+  for layer in layers {
+    apply_source_colors_shapes(&mut layer.shapes, replacements);
+    if let Some((_, _, color)) = &mut layer.solid {
+      replace_source_color(color, replacements);
+    }
+  }
+}
+
+fn apply_source_colors(layers: &mut [Layer], assets: &mut [Asset], replacements: &[SourceColorReplacement]) {
+  apply_source_colors_layers(layers, replacements);
+  for asset in assets {
+    apply_source_colors_layers(&mut asset.layers, replacements);
+  }
+}
+
 fn replace_fitz_color(color: &mut Color, entries: &[FitzEntry], index: usize) {
   let key = fitz_key(*color);
   if let Some(replacement) = entries
@@ -1503,6 +1556,7 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
   if let Some(index) = options.fitz_modifier.replacement_index() {
     apply_fitz(&mut layers, &mut assets, &fitz_entries, index);
   }
+  apply_source_colors(&mut layers, &mut assets, &options.source_color_replacements);
   apply_layer_replacements(&mut layers, &options.layer_color_replacements);
   for asset in &mut assets {
     apply_layer_replacements(&mut asset.layers, &options.layer_color_replacements);

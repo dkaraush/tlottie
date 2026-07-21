@@ -117,6 +117,7 @@ pub unsafe extern "C" fn tlottie_new_with_options(
   let options = ParseOptions {
     fitz_modifier,
     layer_color_replacements,
+    ..ParseOptions::default()
   };
   match Composition::parse_with_options(json, &Limits::default(), &options) {
     Ok(comp) => Box::into_raw(Box::new(Instance {

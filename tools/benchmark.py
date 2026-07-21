@@ -170,7 +170,7 @@ def ensure_builds(skip: bool, required: set[str]) -> None:
     if "rlottie" in external:
         run(
             setup_cmd(PROJECTS / "rlottie", rlottie_cpp_args)
-            + ["-Dexample=false", "-Dtest=false"],
+            + ["-Db_ndebug=true", "-Dexample=false", "-Dtest=false"],
             PROJECT_DIRS["rlottie"],
             meson_env,
         )
@@ -183,6 +183,7 @@ def ensure_builds(skip: bool, required: set[str]) -> None:
         run(
             setup_cmd(project, rlottie_cpp_args)
             + [
+                "-Db_ndebug=true",
                 "-Dexample=false",
                 "-Dtest=false",
                 "-Dmodule=false",
