@@ -4,7 +4,7 @@ Library for drawing [lottie animations](https://en.wikipedia.org/wiki/Lottie_(fi
 
 - Micro-optimized and [benchmarked](#benchmarks) across 17k+ animations from Telegram, against [rlottie](https://github.com/Samsung/rlottie) and [thorvg](https://github.com/thorvg/thorvg).
 - SIMD on ARM NEON, and WASM: [web demo](https://dkaraush.github.io/tlottie/examples/web/).
-- Support of `fitz` modifier and color replacements by layer name prefixes.
+- Support of `fitz` modifier and color replacements.
 - Support of rendering into only alpha channel bitmap.
 - Safe. Lottie JSON is treated as untrusted input.
 - Zero dependencies[^1].
@@ -30,7 +30,8 @@ Example on how to work with `tlottie.wasm` is at [examples/web/](https://github.
 
 Frame time, mainly compared to [rlottie2019](https://github.com/TelegramMessenger/rlottie).
 
-- [android arm, Samsung Fold7](https://dkaraush.github.io/tlottie/benchmarks/android-fold.html): **-40.6%** at 64px, **-45.8%** at 320px, **-47.6%** at 720px
+- [android arm, Samsung Fold7](https://dkaraush.github.io/tlottie/benchmarks/android-fold.html): **-64.7%** at 64px, **-55.8%** at 320px, **-52.0%** at 720px
+- [android arm, Samsung F15](https://dkaraush.github.io/tlottie/benchmarks/android-f15.html): **-62.7%** at 64px, **-42.0%** at 320px, **-23.0%** at 720px
 - [macOS arm](https://dkaraush.github.io/tlottie/benchmarks/macos.html): **-61.5%** at 64px, **-43.5%** at 320px, **-32%** at 720px
 - [linux x86](https://dkaraush.github.io/tlottie/benchmarks/linux.html)[^2]: **-93.2%** at 64px, **-82.3%** at 320px, **-68.8%** at 720px
 
