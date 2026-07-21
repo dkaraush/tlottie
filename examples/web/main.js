@@ -69,6 +69,9 @@ const engines = [
       tl.tlottie_render_with_options(i, f, w, h, aa ? 1 : 0, tolerance),
     renderAlpha8: (i, f, w, h, aa, tolerance) =>
       tl.tlottie_render_alpha8_with_options(i, f, w, h, aa ? 1 : 0, tolerance),
+    renderAlpha8Color: (i, f, w, h, aa, color, tolerance) =>
+      tl.tlottie_render_alpha8_color_with_options(
+        i, f, w, h, aa ? 1 : 0, color, tolerance),
   },
   {
     ...engineDom('rl'),
@@ -311,7 +314,9 @@ function loadLottie(bytes, name) {
         const d0 = performance.now();
         const alpha8 = e.key === 'tl' && alphaOnly.checked;
         const px = alpha8
-          ? e.renderAlpha8(e.inst, frame, e.w, e.h, antialias.checked, +curveTolerance.value)
+          ? e.renderAlpha8Color(
+              e.inst, frame, e.w, e.h, antialias.checked, 0xffffff,
+              +curveTolerance.value)
           : e.render(e.inst, frame, e.w, e.h, antialias.checked, +curveTolerance.value);
         if (!px) { e.dead = true; e.statsEl.textContent = 'render failed'; continue; }
         if (e.direct) {
@@ -329,24 +334,7 @@ function loadLottie(bytes, name) {
           });
           continue;
         }
-        let rgba;
-        if (alpha8) {
-          const alpha = new Uint8Array(e.heap().buffer, px, e.w * e.h);
-          if (!e.alphaRgba || e.alphaRgba.length !== e.w * e.h * 4) {
-            e.alphaRgba = new Uint8ClampedArray(e.w * e.h * 4);
-            for (let i = 0; i < e.alphaRgba.length; i += 4) {
-              e.alphaRgba[i] = 255;
-              e.alphaRgba[i + 1] = 255;
-              e.alphaRgba[i + 2] = 255;
-            }
-          }
-          for (let i = 0, j = 3; i < alpha.length; i++, j += 4) {
-            e.alphaRgba[j] = alpha[i];
-          }
-          rgba = e.alphaRgba;
-        } else {
-          rgba = new Uint8ClampedArray(e.heap().buffer, px, e.w * e.h * 4);
-        }
+        const rgba = new Uint8ClampedArray(e.heap().buffer, px, e.w * e.h * 4);
         e.ctx.putImageData(new ImageData(rgba, e.w, e.h), 0, 0);
         e.drawMs.push(performance.now() - d0);
         if (e.drawMs.length > WINDOW) e.drawMs.shift();

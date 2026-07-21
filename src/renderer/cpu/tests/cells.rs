@@ -83,6 +83,20 @@ fn interior_emitted_as_long_spans() {
   assert!(spans_row_32.len() <= 4, "fragmented row: {spans_row_32:?}");
 }
 
+#[test]
+fn span_rows_reports_empty_canvas_rows() {
+  let sq = contour(&[(1.0, 1.0), (3.0, 1.0), (3.0, 2.0), (1.0, 2.0)]);
+  let mut raster = CellRaster::new(4, 4);
+  raster.fill_contours(&[sq]);
+  let mut ended = Vec::new();
+  raster.sweep_span_rows(FillRule::NonZero, true, |y, span| {
+    if span.is_none() {
+      ended.push(y);
+    }
+  });
+  assert_eq!(ended, [0, 1, 2, 3]);
+}
+
 /// Differential vs mode D: random polygons, per-pixel coverage delta
 /// bounded by the 24.8 snap + rounding (≤2 of 255).
 #[test]

@@ -208,10 +208,10 @@ impl RenderScratch {
   /// zeroed. The only caller ([`RenderCtx::build_mask`]) reads just a bounded
   /// sub-rectangle (the offscreen dirty box) and seeds exactly that region
   /// itself via [`fill_rows_u8`], so skipping the O(n) fill is the whole
-  /// point — in steady state the pooled buffer is already `n` long and no
-  /// fill happens at all.
-  #[cfg(test)]
-  fn take_u8_uninit(&mut self, n: usize) -> Vec<u8> {
+  /// point. Single-mask rendering likewise seeds only the active layer's
+  /// tracked row spans before reading them. In steady state the pooled
+  /// buffer is already `n` long and no fill happens at all.
+  pub(crate) fn take_u8_uninit(&mut self, n: usize) -> Vec<u8> {
     let mut b = self.bufs_u8.pop().unwrap_or_default();
     if b.len() != n {
       b.clear();
@@ -317,8 +317,8 @@ pub(crate) fn render_pooled(composition: &Composition, scratch: &mut RenderScrat
     curve_tolerance: options.curve_tolerance,
   };
   let res = ctx.render_layers(scratch, &mut canvas, &composition.layers, base, frame, 1.0, &Vec::new(), 0);
-  scratch.put_raster(canvas.raster);
-  scratch.put_cells(canvas.cells);
+  scratch.put_raster(canvas.raster.take().expect("direct canvas has rasterizer"));
+  scratch.put_cells(canvas.cells.take().expect("direct canvas has cell rasterizer"));
   res
 }
 
@@ -411,8 +411,8 @@ impl RenderCtx<'_> {
         let mut off = Canvas::with_raster(&mut buf_a, w, h, raster, cells, self.antialias);
         let res = self.draw_layer_content(scratch, &mut off, layer, m, frame, 1.0, clip, precomp_depth);
         da = off.dirty;
-        scratch.put_raster(off.raster);
-        scratch.put_cells(off.cells);
+        scratch.put_raster(off.raster.take().expect("offscreen has rasterizer"));
+        scratch.put_cells(off.cells.take().expect("offscreen has cell rasterizer"));
         res?;
       }
       // Every following pass is a per-pixel function that maps 0 → 0
@@ -448,8 +448,8 @@ impl RenderCtx<'_> {
             // Source content bounds: buf_b is 0 outside `db`,
             // where the mask modulate below is a no-op.
             let db = off.dirty;
-            scratch.put_raster(off.raster);
-            scratch.put_cells(off.cells);
+            scratch.put_raster(off.raster.take().expect("matte has rasterizer"));
+            scratch.put_cells(off.cells.take().expect("matte has cell rasterizer"));
             res?;
             if !src.masks.is_empty() && !db.is_empty() {
               let maskbuf = self.build_mask(scratch, src, sm, frame, w, h, db);
@@ -513,6 +513,7 @@ impl RenderCtx<'_> {
           height: canvas.h,
           antialias: canvas.antialias,
           color_override: layer.color_override,
+          unbounded: false,
         };
         let lp = layer as *const Layer as usize;
         let is_static = *walker.scratch.static_flags.entry(lp).or_insert_with(|| crate::model::shapes_static(&layer.shapes));
@@ -573,6 +574,7 @@ impl RenderCtx<'_> {
             height: canvas.h,
             antialias: canvas.antialias,
             color_override: layer.color_override,
+            unbounded: false,
           };
           let key = walker.fill_key(core::slice::from_ref(&(contour.clone(), true)), FillRule::NonZero);
           let contours: Vec<Contour> = if walker.scratch.cov_cache.contains(key) { Vec::new() } else { vec![walker.clip_all(&contour)] };

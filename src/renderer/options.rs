@@ -12,7 +12,6 @@ pub struct RenderOptions {
   /// The default is `0.125`, prioritizing visible geometric accuracy.
   /// Smaller values improve accuracy at a performance cost.
   pub curve_tolerance: f32,
-
   /// Renders only the animation's alpha mask.
   ///
   /// Output RGB channels are zero. Paint colors are skipped where possible,

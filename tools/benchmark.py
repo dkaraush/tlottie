@@ -20,6 +20,7 @@ by default so iterative performance runs do not require the entire corpus.
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures
 from contextlib import contextmanager, ExitStack
 import ctypes as C
@@ -92,7 +93,13 @@ ANDROID_DEFAULT_OUT = ROOT / "target" / "benchmark-android"
 ANDROID_DEFAULT_DEVICE_ROOT = "/data/local/tmp/tgs_dump"
 ANDROID_REMOTE = "/data/local/tmp/tlottie-android-benchmark"
 ANDROID_DEFAULT_SAMPLE = 1000
-ANDROID_DEFAULT_RENDERERS = ("tlottie", "rlottie", "rlottie_2019_patched", "thorvg")
+ANDROID_DEFAULT_RENDERERS = (
+    "tlottie",
+    "rlottie",
+    "rlottie_2019",
+    "rlottie_2019_patched",
+    "thorvg",
+)
 ANDROID_RENDERERS = {
     "tlottie": f"{ANDROID_REMOTE}/tlottie-benchmark-runner",
     "rlottie": "/data/local/tmp/rlottie_dump_ref",
@@ -2357,7 +2364,8 @@ class ProgressDisplay:
     def finish(self) -> None:
         if not self.interactive:
             return
-        self.update(self.total, "complete", force=True)
+        status = "complete" if self.completed >= self.total else "incomplete"
+        self.update(self.completed, status, force=True)
         print(flush=True)
 
 
@@ -2721,8 +2729,9 @@ def pivot_aggregate(rows: list[dict[str, Any]], key_cols: tuple[str, ...]) -> li
 
 def write_tgv(path: Path, rows: list[dict[str, Any]], renderers: tuple[str, ...], key_cols: tuple[str, ...]) -> None:
     cols = list(key_cols)
-    comparison_col = "tl vs rl19"
-    include_comparison = has_tl_rl19_comparison(renderers)
+    comparison_renderer = tl_vs_rl19_renderer(renderers)
+    comparison_col = tl_vs_rl19_label(comparison_renderer)
+    include_comparison = comparison_renderer is not None
     if include_comparison:
         cols.insert(cols.index("pack") + 1, comparison_col)
     for r in renderers:
@@ -2740,35 +2749,45 @@ def write_tgv(path: Path, rows: list[dict[str, Any]], renderers: tuple[str, ...]
         for row in rows:
             values = {
                 **row,
-                comparison_col: format_tl_vs_rl19_percent(row) if include_comparison else None,
+                comparison_col: (
+                    format_tl_vs_rl19_percent(row, comparison_renderer)
+                    if comparison_renderer is not None
+                    else None
+                ),
             }
             f.write("\t".join(format_cell(values.get(c)) for c in cols) + "\n")
 
 
-def has_tl_rl19_comparison(renderers: tuple[str, ...]) -> bool:
-    return "tlottie" in renderers and any(
-        renderer in renderers for renderer in ("rlottie_2019", "rlottie_2019_patched")
-    )
+def tl_vs_rl19_renderer(renderers: tuple[str, ...]) -> str | None:
+    if "tlottie" not in renderers:
+        return None
+    if "rlottie_2019" in renderers:
+        return "rlottie_2019"
+    if "rlottie_2019_patched" in renderers:
+        return "rlottie_2019_patched"
+    return None
 
 
-def tl_vs_rl19_percent(row: dict[str, Any]) -> float | None:
+def tl_vs_rl19_label(renderer: str | None) -> str:
+    return "tl vs rl19 patched" if renderer == "rlottie_2019_patched" else "tl vs rl19"
+
+
+def tl_vs_rl19_percent(row: dict[str, Any], renderer: str) -> float | None:
     tlottie_ms = row.get("tlottie_frame_ms")
-    rlottie_2019_ms = row.get("rlottie_2019_frame_ms")
-    if rlottie_2019_ms is None:
-        rlottie_2019_ms = row.get("rlottie_2019_patched_frame_ms")
+    rlottie_2019_ms = row.get(f"{renderer}_frame_ms")
     if tlottie_ms is None or rlottie_2019_ms is None or rlottie_2019_ms <= 0:
         return None
     percent = (tlottie_ms / rlottie_2019_ms - 1.0) * 100.0
     return percent if math.isfinite(percent) else None
 
 
-def format_tl_vs_rl19_percent(row: dict[str, Any]) -> str:
-    percent = tl_vs_rl19_percent(row)
+def format_tl_vs_rl19_percent(row: dict[str, Any], renderer: str) -> str:
+    percent = tl_vs_rl19_percent(row, renderer)
     return "n/a" if percent is None else f"{percent:+.1f}%"
 
 
-def tl_vs_rl19_cell(row: dict[str, Any]) -> str:
-    percent = tl_vs_rl19_percent(row)
+def tl_vs_rl19_cell(row: dict[str, Any], renderer: str) -> str:
+    percent = tl_vs_rl19_percent(row, renderer)
     if percent is None:
         return "<td class='comparison muted'>n/a</td>"
     direction = "faster" if percent < 0 else "slower" if percent > 0 else "equal"
@@ -2973,12 +2992,15 @@ def write_grouped_table(
     include_size: bool,
     accuracy_by_pack: dict[str, dict[str, Any]] | None = None,
 ) -> None:
-    include_comparison = has_tl_rl19_comparison(renderers)
+    comparison_renderer = tl_vs_rl19_renderer(renderers)
+    include_comparison = comparison_renderer is not None
     f.write("<div class='tablewrap'><table><tr>")
     for label in labels:
         f.write(f"<th rowspan='2' class='left'>{esc(label)}</th>")
         if label == "pack" and include_comparison:
-            f.write("<th rowspan='2'>tl vs rl19</th>")
+            f.write(
+                f"<th rowspan='2'>{esc(tl_vs_rl19_label(comparison_renderer))}</th>"
+            )
     if include_size:
         f.write("<th rowspan='2'>size</th>")
     for r in renderers:
@@ -3014,7 +3036,8 @@ def write_grouped_table(
             else:
                 f.write(f"<td class='left'>{esc(value)}</td>")
             if label == "pack" and include_comparison:
-                f.write(tl_vs_rl19_cell(row))
+                assert comparison_renderer is not None
+                f.write(tl_vs_rl19_cell(row, comparison_renderer))
         if include_size:
             f.write(f"<td>{row['size']}</td>")
         for r in renderers:
@@ -3419,6 +3442,14 @@ END { printf "FSUM %d %.0f %.0f\n", frames, steady, total }'''
         "export DUMP_NO_WRITE=1 BENCH_ONCE=1",
         f"export LD_LIBRARY_PATH={shlex.quote(ANDROID_REMOTE)}:${{LD_LIBRARY_PATH:-}}",
         f"mkdir -p {shlex.quote(ANDROID_REMOTE + '/out')}",
+        f"emit_lock={shlex.quote(ANDROID_REMOTE + '/emit.lock')}",
+        'rmdir "$emit_lock" 2>/dev/null || true',
+        "emit_result() {",
+        '  while ! mkdir "$emit_lock" 2>/dev/null; do sleep 0.01; done',
+        "  printf '%s\\n%s\\n%s\\n' \"$1\" \"$2\" '### END'",
+        '  rmdir "$emit_lock"',
+        "}",
+        "lane_pids=",
     ]
     if any(renderer != "tlottie" for renderer in renderers):
         for index, file in enumerate(files):
@@ -3457,11 +3488,17 @@ END { printf "FSUM %d %.0f %.0f\n", frames, steady, total }'''
                             f"{renderer_run} 2>&1 | awk {shlex.quote(summarizer)})"
                         )
                         lines.append(
-                            f"printf '%s\\n%s\\n%s\\n' {shlex.quote('### ' + marker)} "
-                            '"$result" \'### END\''
+                            f"emit_result {shlex.quote('### ' + marker)} \"$result\""
                         )
         lines.append(") &")
-    lines.append("wait")
+        lines.append('lane_pids="$lane_pids $!"')
+    lines.extend(
+        (
+            "lane_status=0",
+            'for lane_pid in $lane_pids; do wait "$lane_pid" || lane_status=$?; done',
+            'exit "$lane_status"',
+        )
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -3472,8 +3509,15 @@ def android_parse_log(text: str, root: Path) -> list[dict[str, object]]:
         text,
         re.MULTILINE | re.DOTALL,
     )
-    for marker, body in sections:
-        meta = json.loads(marker)
+    for section_index, (marker, body) in enumerate(sections, 1):
+        try:
+            meta = json.loads(marker)
+        except json.JSONDecodeError as error:
+            excerpt = marker[:240]
+            raise SystemExit(
+                f"malformed Android result marker in section {section_index}: "
+                f"{error}; marker={excerpt!r}"
+            ) from error
         timings = [int(value) for value in ANDROID_FRAME_RE.findall(body)]
         summary = ANDROID_FRAME_SUMMARY_RE.search(body)
         fms = ANDROID_FMS_RE.search(body)
@@ -3554,7 +3598,50 @@ def android_run_streamed(
         raise SystemExit(
             f"Android benchmark shell exited with status {return_code}; inspect {log_path}"
         )
+    if completed != expected:
+        raise SystemExit(
+            f"Android benchmark produced {completed}/{expected} complete cases; "
+            f"inspect {log_path}"
+        )
     return "".join(chunks)
+
+
+def acquire_android_output_lock(out: Path, serial: str) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    lock_path = out / ".android-benchmark.lock"
+    payload = f"pid={os.getpid()} serial={serial}\n"
+    while True:
+        try:
+            descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            break
+        except FileExistsError:
+            try:
+                existing = lock_path.read_text(encoding="utf-8").strip()
+                match = re.search(r"(?:^|\s)pid=(\d+)(?:\s|$)", existing)
+                if match:
+                    os.kill(int(match.group(1)), 0)
+                    raise SystemExit(
+                        f"Android benchmark output is already in use: {out} ({existing})"
+                    )
+            except ProcessLookupError:
+                pass
+            except OSError:
+                raise SystemExit(
+                    f"Android benchmark output lock cannot be inspected: "
+                    f"{lock_path}"
+                )
+            lock_path.unlink(missing_ok=True)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as lock:
+        lock.write(payload)
+
+    def release() -> None:
+        try:
+            if lock_path.read_text(encoding="utf-8") == payload:
+                lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    atexit.register(release)
 
 
 def android_benchmark_invocation(args: argparse.Namespace) -> str:
@@ -3612,6 +3699,7 @@ def run_android_benchmark(args: argparse.Namespace) -> int:
     serial = android_connected_serial(args.android_serial)
     args.android_serial = serial
     args.out = args.out or ANDROID_DEFAULT_OUT
+    acquire_android_output_lock(args.out, serial)
     args.jobs = args.jobs or 2
     core_masks = android_core_masks(serial, args.jobs, args.core_mask)
     args.core_mask = ",".join(core_masks)
@@ -3691,7 +3779,6 @@ def run_android_benchmark(args: argparse.Namespace) -> int:
         android_adb(serial, "push", str(local_binary), ANDROID_RENDERERS[renderer])
         android_adb(serial, "shell", "chmod", "755", ANDROID_RENDERERS[renderer])
 
-    args.out.mkdir(parents=True, exist_ok=True)
     script = android_make_script(
         files,
         args.input,
@@ -3835,7 +3922,7 @@ def main(argv: list[str] | None = None) -> int:
         "--renderers",
         help=(
             "comma-separated renderers; defaults to the five host renderers, "
-            "or tlottie,rlottie,rlottie_2019_patched,thorvg on Android"
+            "or tlottie,rlottie,rlottie_2019,rlottie_2019_patched,thorvg on Android"
         ),
     )
     ap.add_argument("--skip-build", action="store_true")

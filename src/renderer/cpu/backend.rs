@@ -5,7 +5,7 @@
 use crate::model::FillRule;
 use crate::renderer::frame::{Composite, FrameRenderer, Geometry, GradientKind, GradientPaint, Paint, Rule};
 
-use super::executor::{apply_matte, modulate, Canvas, CovCache, DirtyBox, GradientMap, GradientMapKind, RowBounds};
+use super::executor::{apply_matte, mode_s_wins, modulate, Canvas, CovCache, DirtyBox, GradientMap, GradientMapKind, RowBounds};
 use super::CPURenderer;
 
 struct BitmapReset<'a>(&'a mut CPURenderer);
@@ -77,10 +77,11 @@ impl CPURenderer {
 
   fn draw(&mut self, geometry: Geometry<'_>, paint: Paint<'_>) {
     let destination_dirty = self.surface_dirty.last().is_some_and(|bounds| !bounds.is_empty()) || (self.surface_dirty.is_empty() && self.bitmap_dirty);
-    let raster = self.state.take_raster(self.width, self.height);
-    let cells = self.state.take_cells(self.width, self.height);
     let key = geometry.cache_key;
     let contours = geometry.raw_contours();
+    let translation = geometry.raw_translation();
+    let retained = paint_is_retained(&self.state.cov_cache, key, paint, self.alpha_only);
+    let work = (!retained).then(|| (self.state.take_raster(self.width, self.height), self.state.take_cells(self.width, self.height)));
     let scratch = &mut self.state;
     let pixels = match self.surfaces.last_mut() {
       Some(surface) => surface.as_mut_slice(),
@@ -94,7 +95,10 @@ impl CPURenderer {
     };
     let dirty_rows = self.surface_rows.last_mut().map(Vec::as_mut_slice);
     let track_rows = dirty_rows.is_some();
-    let mut canvas = Canvas::with_raster_and_rows(pixels, self.width, self.height, raster, cells, self.antialias, dirty_rows);
+    let mut canvas = match work {
+      Some((raster, cells)) => Canvas::with_raster_and_rows(pixels, self.width, self.height, raster, cells, self.antialias, dirty_rows),
+      None => Canvas::with_retained_rows(pixels, self.width, self.height, self.antialias, dirty_rows),
+    };
     if destination_dirty {
       // `Canvas` uses an empty dirty box to select a gradient copy fast
       // path. It is recreated for each streamed command, so carry the
@@ -102,20 +106,40 @@ impl CPURenderer {
       canvas.dirty.mark_row(0, 0, 1);
     }
     match (paint, track_rows) {
-      (Paint::Solid(solid), true) => canvas.fill::<true>(&mut scratch.cov_cache, key, contours, fill_rule(solid.rule), alpha_color(solid.color, self.alpha_only), solid.opacity),
-      (Paint::Solid(solid), false) => canvas.fill::<false>(&mut scratch.cov_cache, key, contours, fill_rule(solid.rule), alpha_color(solid.color, self.alpha_only), solid.opacity),
+      (Paint::Solid(solid), true) => canvas.fill_translated::<true>(
+        &mut scratch.cov_cache,
+        key,
+        contours,
+        translation,
+        fill_rule(solid.rule),
+        alpha_color(solid.color, self.alpha_only),
+        solid.opacity,
+      ),
+      (Paint::Solid(solid), false) => canvas.fill_translated::<false>(
+        &mut scratch.cov_cache,
+        key,
+        contours,
+        translation,
+        fill_rule(solid.rule),
+        alpha_color(solid.color, self.alpha_only),
+        solid.opacity,
+      ),
       (Paint::Gradient(gradient), true) => {
         let map = gradient_map(gradient);
-        fill_gradient::<true>(&mut canvas, &mut scratch.cov_cache, key, contours, gradient, &map, self.alpha_only);
+        fill_gradient::<true>(&mut canvas, &mut scratch.cov_cache, key, contours, translation, gradient, &map, self.alpha_only);
       }
       (Paint::Gradient(gradient), false) => {
         let map = gradient_map(gradient);
-        fill_gradient::<false>(&mut canvas, &mut scratch.cov_cache, key, contours, gradient, &map, self.alpha_only);
+        fill_gradient::<false>(&mut canvas, &mut scratch.cov_cache, key, contours, translation, gradient, &map, self.alpha_only);
       }
     }
     let draw_dirty = canvas.dirty;
-    scratch.put_raster(canvas.raster);
-    scratch.put_cells(canvas.cells);
+    if let Some(raster) = canvas.raster.take() {
+      scratch.put_raster(raster);
+    }
+    if let Some(cells) = canvas.cells.take() {
+      scratch.put_cells(cells);
+    }
     if let Some(dirty) = self.surface_dirty.last_mut() {
       dirty.union(draw_dirty);
     } else {
@@ -181,6 +205,68 @@ impl CPURenderer {
 
   fn apply_mask(&mut self, geometry: crate::renderer::frame::Geometry<'_>, mode: u8, inverted: bool, opacity: u8, first: bool, last: bool) {
     let len = self.width.saturating_mul(self.height);
+    // A single mask needs no accumulator: its final factor is just its
+    // coverage (add/intersect/difference) or inverse coverage (subtract),
+    // after inversion and opacity. Restrict modulation to the active
+    // layer's tracked row spans instead of scanning the full canvas. Small
+    // animated masks on a 720px surface otherwise spend most of the frame
+    // initializing, combining, and applying three full-size mask planes.
+    if first && last {
+      let mut active_rows = self.surface_rows.pop();
+      if let Some(rows) = active_rows.as_deref_mut() {
+        if mode_s_wins(geometry.raw_contours(), len) {
+          let mut cells = self.state.take_cells(self.width, self.height);
+          cells.reset();
+          cells.fill_contours(geometry.raw_contours());
+          let width = self.width;
+          let antialias = self.antialias;
+          modulate_single_mask_spans(self.active(), &mut cells, width, rows, mode, inverted, opacity, antialias);
+          self.state.put_cells(cells);
+          self.surface_rows.push(active_rows.expect("checked above"));
+          return;
+        }
+      }
+      let mut coverage = if let Some(rows) = active_rows.as_deref() {
+        let mut coverage = self.state.take_u8_uninit(len);
+        clear_mask_rows(&mut coverage, self.width, rows);
+        coverage
+      } else {
+        self.state.take_u8(len, 0)
+      };
+      let width = self.width;
+      if mode_s_wins(geometry.raw_contours(), len) {
+        let mut cells = self.state.take_cells(self.width, self.height);
+        cells.reset();
+        cells.fill_contours(geometry.raw_contours());
+        cells.sweep_spans(FillRule::NonZero, self.antialias, |y, x0, span_len, value| {
+          let lo = y.saturating_mul(width).saturating_add(x0);
+          if let Some(dst) = coverage.get_mut(lo..lo.saturating_add(span_len)) {
+            dst.fill(value);
+          }
+        });
+        self.state.put_cells(cells);
+      } else {
+        let mut raster = self.state.take_raster(self.width, self.height);
+        raster.reset();
+        raster.fill_contours(geometry.raw_contours());
+        raster.sweep(FillRule::NonZero, self.antialias, |y, x0, row| {
+          let lo = y.saturating_mul(width).saturating_add(x0);
+          if let Some(dst) = coverage.get_mut(lo..lo.saturating_add(row.len())) {
+            dst.copy_from_slice(row);
+          }
+        });
+        self.state.put_raster(raster);
+      }
+      if let Some(rows) = active_rows {
+        modulate_single_mask_rows(self.active(), &mut coverage, width, &rows, mode, inverted, opacity);
+        self.surface_rows.push(rows);
+      } else {
+        prepare_single_mask(&mut coverage, mode, inverted, opacity);
+        modulate(self.active(), &coverage);
+      }
+      self.state.put_u8(coverage);
+      return;
+    }
     if first || self.mask_accumulator.is_none() {
       let initial = if matches!(mode, b'a' | b'f') { 0 } else { 255 };
       if let Some(previous) = self.mask_accumulator.take() {
@@ -189,17 +275,30 @@ impl CPURenderer {
       self.mask_accumulator = Some(self.state.take_u8(len, initial));
     }
     let mut coverage = self.state.take_u8(len, 0);
-    let mut raster = self.state.take_raster(self.width, self.height);
-    raster.reset();
-    raster.fill_contours(geometry.raw_contours());
     let width = self.width;
-    raster.sweep(FillRule::NonZero, self.antialias, |y, x0, row| {
-      let lo = y.saturating_mul(width).saturating_add(x0);
-      if let Some(dst) = coverage.get_mut(lo..lo.saturating_add(row.len())) {
-        dst.copy_from_slice(row);
-      }
-    });
-    self.state.put_raster(raster);
+    if mode_s_wins(geometry.raw_contours(), len) {
+      let mut cells = self.state.take_cells(self.width, self.height);
+      cells.reset();
+      cells.fill_contours(geometry.raw_contours());
+      cells.sweep_spans(FillRule::NonZero, self.antialias, |y, x0, span_len, value| {
+        let lo = y.saturating_mul(width).saturating_add(x0);
+        if let Some(dst) = coverage.get_mut(lo..lo.saturating_add(span_len)) {
+          dst.fill(value);
+        }
+      });
+      self.state.put_cells(cells);
+    } else {
+      let mut raster = self.state.take_raster(self.width, self.height);
+      raster.reset();
+      raster.fill_contours(geometry.raw_contours());
+      raster.sweep(FillRule::NonZero, self.antialias, |y, x0, row| {
+        let lo = y.saturating_mul(width).saturating_add(x0);
+        if let Some(dst) = coverage.get_mut(lo..lo.saturating_add(row.len())) {
+          dst.copy_from_slice(row);
+        }
+      });
+      self.state.put_raster(raster);
+    }
     if let Some(accumulator) = self.mask_accumulator.as_mut() {
       for (current, &sample) in accumulator.iter_mut().zip(&coverage) {
         let mut contribution = u32::from(sample);
@@ -226,6 +325,144 @@ impl CPURenderer {
   }
 }
 
+fn clear_mask_rows(mask: &mut [u8], width: usize, rows: &[RowBounds]) {
+  if width == 0 {
+    return;
+  }
+  let height = mask.len() / width;
+  for (y, &bounds) in rows.iter().take(height).enumerate() {
+    if bounds.is_empty() {
+      continue;
+    }
+    let x0 = bounds.x0.min(width);
+    let x1 = bounds.x1.saturating_add(1).min(width);
+    if x0 < x1 {
+      if let Some(row) = mask.get_mut(y * width + x0..y * width + x1) {
+        row.fill(0);
+      }
+    }
+  }
+}
+
+fn prepare_single_mask(mask: &mut [u8], mode: u8, inverted: bool, opacity: u8) {
+  for sample in mask {
+    *sample = single_mask_factor(*sample, mode, inverted, opacity);
+  }
+}
+
+#[inline]
+fn single_mask_factor(sample: u8, mode: u8, inverted: bool, opacity: u8) -> u8 {
+  let contribution = if inverted { 255 - u32::from(sample) } else { u32::from(sample) };
+  let contribution = (contribution * u32::from(opacity) + 127) / 255;
+  if mode == b's' {
+    (255 - contribution) as u8
+  } else {
+    contribution as u8
+  }
+}
+
+fn modulate_single_mask_spans(pixels: &mut [u32], cells: &mut super::cells::CellRaster, width: usize, rows: &mut [RowBounds], mode: u8, inverted: bool, opacity: u8, antialias: bool) {
+  if width == 0 {
+    return;
+  }
+  let outside = single_mask_factor(0, mode, inverted, opacity);
+  let mut cursor_y = usize::MAX;
+  let mut cursor = 0usize;
+  let mut kept_x0 = usize::MAX;
+  let mut kept_x1 = 0usize;
+  cells.sweep_span_rows(FillRule::NonZero, antialias, |y, span| {
+    let Some(&bounds) = rows.get(y) else {
+      return;
+    };
+    if bounds.is_empty() {
+      return;
+    }
+    let row_x0 = bounds.x0.min(width);
+    let row_x1 = bounds.x1.saturating_add(1).min(width);
+    if row_x0 >= row_x1 {
+      return;
+    }
+    if cursor_y != y {
+      cursor_y = y;
+      cursor = row_x0;
+      kept_x0 = usize::MAX;
+      kept_x1 = 0;
+    }
+    if let Some((span_x0, span_len, coverage)) = span {
+      let span_x1 = span_x0.saturating_add(span_len).min(row_x1);
+      let span_x0 = span_x0.max(row_x0).min(span_x1);
+      if cursor < span_x0 {
+        modulate_uniform_range(pixels, width, y, cursor, span_x0, outside);
+      }
+      let paint_x0 = cursor.max(span_x0);
+      if paint_x0 < span_x1 {
+        let factor = single_mask_factor(coverage, mode, inverted, opacity);
+        modulate_uniform_range(pixels, width, y, paint_x0, span_x1, factor);
+        if factor != 0 {
+          kept_x0 = kept_x0.min(paint_x0);
+          kept_x1 = kept_x1.max(span_x1);
+        }
+        cursor = span_x1;
+      }
+    } else {
+      if cursor < row_x1 {
+        modulate_uniform_range(pixels, width, y, cursor, row_x1, outside);
+      }
+      if outside == 0 {
+        if let Some(bounds) = rows.get_mut(y) {
+          *bounds = if kept_x0 < kept_x1 { RowBounds { x0: kept_x0, x1: kept_x1 - 1 } } else { RowBounds::empty() };
+        }
+      }
+      cursor_y = usize::MAX;
+    }
+  });
+}
+
+#[inline]
+fn modulate_uniform_range(pixels: &mut [u32], width: usize, y: usize, x0: usize, x1: usize, factor: u8) {
+  if x0 >= x1 || factor == 255 {
+    return;
+  }
+  let lo = y.saturating_mul(width).saturating_add(x0);
+  let hi = y.saturating_mul(width).saturating_add(x1);
+  let Some(span) = pixels.get_mut(lo..hi) else {
+    return;
+  };
+  if factor == 0 {
+    span.fill(0);
+    return;
+  }
+  let mask = [factor];
+  for pixel in span {
+    modulate(core::slice::from_mut(pixel), &mask);
+  }
+}
+
+fn modulate_single_mask_rows(pixels: &mut [u32], mask: &mut [u8], width: usize, rows: &[RowBounds], mode: u8, inverted: bool, opacity: u8) {
+  if width == 0 {
+    return;
+  }
+  let height = pixels.len().min(mask.len()) / width;
+  for (y, &bounds) in rows.iter().take(height).enumerate() {
+    if bounds.is_empty() {
+      continue;
+    }
+    let x0 = bounds.x0.min(width);
+    let x1 = bounds.x1.saturating_add(1).min(width);
+    if x0 >= x1 {
+      continue;
+    }
+    let start = y * width + x0;
+    let end = y * width + x1;
+    if let Some(mask_row) = mask.get_mut(start..end) {
+      prepare_single_mask(mask_row, mode, inverted, opacity);
+    }
+    if let (Some(pixel_row), Some(mask_row)) = (pixels.get_mut(start..end), mask.get(start..end)) {
+      modulate(pixel_row, mask_row);
+    }
+  }
+}
+
 fn alpha_color(mut color: crate::math::Color, alpha_only: bool) -> crate::math::Color {
   if alpha_only {
     color.r = 0.0;
@@ -235,17 +472,36 @@ fn alpha_color(mut color: crate::math::Color, alpha_only: bool) -> crate::math::
   color
 }
 
+fn paint_is_retained(cache: &CovCache, key: u128, paint: Paint<'_>, alpha_only: bool) -> bool {
+  if cache.contains_coverage(key) {
+    return true;
+  }
+  let Paint::Gradient(gradient) = paint else {
+    return false;
+  };
+  if !alpha_only {
+    return cache.contains(gradient.source_key);
+  }
+  let first_alpha = gradient.lut.first().copied().unwrap_or(0) >> 24;
+  if gradient.lut.iter().all(|pixel| pixel >> 24 == first_alpha) {
+    false
+  } else {
+    cache.contains(gradient.source_key ^ (1u128 << 127))
+  }
+}
+
 fn fill_gradient<const TRACK_ROWS: bool>(
   canvas: &mut Canvas<'_>,
   cache: &mut CovCache,
   key: u128,
   contours: &[crate::geometry::Contour],
+  translation: crate::renderer::frame::Point,
   gradient: &GradientPaint,
   map: &GradientMap,
   alpha_only: bool,
 ) {
   if !alpha_only {
-    canvas.fill_gradient::<TRACK_ROWS>(cache, key, gradient.source_key, contours, fill_rule(gradient.rule), &gradient.lut, map);
+    canvas.fill_gradient_translated::<TRACK_ROWS>(cache, key, gradient.source_key, contours, translation, fill_rule(gradient.rule), &gradient.lut, map);
     return;
   }
 
@@ -257,7 +513,7 @@ fn fill_gradient<const TRACK_ROWS: bool>(
       b: 0.0,
       a: first_alpha as f32 / 255.0,
     };
-    canvas.fill::<TRACK_ROWS>(cache, key, contours, fill_rule(gradient.rule), color, 1.0);
+    canvas.fill_translated::<TRACK_ROWS>(cache, key, contours, translation, fill_rule(gradient.rule), color, 1.0);
     return;
   }
 
@@ -265,7 +521,7 @@ fn fill_gradient<const TRACK_ROWS: bool>(
   for (out, &pixel) in alpha_lut.iter_mut().zip(gradient.lut.iter()) {
     *out = pixel & 0xff00_0000;
   }
-  canvas.fill_gradient::<TRACK_ROWS>(cache, key, gradient.source_key ^ (1u128 << 127), contours, fill_rule(gradient.rule), &alpha_lut, map);
+  canvas.fill_gradient_translated::<TRACK_ROWS>(cache, key, gradient.source_key ^ (1u128 << 127), contours, translation, fill_rule(gradient.rule), &alpha_lut, map);
 }
 
 impl FrameRenderer for CPURenderer {

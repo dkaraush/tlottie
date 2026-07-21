@@ -81,10 +81,10 @@ pub(crate) struct Canvas<'a> {
   pub(crate) w: usize,
   pub(crate) h: usize,
   pub(crate) antialias: bool,
-  pub(crate) raster: Rasterizer,
+  pub(crate) raster: Option<Rasterizer>,
   /// Mode-S sparse cell engine, selected per paint when the contours'
   /// bbox extent exceeds [`MODE_S_MIN_EXTENT`].
-  pub(crate) cells: CellRaster,
+  pub(crate) cells: Option<CellRaster>,
   /// Union of all rows/columns written since creation (fills, gradient
   /// fills, and nested offscreen composites all mark it).
   pub(crate) dirty: DirtyBox,
@@ -119,8 +119,24 @@ impl<'a> Canvas<'a> {
       w,
       h,
       antialias,
-      raster,
-      cells,
+      raster: Some(raster),
+      cells: Some(cells),
+      dirty: DirtyBox::empty(),
+      dirty_rows,
+      row_cov: Vec::new(),
+      row_ones: Vec::new(),
+      span_buf: Vec::new(),
+    }
+  }
+
+  pub(crate) fn with_retained_rows(pixels: &'a mut [u32], w: usize, h: usize, antialias: bool, dirty_rows: Option<&'a mut [RowBounds]>) -> Self {
+    Canvas {
+      pixels,
+      w,
+      h,
+      antialias,
+      raster: None,
+      cells: None,
       dirty: DirtyBox::empty(),
       dirty_rows,
       row_cov: Vec::new(),
@@ -133,7 +149,21 @@ impl<'a> Canvas<'a> {
 impl Canvas<'_> {
   /// Rasterizes `contours` and blends `color` (straight alpha, 0..=1
   /// components) with `opacity`, premultiplied source-over.
+  #[cfg(test)]
   pub(crate) fn fill<const TRACK_ROWS: bool>(&mut self, cache: &mut CovCache, key: u128, contours: &[Contour], rule: crate::model::FillRule, color: Color, opacity: f32) {
+    self.fill_translated::<TRACK_ROWS>(cache, key, contours, crate::renderer::frame::Point::default(), rule, color, opacity);
+  }
+
+  pub(crate) fn fill_translated<const TRACK_ROWS: bool>(
+    &mut self,
+    cache: &mut CovCache,
+    key: u128,
+    contours: &[Contour],
+    translation: crate::renderer::frame::Point,
+    rule: crate::model::FillRule,
+    color: Color,
+    opacity: f32,
+  ) {
     let alpha = (color.a * opacity).clamp(0.0, 1.0);
     if alpha <= 0.0 {
       return;
@@ -211,8 +241,9 @@ impl Canvas<'_> {
     let dirty_rows = &mut self.dirty_rows;
     if mode_s_wins(contours, w * self.h) {
       // Mode S: sparse cells — no w×h plane, cost ∝ edge crossings.
-      self.cells.reset();
-      self.cells.fill_contours(contours);
+      let cells = self.cells.as_mut().expect("fresh fill requires cell rasterizer");
+      cells.reset();
+      cells.fill_contours_translated(contours, translation.x, translation.y);
       let capture = cache.capture_enabled();
       let mut spans: Vec<u64> = core::mem::take(&mut self.span_buf);
       spans.clear();
@@ -242,9 +273,9 @@ impl Canvas<'_> {
         }
       };
       if sa == 255 {
-        self.cells.sweep_spans(rule, antialias, |y, x0, len, cov| render_span(y, x0, len, cov, true));
+        cells.sweep_spans(rule, antialias, |y, x0, len, cov| render_span(y, x0, len, cov, true));
       } else {
-        self.cells.sweep_spans(rule, antialias, |y, x0, len, cov| render_span(y, x0, len, cov, false));
+        cells.sweep_spans(rule, antialias, |y, x0, len, cov| render_span(y, x0, len, cov, false));
       }
       // Chunky span lists cache as spans (denser, uniform replay);
       // fragmented ones as rows (fast row replay).
@@ -265,11 +296,12 @@ impl Canvas<'_> {
       cache.insert(key, entry);
       return;
     }
-    self.raster.reset();
-    self.raster.fill_contours(contours);
+    let raster = self.raster.as_mut().expect("fresh fill requires dense rasterizer");
+    raster.reset();
+    raster.fill_contours_translated(contours, translation.x, translation.y);
     let capture = cache.capture_enabled();
     let mut entry = if capture && w.saturating_mul(self.h) <= 160 * 160 {
-      let (row_cap, data_cap) = self.raster.capture_capacities();
+      let (row_cap, data_cap) = raster.capture_capacities();
       CovEntry {
         rows: Vec::with_capacity(row_cap),
         data: PlaneData::Cov(Vec::with_capacity(data_cap)),
@@ -277,7 +309,7 @@ impl Canvas<'_> {
     } else {
       CovEntry::default()
     };
-    self.raster.sweep(rule, antialias, |y, x0, cov_row| {
+    raster.sweep(rule, antialias, |y, x0, cov_row| {
       let lo = y.saturating_mul(w).saturating_add(x0);
       let hi = lo.saturating_add(cov_row.len());
       let Some(dst_row) = pixels.get_mut(lo..hi) else {

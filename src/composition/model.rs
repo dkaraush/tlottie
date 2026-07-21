@@ -158,7 +158,6 @@ pub(crate) struct Transform {
 
 impl Transform {
   /// True when every track (including opacity) is a constant.
-  #[cfg(test)]
   pub fn is_static(&self) -> bool {
     self.anchor.is_static() && self.position.is_static() && self.scale.is_static() && self.rotation.is_static() && self.opacity.is_static() && self.skew.is_static() && self.skew_axis.is_static()
   }
@@ -191,7 +190,6 @@ impl Position {
     }
   }
 
-  #[cfg(test)]
   pub fn is_static(&self) -> bool {
     match self {
       Position::Combined(p) => p.is_static(),
@@ -220,7 +218,6 @@ pub(crate) enum Shape {
 impl Shape {
   /// True when the shape (and, for groups, its whole subtree) evaluates
   /// identically at every frame — the static-subtree replay condition.
-  #[cfg(test)]
   pub fn is_static(&self) -> bool {
     match self {
       Shape::Group(g) => g.transform.is_static() && shapes_static(&g.shapes),
@@ -326,7 +323,6 @@ pub(crate) fn shapes_have_multiple_visible_paints(shapes: &[Shape], frame: f32) 
 }
 
 /// All shapes in a list static (see [`Shape::is_static`]).
-#[cfg(test)]
 pub(crate) fn shapes_static(shapes: &[Shape]) -> bool {
   shapes.iter().all(Shape::is_static)
 }

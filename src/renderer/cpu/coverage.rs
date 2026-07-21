@@ -184,6 +184,44 @@ pub(crate) struct CovEntry {
 /// geometries per loop and full keys would dwarf the coverage payload).
 /// Eviction: whole-cache clear on budget overflow — periodic animations
 /// refill within one loop, and the budget bounds per-instance memory.
+pub(super) type CoverageMap = std::collections::HashMap<u128, CovEntry, core::hash::BuildHasherDefault<CoverageKeyHasher>>;
+
+/// Coverage keys are already two independently mixed 64-bit content hashes.
+/// Running SipHash over them at every lookup is redundant and shows up on
+/// small Android frames, so fold and avalanche the existing key directly.
+#[derive(Default)]
+pub(super) struct CoverageKeyHasher(u64);
+
+impl core::hash::Hasher for CoverageKeyHasher {
+  #[inline]
+  fn finish(&self) -> u64 {
+    self.0
+  }
+
+  #[inline]
+  fn write(&mut self, bytes: &[u8]) {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in bytes {
+      hash = (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+    }
+    self.0 = avalanche(hash);
+  }
+
+  #[inline]
+  fn write_u128(&mut self, key: u128) {
+    self.0 = avalanche(key as u64 ^ (key >> 64) as u64);
+  }
+}
+
+#[inline]
+fn avalanche(mut value: u64) -> u64 {
+  value ^= value >> 33;
+  value = value.wrapping_mul(0xff51_afd7_ed55_8ccd);
+  value ^= value >> 33;
+  value = value.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+  value ^ (value >> 33)
+}
+
 #[derive(Default)]
 pub(crate) struct CovCache {
   /// Canvas-scaled budget (see COV_CACHE_BUDGET docs); 0 = default.
@@ -203,8 +241,8 @@ pub(crate) struct CovCache {
   /// second time the cache freezes (see below). Lookups hit either
   /// generation in place. A working set that fits half the budget never
   /// rotates at all; bigger sets freeze at ~budget resident.
-  pub(super) young: std::collections::HashMap<u128, CovEntry>,
-  pub(super) old: std::collections::HashMap<u128, CovEntry>,
+  pub(super) young: CoverageMap,
+  pub(super) old: CoverageMap,
   pub(super) young_bytes: usize,
   /// Freeze policy: drop-rotation is the wrong eviction for periodic
   /// content whose loop working set exceeds the budget — every entry is
@@ -413,7 +451,7 @@ impl CovCache {
         // during first playback. Large canvases keep gradual growth: their
         // fewer, bigger entries did not repay the eager table allocation.
         if !self.shrink_entries {
-          self.young = std::collections::HashMap::with_capacity(self.old.capacity());
+          self.young = CoverageMap::with_capacity_and_hasher(self.old.capacity(), core::hash::BuildHasherDefault::default());
         }
         self.young_bytes = 0;
       }

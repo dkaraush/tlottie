@@ -13,8 +13,8 @@
 
 use core::arch::wasm32::{
   f32x4, f32x4_abs, f32x4_add, f32x4_ge, f32x4_lt, f32x4_max, f32x4_min, f32x4_mul, f32x4_neg, f32x4_splat, f32x4_sqrt, f32x4_sub, u16x8, u16x8_add, u16x8_extend_high_u8x16, u16x8_extend_low_u8x16,
-  u16x8_min, u16x8_mul, u16x8_shr, u16x8_splat, u16x8_sub, u32x4_all_true, u32x4_eq, u32x4_extract_lane, u32x4_splat, u32x4_trunc_sat_f32x4, u8x16, u8x16_narrow_i16x8, u8x16_swizzle, v128, v128_and,
-  v128_bitselect, v128_load, v128_store,
+  u16x8_max, u16x8_min, u16x8_mul, u16x8_shr, u16x8_splat, u16x8_sub, u32x4_all_true, u32x4_eq, u32x4_extract_lane, u32x4_splat, u32x4_trunc_sat_f32x4, u8x16, u8x16_narrow_i16x8, u8x16_swizzle, v128,
+  v128_and, v128_bitselect, v128_load, v128_store,
 };
 
 /// Swizzle pattern replicating each of the low 4 bytes across one
@@ -36,6 +36,119 @@ fn div255_round(n: v128) -> v128 {
 #[inline]
 fn over(d: v128, s: v128, inv: v128) -> v128 {
   u16x8_min(u16x8_add(s, u16x8_shr(u16x8_mul(d, u16x8_add(inv, u16x8_splat(1))), 8)), u16x8_splat(255))
+}
+
+#[inline]
+fn alpha_over8(dst: v128, source: v128) -> v128 {
+  over(dst, source, u16x8_sub(u16x8_splat(255), source))
+}
+
+#[inline]
+fn alpha_load(bytes: &[u8]) -> v128 {
+  #[allow(unsafe_code)]
+  unsafe {
+    v128_load(bytes.as_ptr().cast::<v128>())
+  }
+}
+
+#[inline]
+fn alpha_store(bytes: &mut [u8], value: v128) {
+  #[allow(unsafe_code)]
+  unsafe {
+    v128_store(bytes.as_mut_ptr().cast::<v128>(), value)
+  }
+}
+
+pub(super) fn alpha_blend_solid_wasm(dst: &mut [u8], coverage: &[u8], alpha: u8) {
+  let alpha = u16x8_splat(u16::from(alpha));
+  for (dst, coverage) in dst.chunks_exact_mut(16).zip(coverage.chunks_exact(16)) {
+    let d = alpha_load(dst);
+    let c = alpha_load(coverage);
+    let sl = div255_round(u16x8_mul(u16x8_extend_low_u8x16(c), alpha));
+    let sh = div255_round(u16x8_mul(u16x8_extend_high_u8x16(c), alpha));
+    alpha_store(dst, u8x16_narrow_i16x8(alpha_over8(u16x8_extend_low_u8x16(d), sl), alpha_over8(u16x8_extend_high_u8x16(d), sh)));
+  }
+}
+
+pub(super) fn alpha_blend_product_wasm(dst: &mut [u8], lhs: &[u8], rhs: &[u8]) {
+  for ((dst, lhs), rhs) in dst.chunks_exact_mut(16).zip(lhs.chunks_exact(16)).zip(rhs.chunks_exact(16)) {
+    let d = alpha_load(dst);
+    let l = alpha_load(lhs);
+    let r = alpha_load(rhs);
+    let sl = div255_round(u16x8_mul(u16x8_extend_low_u8x16(l), u16x8_extend_low_u8x16(r)));
+    let sh = div255_round(u16x8_mul(u16x8_extend_high_u8x16(l), u16x8_extend_high_u8x16(r)));
+    alpha_store(dst, u8x16_narrow_i16x8(alpha_over8(u16x8_extend_low_u8x16(d), sl), alpha_over8(u16x8_extend_high_u8x16(d), sh)));
+  }
+}
+
+pub(super) fn alpha_blend_uniform_wasm(dst: &mut [u8], source: u8) {
+  let source = u16x8_splat(u16::from(source));
+  for dst in dst.chunks_exact_mut(16) {
+    let d = alpha_load(dst);
+    alpha_store(dst, u8x16_narrow_i16x8(alpha_over8(u16x8_extend_low_u8x16(d), source), alpha_over8(u16x8_extend_high_u8x16(d), source)));
+  }
+}
+
+pub(super) fn alpha_composite_over_wasm(dst: &mut [u8], src: &[u8], opacity: u8) {
+  let opacity = u16x8_splat(u16::from(opacity));
+  for (dst, src) in dst.chunks_exact_mut(16).zip(src.chunks_exact(16)) {
+    let d = alpha_load(dst);
+    let s = alpha_load(src);
+    let sl = div255_round(u16x8_mul(u16x8_extend_low_u8x16(s), opacity));
+    let sh = div255_round(u16x8_mul(u16x8_extend_high_u8x16(s), opacity));
+    alpha_store(dst, u8x16_narrow_i16x8(alpha_over8(u16x8_extend_low_u8x16(d), sl), alpha_over8(u16x8_extend_high_u8x16(d), sh)));
+  }
+}
+
+pub(super) fn alpha_multiply_wasm(dst: &mut [u8], factors: &[u8]) {
+  for (dst, factors) in dst.chunks_exact_mut(16).zip(factors.chunks_exact(16)) {
+    let d = alpha_load(dst);
+    let f = alpha_load(factors);
+    let lo = div255_round(u16x8_mul(u16x8_extend_low_u8x16(d), u16x8_extend_low_u8x16(f)));
+    let hi = div255_round(u16x8_mul(u16x8_extend_high_u8x16(d), u16x8_extend_high_u8x16(f)));
+    alpha_store(dst, u8x16_narrow_i16x8(lo, hi));
+  }
+}
+
+pub(super) fn alpha_matte_wasm(dst: &mut [u8], src: &[u8], opacity: u8, inverted: bool) {
+  let opacity = u16x8_splat(u16::from(opacity));
+  let full = u16x8_splat(255);
+  for (dst, src) in dst.chunks_exact_mut(16).zip(src.chunks_exact(16)) {
+    let d = alpha_load(dst);
+    let s = alpha_load(src);
+    let mut fl = div255_round(u16x8_mul(u16x8_extend_low_u8x16(s), opacity));
+    let mut fh = div255_round(u16x8_mul(u16x8_extend_high_u8x16(s), opacity));
+    if inverted {
+      fl = u16x8_sub(full, fl);
+      fh = u16x8_sub(full, fh);
+    }
+    let lo = div255_round(u16x8_mul(u16x8_extend_low_u8x16(d), fl));
+    let hi = div255_round(u16x8_mul(u16x8_extend_high_u8x16(d), fh));
+    alpha_store(dst, u8x16_narrow_i16x8(lo, hi));
+  }
+}
+
+pub(super) fn alpha_mask_combine_wasm(dst: &mut [u8], src: &[u8], mode: u8, inverted: bool, opacity: u8) {
+  let opacity = u16x8_splat(u16::from(opacity));
+  let full = u16x8_splat(255);
+  for (dst, src) in dst.chunks_exact_mut(16).zip(src.chunks_exact(16)) {
+    let d = alpha_load(dst);
+    let s = alpha_load(src);
+    let (dl, dh) = (u16x8_extend_low_u8x16(d), u16x8_extend_high_u8x16(d));
+    let (mut sl, mut sh) = (u16x8_extend_low_u8x16(s), u16x8_extend_high_u8x16(s));
+    if inverted {
+      sl = u16x8_sub(full, sl);
+      sh = u16x8_sub(full, sh);
+    }
+    let (cl, ch) = (div255_round(u16x8_mul(sl, opacity)), div255_round(u16x8_mul(sh, opacity)));
+    let combine = |old, contribution| match mode {
+      b's' => div255_round(u16x8_mul(old, u16x8_sub(full, contribution))),
+      b'i' => div255_round(u16x8_mul(old, contribution)),
+      b'f' => u16x8_sub(u16x8_max(old, contribution), u16x8_min(old, contribution)),
+      _ => u16x8_add(contribution, div255_round(u16x8_mul(u16x8_sub(full, contribution), old))),
+    };
+    alpha_store(dst, u8x16_narrow_i16x8(combine(dl, cl), combine(dh, ch)));
+  }
 }
 
 pub(super) fn fill_span_solid_wasm(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb: u32, sa: u32) {

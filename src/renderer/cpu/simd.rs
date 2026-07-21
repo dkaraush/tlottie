@@ -634,6 +634,252 @@ fn focal_lut_over_scalar(dst: &mut [u32], lut: &[u32], g0x: f32, g0y: f32, sa: f
   }
 }
 
+// Alpha8 span kernels. These intentionally use the same rounding protocol as
+// the scalar backend: source scaling is rounded /255, while source-over uses
+// dst * (256 - source) >> 8. Long spans process 16 pixels per iteration on
+// both NEON and wasm simd128; short spans retain the cheaper scalar loops.
+
+#[inline]
+fn alpha_over(dst: u8, source: u32) -> u8 {
+  (source + ((u32::from(dst) * (256 - source)) >> 8)).min(255) as u8
+}
+
+pub(crate) fn alpha_blend_solid(dst: &mut [u8], coverage: &[u8], alpha: u8) {
+  if alpha == 0 {
+    return;
+  }
+  let n = dst.len().min(coverage.len());
+  #[cfg(target_arch = "aarch64")]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    #[allow(unsafe_code)]
+    unsafe {
+      neon::alpha_blend_solid_neon(head, &coverage[..full], alpha)
+    };
+    alpha_blend_solid_scalar(tail, &coverage[full..n], alpha);
+    return;
+  }
+  #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    wasm128::alpha_blend_solid_wasm(head, &coverage[..full], alpha);
+    alpha_blend_solid_scalar(tail, &coverage[full..n], alpha);
+    return;
+  }
+  alpha_blend_solid_scalar(&mut dst[..n], &coverage[..n], alpha);
+}
+
+fn alpha_blend_solid_scalar(dst: &mut [u8], coverage: &[u8], alpha: u8) {
+  for (dst, &coverage) in dst.iter_mut().zip(coverage) {
+    let source = (u32::from(alpha) * u32::from(coverage) + 127) / 255;
+    *dst = alpha_over(*dst, source);
+  }
+}
+
+pub(crate) fn alpha_blend_product(dst: &mut [u8], lhs: &[u8], rhs: &[u8]) {
+  let n = dst.len().min(lhs.len()).min(rhs.len());
+  #[cfg(target_arch = "aarch64")]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    #[allow(unsafe_code)]
+    unsafe {
+      neon::alpha_blend_product_neon(head, &lhs[..full], &rhs[..full])
+    };
+    alpha_blend_product_scalar(tail, &lhs[full..n], &rhs[full..n]);
+    return;
+  }
+  #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    wasm128::alpha_blend_product_wasm(head, &lhs[..full], &rhs[..full]);
+    alpha_blend_product_scalar(tail, &lhs[full..n], &rhs[full..n]);
+    return;
+  }
+  alpha_blend_product_scalar(&mut dst[..n], &lhs[..n], &rhs[..n]);
+}
+
+fn alpha_blend_product_scalar(dst: &mut [u8], lhs: &[u8], rhs: &[u8]) {
+  for ((dst, &lhs), &rhs) in dst.iter_mut().zip(lhs).zip(rhs) {
+    let source = (u32::from(lhs) * u32::from(rhs) + 127) / 255;
+    *dst = alpha_over(*dst, source);
+  }
+}
+
+pub(crate) fn alpha_blend_uniform(dst: &mut [u8], coverage: u8, alpha: u8) {
+  let source = (u32::from(alpha) * u32::from(coverage) + 127) / 255;
+  if source == 0 {
+    return;
+  }
+  if source == 255 {
+    dst.fill(255);
+    return;
+  }
+  #[cfg(target_arch = "aarch64")]
+  if dst.len() >= SIMD_MIN_SPAN {
+    let full = dst.len() - dst.len() % 16;
+    let (head, tail) = dst.split_at_mut(full);
+    #[allow(unsafe_code)]
+    unsafe {
+      neon::alpha_blend_uniform_neon(head, source as u8)
+    };
+    alpha_blend_uniform_scalar(tail, source);
+    return;
+  }
+  #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+  if dst.len() >= SIMD_MIN_SPAN {
+    let full = dst.len() - dst.len() % 16;
+    let (head, tail) = dst.split_at_mut(full);
+    wasm128::alpha_blend_uniform_wasm(head, source as u8);
+    alpha_blend_uniform_scalar(tail, source);
+    return;
+  }
+  alpha_blend_uniform_scalar(dst, source);
+}
+
+fn alpha_blend_uniform_scalar(dst: &mut [u8], source: u32) {
+  for dst in dst {
+    *dst = alpha_over(*dst, source);
+  }
+}
+
+pub(crate) fn alpha_composite_over(dst: &mut [u8], src: &[u8], opacity: u8) {
+  if opacity == 0 {
+    return;
+  }
+  let n = dst.len().min(src.len());
+  #[cfg(target_arch = "aarch64")]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    #[allow(unsafe_code)]
+    unsafe {
+      neon::alpha_composite_over_neon(head, &src[..full], opacity)
+    };
+    alpha_composite_over_scalar(tail, &src[full..n], opacity);
+    return;
+  }
+  #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    wasm128::alpha_composite_over_wasm(head, &src[..full], opacity);
+    alpha_composite_over_scalar(tail, &src[full..n], opacity);
+    return;
+  }
+  alpha_composite_over_scalar(&mut dst[..n], &src[..n], opacity);
+}
+
+fn alpha_composite_over_scalar(dst: &mut [u8], src: &[u8], opacity: u8) {
+  for (dst, &src) in dst.iter_mut().zip(src) {
+    let source = (u32::from(src) * u32::from(opacity) + 127) / 255;
+    *dst = alpha_over(*dst, source);
+  }
+}
+
+pub(crate) fn alpha_multiply(dst: &mut [u8], factors: &[u8]) {
+  let n = dst.len().min(factors.len());
+  #[cfg(target_arch = "aarch64")]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    #[allow(unsafe_code)]
+    unsafe {
+      neon::alpha_multiply_neon(head, &factors[..full])
+    };
+    alpha_multiply_scalar(tail, &factors[full..n]);
+    return;
+  }
+  #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    wasm128::alpha_multiply_wasm(head, &factors[..full]);
+    alpha_multiply_scalar(tail, &factors[full..n]);
+    return;
+  }
+  alpha_multiply_scalar(&mut dst[..n], &factors[..n]);
+}
+
+fn alpha_multiply_scalar(dst: &mut [u8], factors: &[u8]) {
+  for (dst, &factor) in dst.iter_mut().zip(factors) {
+    *dst = ((u32::from(*dst) * u32::from(factor) + 127) / 255) as u8;
+  }
+}
+
+pub(crate) fn alpha_matte(dst: &mut [u8], src: &[u8], opacity: u8, inverted: bool) {
+  let n = dst.len().min(src.len());
+  #[cfg(target_arch = "aarch64")]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    #[allow(unsafe_code)]
+    unsafe {
+      neon::alpha_matte_neon(head, &src[..full], opacity, inverted)
+    };
+    alpha_matte_scalar(tail, &src[full..n], opacity, inverted);
+    return;
+  }
+  #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    wasm128::alpha_matte_wasm(head, &src[..full], opacity, inverted);
+    alpha_matte_scalar(tail, &src[full..n], opacity, inverted);
+    return;
+  }
+  alpha_matte_scalar(&mut dst[..n], &src[..n], opacity, inverted);
+}
+
+fn alpha_matte_scalar(dst: &mut [u8], src: &[u8], opacity: u8, inverted: bool) {
+  for (dst, &src) in dst.iter_mut().zip(src) {
+    let scaled = (u32::from(src) * u32::from(opacity) + 127) / 255;
+    let factor = if inverted { 255 - scaled } else { scaled };
+    *dst = ((u32::from(*dst) * factor + 127) / 255) as u8;
+  }
+}
+
+pub(crate) fn alpha_mask_combine(dst: &mut [u8], src: &[u8], mode: u8, inverted: bool, opacity: u8) {
+  let n = dst.len().min(src.len());
+  #[cfg(target_arch = "aarch64")]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    #[allow(unsafe_code)]
+    unsafe {
+      neon::alpha_mask_combine_neon(head, &src[..full], mode, inverted, opacity)
+    };
+    alpha_mask_combine_scalar(tail, &src[full..n], mode, inverted, opacity);
+    return;
+  }
+  #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    wasm128::alpha_mask_combine_wasm(head, &src[..full], mode, inverted, opacity);
+    alpha_mask_combine_scalar(tail, &src[full..n], mode, inverted, opacity);
+    return;
+  }
+  alpha_mask_combine_scalar(&mut dst[..n], &src[..n], mode, inverted, opacity);
+}
+
+fn alpha_mask_combine_scalar(dst: &mut [u8], src: &[u8], mode: u8, inverted: bool, opacity: u8) {
+  for (dst, &src) in dst.iter_mut().zip(src) {
+    let sample = if inverted { 255 - u32::from(src) } else { u32::from(src) };
+    let contribution = (sample * u32::from(opacity) + 127) / 255;
+    let old = u32::from(*dst);
+    *dst = match mode {
+      b's' => ((old * (255 - contribution) + 127) / 255) as u8,
+      b'i' => ((old * contribution + 127) / 255) as u8,
+      b'f' => old.abs_diff(contribution) as u8,
+      _ => (contribution + ((255 - contribution) * old + 127) / 255) as u8,
+    };
+  }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[path = "simd/neon.rs"]
 mod neon;
@@ -645,3 +891,7 @@ mod wasm128;
 #[cfg(test)]
 #[path = "tests/simd.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/alpha_simd.rs"]
+mod alpha_tests;
