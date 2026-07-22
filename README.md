@@ -32,7 +32,7 @@ Frame time, mainly compared to [rlottie2019](https://github.com/TelegramMessenge
 
 - [android arm, Samsung Fold7](https://dkaraush.github.io/tlottie/benchmarks/android-fold.html): **-64.7%** at 64px, **-55.8%** at 320px, **-52.0%** at 720px
 - [android arm, Samsung F15](https://dkaraush.github.io/tlottie/benchmarks/android-f15.html): **-62.7%** at 64px, **-42.0%** at 320px, **-23.0%** at 720px
-- [macOS arm](https://dkaraush.github.io/tlottie/benchmarks/macos.html): **-61.5%** at 64px, **-43.5%** at 320px, **-32%** at 720px
+- [macOS arm](https://dkaraush.github.io/tlottie/benchmarks/macos.html): **-61.5%** at 64px, **-47.6%** at 320px, **-27.3%** at 720px
 - [linux x86](https://dkaraush.github.io/tlottie/benchmarks/linux.html)[^2]: **-72.6%** at 64px, **-49.8%** at 320px, **-32.8%** at 720px
 
 [^1]: Listed dependencies are only for GPU renderers, that are currently work in progress, expected to be useful only on large canvas sizes.
