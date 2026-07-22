@@ -73,7 +73,6 @@ impl Composition {
 #[cfg(feature = "cpu")]
 pub use renderer::cpu::CPURenderer;
 
-/// Backward-compatible name for [`CPURenderer`].
-#[deprecated(note = "renamed to CPURenderer")]
-#[cfg(feature = "cpu")]
-pub type Animation = CPURenderer;
+#[cfg(test)]
+#[path = "tests/dos.rs"]
+mod dos;

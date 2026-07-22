@@ -1,6 +1,6 @@
 //! Parse-time animation customizations.
 
-/// Telegram's Fitzpatrick skin-tone modifier.
+/// Fitzpatrick skin-tone modifier.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(u32)]
 pub enum FitzModifier {
@@ -57,9 +57,9 @@ pub struct LayerColorReplacement {
 /// and solid layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceColorReplacement {
-  /// Source color in Android `0xAARRGGBB` form. The alpha byte is ignored.
+  /// Source color in `0xAARRGGBB` form. The alpha byte is ignored.
   pub source_color: u32,
-  /// Target color in Android `0xAARRGGBB` form. The animation's original alpha is preserved.
+  /// Target color in `0xAARRGGBB` form. The animation's original alpha is preserved.
   pub target_color: u32,
 }
 

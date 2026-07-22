@@ -1,4 +1,3 @@
-use super::*;
 use crate::composition::property::{Easing, Keyframe, Property, Timeline};
 
 fn animated(kfs: Vec<Keyframe<f32>>) -> Property<f32> {
