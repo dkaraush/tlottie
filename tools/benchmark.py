@@ -1740,6 +1740,12 @@ static uint32_t average_argb(uint32_t a, uint32_t b) {
         | ((channel(a, 0) + channel(b, 0)) / 2u);
 }
 
+static uint32_t rgba_word_to_argb(uint32_t pixel) {
+    return (pixel & 0xff00ff00u)
+        | ((pixel & 0x000000ffu) << 16)
+        | ((pixel & 0x00ff0000u) >> 16);
+}
+
 int benchmark_accuracy_diff(
     const void *candidate_buffer,
     const uint32_t *reference_a,
@@ -1752,7 +1758,7 @@ int benchmark_accuracy_diff(
 ) {
     if (!candidate_buffer || !reference_a || !reference_b || !bad_out || !consensus_out)
         return -1;
-    const uint32_t *candidate_argb = candidate_buffer;
+    const uint32_t *candidate_rgba = candidate_buffer;
     const uint8_t *candidate_alpha = candidate_buffer;
     size_t bad = 0, consensus = 0;
     for (size_t i = 0; i < len; ++i) {
@@ -1765,7 +1771,11 @@ int benchmark_accuracy_diff(
             bad += delta(candidate_alpha[i], (aa + ba) / 2u) > tolerance;
         } else if (close_argb(a, b, tolerance)) {
             ++consensus;
-            bad += !close_argb(candidate_argb[i], average_argb(a, b), tolerance);
+            bad += !close_argb(
+                rgba_word_to_argb(candidate_rgba[i]),
+                average_argb(a, b),
+                tolerance
+            );
         }
     }
     *bad_out = bad;
@@ -2149,7 +2159,7 @@ def diff_from_consensus(
         if not px_close(ap, bp, tolerance):
             continue
         consensus += 1
-        if not px_close_to_avg(cp, ap, bp, tolerance):
+        if not px_close_to_avg(rgba_word_to_argb(cp), ap, bp, tolerance):
             bad += 1
     return bad, consensus
 
@@ -2176,7 +2186,7 @@ def numpy_alpha(frame: Any, total: int, alpha8: bool) -> Any:
 
 
 def frame_pixels(frame: Any) -> Any:
-    """Expose a compact raw ARGB frame as uint32 pixels for the Python fallback."""
+    """Expose a compact raw pixel frame as uint32 words for Python code."""
     if isinstance(frame, (bytes, memoryview)):
         return memoryview(frame).cast("B").cast("I")
     return frame
@@ -2185,7 +2195,9 @@ def frame_pixels(frame: Any) -> Any:
 def diff_from_consensus_numpy(
     candidate: Any, a: Any, b: Any, tolerance: int
 ) -> tuple[int, int]:
-    candidate_channels = numpy_channels(candidate)
+    # tlottie exposes RGBA bytes; rlottie and ThorVG expose BGRA bytes
+    # (0xAARRGGBB words). Put the candidate in the reference byte order.
+    candidate_channels = numpy_channels(candidate)[:, [2, 1, 0, 3]]
     a_channels = numpy_channels(a)
     b_channels = numpy_channels(b)
     consensus_mask = numpy_close_mask(a_channels, b_channels, tolerance)
@@ -2249,6 +2261,12 @@ def avg_px(a: int, b: int) -> int:
 
 def channels(px: int) -> tuple[int, int, int, int]:
     return ((px >> 24) & 0xFF, (px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF)
+
+
+def rgba_word_to_argb(px: int) -> int:
+    """Convert tlottie's 0xAABBGGRR word to reference 0xAARRGGBB."""
+    px = int(px)
+    return (px & 0xFF00FF00) | ((px & 0xFF) << 16) | ((px >> 16) & 0xFF)
 
 
 def run_accuracy(
@@ -2544,29 +2562,69 @@ def make_diff_grid(
     width = 3 * size
     height = 2 * size
     out = bytearray(width * height * 3)
-    paste_image(out, width, tlottie, size, 0, 0)
+    paste_image(out, width, tlottie, size, 0, 0, rgba_words=True)
     paste_image(out, width, rlottie, size, size, 0)
     paste_image(out, width, thorvg, size, size * 2, 0)
-    paste_diff(out, width, tlottie, rlottie, size, 0, size, tolerance)
+    paste_diff(
+        out, width, tlottie, rlottie, size, 0, size, tolerance, a_rgba=True
+    )
     paste_diff(out, width, rlottie, thorvg, size, size, size, tolerance)
-    paste_diff(out, width, tlottie, thorvg, size, size * 2, size, tolerance)
+    paste_diff(
+        out, width, tlottie, thorvg, size, size * 2, size, tolerance, a_rgba=True
+    )
     return bytes(out)
 
 
-def make_vulkan_diff_grid(cpu: list[int], vulkan: list[int], size: int, tolerance: int) -> bytes:
+def make_vulkan_diff_grid(
+    cpu: list[int], vulkan: list[int], size: int, tolerance: int
+) -> bytes:
     width = 2 * size
     out = bytearray(width * 2 * size * 3)
-    paste_image(out, width, cpu, size, 0, 0)
-    paste_image(out, width, vulkan, size, size, 0)
-    paste_diff(out, width, cpu, vulkan, size, 0, size, tolerance)
-    paste_diff(out, width, cpu, vulkan, size, size, size, 0)
+    paste_image(out, width, cpu, size, 0, 0, rgba_words=True)
+    paste_image(out, width, vulkan, size, size, 0, rgba_words=True)
+    paste_diff(
+        out,
+        width,
+        cpu,
+        vulkan,
+        size,
+        0,
+        size,
+        tolerance,
+        a_rgba=True,
+        b_rgba=True,
+    )
+    paste_diff(
+        out,
+        width,
+        cpu,
+        vulkan,
+        size,
+        size,
+        size,
+        0,
+        a_rgba=True,
+        b_rgba=True,
+    )
     return bytes(out)
 
 
-def paste_image(dst: bytearray, dst_width: int, pixels: list[int], size: int, x0: int, y0: int) -> None:
+def paste_image(
+    dst: bytearray,
+    dst_width: int,
+    pixels: list[int],
+    size: int,
+    x0: int,
+    y0: int,
+    rgba_words: bool = False,
+) -> None:
+    pixels = frame_pixels(pixels)
     for y in range(size):
         for x in range(size):
-            r, g, b = rgb_from_argb(pixels[y * size + x])
+            pixel = pixels[y * size + x]
+            if rgba_words:
+                pixel = rgba_word_to_argb(pixel)
+            r, g, b = rgb_from_argb(pixel)
             write_rgb(dst, dst_width, x0 + x, y0 + y, r, g, b)
 
 
@@ -2579,11 +2637,19 @@ def paste_diff(
     x0: int,
     y0: int,
     tolerance: int,
+    a_rgba: bool = False,
+    b_rgba: bool = False,
 ) -> None:
+    a = frame_pixels(a)
+    b = frame_pixels(b)
     for y in range(size):
         for x in range(size):
             ap = a[y * size + x]
             bp = b[y * size + x]
+            if a_rgba:
+                ap = rgba_word_to_argb(ap)
+            if b_rgba:
+                bp = rgba_word_to_argb(bp)
             if px_close(ap, bp, tolerance):
                 write_rgb(dst, dst_width, x0 + x, y0 + y, 0, 0, 0)
             else:
