@@ -18,8 +18,10 @@ pub(super) struct Alpha8Renderer<'a> {
 }
 
 impl<'a> Alpha8Renderer<'a> {
-  pub(super) fn new(pixels: &'a mut [u8], width: usize, height: usize, antialias: bool, state: &'a mut RenderScratch) -> Self {
-    pixels.fill(0);
+  pub(super) fn new(pixels: &'a mut [u8], width: usize, height: usize, antialias: bool, clear: bool, state: &'a mut RenderScratch) -> Self {
+    if clear {
+      pixels.fill(0);
+    }
     Self {
       pixels,
       width,

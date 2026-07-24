@@ -543,6 +543,7 @@ class Tlottie:
             C.c_size_t,
             C.c_uint32,
             C.c_float,
+            C.c_uint32,
         ]
         self.lib.tlottie_render_with_options.restype = C.c_int
         self.lib.tlottie_render_alpha8_with_options.argtypes = [
@@ -554,6 +555,7 @@ class Tlottie:
             C.c_size_t,
             C.c_uint32,
             C.c_float,
+            C.c_uint32,
         ]
         self.lib.tlottie_render_alpha8_with_options.restype = C.c_int
 
@@ -586,6 +588,7 @@ class Tlottie:
                 out_len,
                 antialias,
                 self.curve_tolerance,
+                1,
             )
         )
 

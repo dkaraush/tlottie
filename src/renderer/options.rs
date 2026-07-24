@@ -1,6 +1,11 @@
 /// Per-frame rendering options.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderOptions {
+  /// Clears the destination before rendering. Defaults to `true`.
+  ///
+  /// Disable this to composite the animation over the existing
+  /// premultiplied destination pixels.
+  pub clear: bool,
   /// Enables analytic edge antialiasing. Defaults to `true`.
   ///
   /// When disabled, coverage is thresholded to fully transparent or fully
@@ -23,6 +28,7 @@ pub struct RenderOptions {
 impl Default for RenderOptions {
   fn default() -> Self {
     Self {
+      clear: true,
       antialias: true,
       curve_tolerance: 0.125,
       alpha_only: false,

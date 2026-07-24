@@ -93,7 +93,7 @@ impl CPURenderer {
 
   /// Renders a frame with explicit [`crate::RenderOptions`].
   pub fn render(&mut self, frame: f32, pixels: &mut [u32], width: u32, height: u32, options: crate::RenderOptions) -> Result<()> {
-    if self.comp.is_static() {
+    if options.clear && self.comp.is_static() {
       if let Some(cached) = &self.static_bitmap {
         if cached.width == width && cached.height == height && cached.options == options {
           let Some(target) = pixels.get_mut(..cached.pixels.len()) else {
@@ -111,7 +111,7 @@ impl CPURenderer {
     let mut walker = core::mem::take(&mut self.walker);
     let result = self.with_bitmap(pixels, width, height, options, |renderer| walker.render(&composition, frame, width, height, options, renderer));
     self.walker = walker;
-    if result.is_ok() && self.comp.is_static() {
+    if result.is_ok() && options.clear && self.comp.is_static() {
       let pixel_count = (width as usize).saturating_mul(height as usize);
       let cache_fits = pixel_count.checked_mul(core::mem::size_of::<u32>()).is_some_and(|bytes| bytes <= STATIC_BITMAP_CACHE_BYTES);
       if cache_fits {
@@ -174,7 +174,7 @@ impl CPURenderer {
     self.state.cov_cache.frame_tick();
     let composition = std::sync::Arc::clone(&self.comp);
     let mut walker = core::mem::take(&mut self.walker);
-    let mut backend = super::alpha_backend::Alpha8Renderer::new(target, width as usize, height as usize, options.antialias, &mut self.state);
+    let mut backend = super::alpha_backend::Alpha8Renderer::new(target, width as usize, height as usize, options.antialias, options.clear, &mut self.state);
     let result = walker.render(&composition, frame, width, height, options, &mut backend);
     backend.finish();
     self.walker = walker;

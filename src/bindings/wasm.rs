@@ -302,6 +302,7 @@ fn render_alpha8(inst: &mut Instance, frame: f32, width: u32, height: u32, antia
       width,
       height,
       RenderOptions {
+        clear: true,
         antialias: antialias != 0,
         curve_tolerance,
         alpha_only: true,

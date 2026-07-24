@@ -36,6 +36,90 @@ fn empty_renderer() -> crate::CPURenderer {
 }
 
 #[test]
+fn render_options_clear_destination_by_default() {
+  assert!(RenderOptions::default().clear);
+  let mut renderer = empty_renderer();
+  let mut pixels = [0x8040_2010; 4];
+  renderer.render(0.0, &mut pixels, 2, 2, RenderOptions::default()).unwrap();
+  assert_eq!(pixels, [0; 4]);
+}
+
+#[test]
+fn disabled_clear_preserves_an_empty_animation_destination() {
+  let mut renderer = empty_renderer();
+  let original = [0x8040_2010, 0xff30_2010, 0x4020_1008, 0];
+  let mut pixels = original;
+  renderer
+    .render(
+      0.0,
+      &mut pixels,
+      2,
+      2,
+      RenderOptions {
+        clear: false,
+        ..RenderOptions::default()
+      },
+    )
+    .unwrap();
+  assert_eq!(pixels, original);
+}
+
+fn assert_renders_over_existing_pixels(json: &[u8], width: u32, height: u32) {
+  let composition = Composition::parse(json, &Limits::default()).unwrap();
+  let mut renderer = crate::CPURenderer::new(composition);
+  let len = width as usize * height as usize;
+  let mut source = vec![0; len];
+  renderer.render(0.0, &mut source, width, height, RenderOptions::default()).unwrap();
+
+  for background in [0xff60_4020, 0xff10_3050] {
+    let mut expected = vec![background; len];
+    crate::simd::composite_over_span(&mut expected, &source, 255);
+    let mut actual = vec![background; len];
+    renderer
+      .render(
+        0.0,
+        &mut actual,
+        width,
+        height,
+        RenderOptions {
+          clear: false,
+          ..RenderOptions::default()
+        },
+      )
+      .unwrap();
+    assert_eq!(actual, expected);
+  }
+}
+
+#[test]
+fn disabled_clear_uses_source_over_for_static_solid_content() {
+  assert_renders_over_existing_pixels(
+    br##"{"fr":30,"ip":0,"op":1,"w":4,"h":4,"layers":[
+      {"ty":1,"ind":1,"sw":4,"sh":4,"sc":"#ff0000","ip":0,"op":1,"st":0,
+       "ks":{"o":{"a":0,"k":50},"p":{"a":0,"k":[2,2]},"a":{"a":0,"k":[2,2]},"s":{"a":0,"k":[100,100]}}}
+    ]}"##,
+    4,
+    4,
+  );
+}
+
+#[test]
+fn disabled_clear_uses_source_over_for_cached_gradients() {
+  assert_renders_over_existing_pixels(
+    br#"{"fr":30,"ip":0,"op":1,"w":8,"h":8,"layers":[
+      {"ty":4,"ind":1,"ip":0,"op":1,"st":0,
+       "ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}},
+       "shapes":[{"ty":"gr","it":[
+         {"ty":"rc","p":{"a":0,"k":[4,4]},"s":{"a":0,"k":[6,6]},"r":{"a":0,"k":1}},
+         {"ty":"gf","o":{"a":0,"k":70},"r":1,"g":{"p":2,"k":{"a":0,"k":[0,1,0,0,1,0,0,1]}},"s":{"a":0,"k":[1,1]},"e":{"a":0,"k":[7,7]},"t":1}
+       ]}]}
+    ]}"#,
+    8,
+    8,
+  );
+}
+
+#[test]
 fn bitmap_binding_rejects_nested_targets() {
   let mut renderer = empty_renderer();
   let mut outer = [0u32; 4];
