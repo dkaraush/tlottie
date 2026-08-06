@@ -36,6 +36,9 @@ pub struct Composition {
   pub(crate) layers: Vec<Layer>,
   /// Precomp assets, looked up by `Layer::ref_id`.
   pub(crate) assets: Vec<Asset>,
+  /// Byte order the model's colors are stored in. Everything except the luma
+  /// matte is channel-order agnostic, so this is only consulted there.
+  pub(crate) channel_order: crate::composition::options::ChannelOrder,
 }
 
 impl Composition {

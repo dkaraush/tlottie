@@ -5,6 +5,7 @@ Library for drawing [lottie animations](https://en.wikipedia.org/wiki/Lottie_(fi
 - Micro-optimized and [benchmarked](#benchmarks) across 17k+ animations from Telegram, against [rlottie](https://github.com/Samsung/rlottie) and [thorvg](https://github.com/thorvg/thorvg).
 - SIMD on ARM NEON, and WASM: [web demo](https://dkaraush.github.io/tlottie/examples/web/).
 - Support of `fitz` modifier and color replacements.
+- RGBA or BGRA output, chosen per instance at parse time and free at render time — desktop compositors (Qt `ARGB32_Premultiplied`, DXGI `B8G8R8A8_UNORM`, Cairo `ARGB32`) take BGRA without a conversion pass.
 - Support of rendering into only alpha channel bitmap.
 - Safe. Lottie JSON is treated as untrusted input.
 - Zero dependencies[^1].

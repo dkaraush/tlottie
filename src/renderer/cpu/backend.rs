@@ -179,7 +179,7 @@ impl CPURenderer {
         };
         let _source_dirty = self.surface_dirty.pop().unwrap_or_else(DirtyBox::empty);
         let source_rows = self.surface_rows.pop().unwrap_or_default();
-        apply_matte(&mut target, &source, kind, source_opacity);
+        apply_matte(&mut target, &source, kind, source_opacity, self.comp.channel_order);
         let width = self.width;
         composite_over_rows(self.active(), &target, width, &target_rows, target_dirty, opacity);
         if !target_dirty.is_empty() {

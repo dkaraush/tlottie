@@ -2,7 +2,7 @@
 
 #![allow(unsafe_code)]
 
-use crate::{CPURenderer, Composition, FitzModifier, LayerColorReplacement, Limits, ParseOptions, RenderOptions, SourceColorReplacement};
+use crate::{CPURenderer, ChannelOrder, Composition, FitzModifier, LayerColorReplacement, Limits, ParseOptions, RenderOptions, SourceColorReplacement};
 
 /// One constructor-time layer-prefix color override.
 #[repr(C)]
@@ -35,13 +35,18 @@ pub struct TLottieInstance {
 /// `json_ptr..json_ptr+json_len` must be readable for the duration of the call.
 #[no_mangle]
 pub unsafe extern "C" fn tlottie_new(json_ptr: *const u8, json_len: usize) -> *mut TLottieInstance {
-  unsafe { tlottie_new_with_options(json_ptr, json_len, 0, core::ptr::null(), 0, core::ptr::null(), 0) }
+  unsafe { tlottie_new_with_options(json_ptr, json_len, 0, core::ptr::null(), 0, core::ptr::null(), 0, 0) }
 }
 
 /// Parses Lottie JSON with a Fitz modifier and layer-prefix color overrides.
 ///
 /// `fitz_modifier` is one of `TLOTTIE_FITZ_*`. Prefix strings are matched
 /// directly against layer `nm` values and need no trailing `**`.
+///
+/// `channel_order` is one of `TLOTTIE_CHANNEL_*` and selects the byte order
+/// of every pixel this instance renders. It is applied once here, so it costs
+/// nothing per frame; color replacements are still given as `0xAARRGGBB`
+/// regardless of the order chosen.
 ///
 /// # Safety
 /// The JSON and every prefix byte range must be readable for this call.
@@ -54,11 +59,15 @@ pub unsafe extern "C" fn tlottie_new_with_options(
   replacements_len: usize,
   color_replacements_ptr: *const TLottieColorReplacement,
   color_replacements_len: usize,
+  channel_order: u32,
 ) -> *mut TLottieInstance {
   if json_ptr.is_null() {
     return core::ptr::null_mut();
   }
   let Some(fitz_modifier) = FitzModifier::from_u32(fitz_modifier) else {
+    return core::ptr::null_mut();
+  };
+  let Some(channel_order) = ChannelOrder::from_u32(channel_order) else {
     return core::ptr::null_mut();
   };
   if replacements_len != 0 && replacements_ptr.is_null() {
@@ -107,6 +116,7 @@ pub unsafe extern "C" fn tlottie_new_with_options(
     fitz_modifier,
     layer_color_replacements,
     source_color_replacements,
+    channel_order,
   };
   match Composition::parse_with_options(json, &Limits::default(), &options) {
     Ok(comp) => Box::into_raw(Box::new(TLottieInstance { renderer: CPURenderer::new(comp) })),

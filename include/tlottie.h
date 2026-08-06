@@ -33,6 +33,18 @@ typedef struct TLottieColorReplacement {
   uint32_t target_color;
 } TLottieColorReplacement;
 
+/*
+ * Byte order of every pixel an instance renders. Selected once at parse
+ * time by pre-swapping the model's colors, so it costs nothing per frame.
+ */
+enum TlottieChannelOrder {
+  /* 0xAABBGGRR words: [R, G, B, A] bytes. Android ARGB_8888. */
+  TLOTTIE_CHANNEL_RGBA = 0,
+  /* 0xAARRGGBB words: [B, G, R, A] bytes. Qt ARGB32_Premultiplied,
+     DXGI B8G8R8A8_UNORM, Cairo ARGB32. */
+  TLOTTIE_CHANNEL_BGRA = 1,
+};
+
 enum TlottieStatus {
   TLOTTIE_OK = 0,
   TLOTTIE_ERROR_INVALID_ARGUMENT = -1,
@@ -47,6 +59,9 @@ TLottieInstance *tlottie_new(const uint8_t *json_ptr, size_t json_len);
  * Like tlottie_new, with parse-time customization. Layer prefixes do not
  * include the legacy trailing "**"; matching and color replacement happen
  * once while the instance is created.
+ *
+ * channel_order is one of TLOTTIE_CHANNEL_*. Color replacements are always
+ * given as 0xAARRGGBB, whichever order is selected.
  */
 TLottieInstance *tlottie_new_with_options(
     const uint8_t *json_ptr,
@@ -55,7 +70,8 @@ TLottieInstance *tlottie_new_with_options(
     const TLottieLayerColorReplacement *replacements,
     size_t replacements_len,
     const TLottieColorReplacement *color_replacements,
-    size_t color_replacements_len);
+    size_t color_replacements_len,
+    uint32_t channel_order);
 
 /* NULL is accepted. Other pointers must have come from tlottie_new. */
 void tlottie_drop(TLottieInstance *renderer);
