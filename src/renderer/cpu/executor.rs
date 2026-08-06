@@ -297,7 +297,9 @@ pub(crate) fn render_pooled(composition: &Composition, scratch: &mut RenderScrat
       what: "pixel buffer too small",
     });
   };
-  buf.fill(0);
+  if options.clear {
+    buf.fill(0);
+  }
 
   let max_frame = composition.frame_count().saturating_sub(1) as f32;
   let frame_in_range = if frame_index.is_finite() { frame_index.clamp(0.0, max_frame) } else { 0.0 };
@@ -310,6 +312,9 @@ pub(crate) fn render_pooled(composition: &Composition, scratch: &mut RenderScrat
   let raster = scratch.take_raster(width as usize, height as usize);
   let cells = scratch.take_cells(width as usize, height as usize);
   let mut canvas = Canvas::with_raster(buf, width as usize, height as usize, raster, cells, options.antialias);
+  if !options.clear {
+    canvas.dirty.mark_row(0, 0, 1);
+  }
   let ctx = RenderCtx {
     comp: composition,
     continuous: frame_in_range.fract() != 0.0,

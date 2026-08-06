@@ -48,12 +48,17 @@ impl CPURenderer {
         what: "pixel buffer too small",
       });
     };
-    target.fill(0);
+    if options.clear {
+      target.fill(0);
+    }
     self.width = width as usize;
     self.height = height as usize;
     self.antialias = options.antialias;
     self.alpha_only = options.alpha_only;
-    self.bitmap_dirty = false;
+    // Existing pixels are destination content. Marking them dirty makes
+    // empty-target fast paths use the same source-over compositors as
+    // layers, masks, and mattes.
+    self.bitmap_dirty = !options.clear;
     self.state.cov_cache.set_budget_for_canvas(self.width, self.height);
     self.state.cov_cache.frame_tick();
     self.bitmap = Some(core::ptr::NonNull::from(target));

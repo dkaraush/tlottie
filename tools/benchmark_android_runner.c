@@ -85,7 +85,8 @@ int main(int argc, char **argv) {
             pixels,
             pixel_count,
             1,
-            curve_tolerance);
+            curve_tolerance,
+            1);
         const uint64_t elapsed = now_ns() - started;
         if (status != TLOTTIE_OK) {
             fprintf(stderr, "tlottie render %u failed with status %d\n", index, status);

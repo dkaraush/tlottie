@@ -68,7 +68,8 @@ uint32_t tlottie_frame_count(const TLottieInstance *renderer);
 /*
  * Renders width * height premultiplied RGBA8 pixels into out. Each word is
  * 0xAABBGGRR, giving [R, G, B, A] bytes on little-endian targets. out_len is
- * measured in uint32_t pixels. Nonzero antialias enables AA.
+ * measured in uint32_t pixels. Nonzero antialias enables AA. This default
+ * entry point clears out before rendering.
  */
 int32_t tlottie_render(
     TLottieInstance *renderer,
@@ -82,7 +83,9 @@ int32_t tlottie_render(
 /*
  * Like tlottie_render, with an explicit maximum curve-flattening error in
  * device pixels. curve_tolerance must be finite and greater than zero.
- * Smaller values improve geometric accuracy at a performance cost.
+ * Smaller values improve geometric accuracy at a performance cost. Nonzero
+ * clear resets the output first; zero composites over its existing
+ * premultiplied pixels.
  */
 int32_t tlottie_render_with_options(
     TLottieInstance *renderer,
@@ -92,7 +95,8 @@ int32_t tlottie_render_with_options(
     uint32_t *out,
     size_t out_len,
     uint32_t antialias,
-    float curve_tolerance);
+    float curve_tolerance,
+    uint32_t clear);
 
 /*
  * Renders width * height bytes directly into an Alpha8 bitmap. Unlike the
@@ -108,6 +112,7 @@ int32_t tlottie_render_alpha8(
     size_t out_len,
     uint32_t antialias);
 
+/* Nonzero clear resets out first; zero composites over existing alpha. */
 int32_t tlottie_render_alpha8_with_options(
     TLottieInstance *renderer,
     float frame,
@@ -116,7 +121,8 @@ int32_t tlottie_render_alpha8_with_options(
     uint8_t *out,
     size_t out_len,
     uint32_t antialias,
-    float curve_tolerance);
+    float curve_tolerance,
+    uint32_t clear);
 
 #ifdef __cplusplus
 }
