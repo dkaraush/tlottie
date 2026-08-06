@@ -98,6 +98,23 @@ pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb:
       return;
     }
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN {
+      let n = dst.len().min(cov.len());
+      let full = n - n % 4;
+      let (dst_v, dst_tail) = dst.split_at_mut(full);
+      let (cov_v, cov_tail) = cov.split_at(full.min(cov.len()));
+      // SAFETY: SSE2 is part of the x86_64 baseline and the cfg above
+      // additionally requires it to be statically enabled.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::fill_span_solid_sse2(dst_v, cov_v, sr, sg, sb, sa)
+      };
+      fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
+      return;
+    }
+  }
   fill_span_solid_scalar(dst, cov, sr, sg, sb, sa);
 }
 
@@ -192,6 +209,20 @@ pub(crate) fn fill_span_uniform(dst: &mut [u32], cov: u8, sr: u32, sg: u32, sb: 
       return;
     }
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN {
+      let full = dst.len() - dst.len() % 4;
+      let (dst_v, dst_tail) = dst.split_at_mut(full);
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::fill_span_uniform_sse2(dst_v, ca, s_r, s_g, s_b)
+      };
+      fill_span_uniform_scalar(dst_tail, ca, s_r, s_g, s_b);
+      return;
+    }
+  }
   fill_span_uniform_scalar(dst, ca, s_r, s_g, s_b);
 }
 
@@ -251,6 +282,20 @@ pub(crate) fn linear_lut_fill(out: &mut [u32], lut: &[u32], row_base: f32, dt: f
       return;
     }
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if out.len() >= SIMD_MIN_SPAN {
+      let full = out.len() - out.len() % 4;
+      let (head, tail) = out.split_at_mut(full);
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::linear_lut_fill_sse2(head, lut, row_base, dt, x_start, scale)
+      };
+      linear_lut_fill_scalar(tail, lut, row_base, dt, x_start + full as f32, scale);
+      return;
+    }
+  }
   linear_lut_fill_scalar(out, lut, row_base, dt, x_start, scale);
 }
 
@@ -306,6 +351,20 @@ pub(crate) fn radial_lut_fill(out: &mut [u32], lut: &[u32], dd0x: f32, dd0y: f32
       return;
     }
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if out.len() >= SIMD_MIN_SPAN {
+      let full = out.len() - out.len() % 4;
+      let (head, tail) = out.split_at_mut(full);
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::radial_lut_fill_sse2(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale)
+      };
+      radial_lut_fill_scalar(tail, lut, dd0x, dd0y, da, db, inv_r, x_start + full as f32, scale);
+      return;
+    }
+  }
   radial_lut_fill_scalar(out, lut, dd0x, dd0y, da, db, inv_r, x_start, scale);
 }
 
@@ -355,6 +414,20 @@ pub(crate) fn focal_lut_fill(out: &mut [u32], lut: &[u32], g0x: f32, g0y: f32, s
       let full = out.len() - out.len() % 4;
       let (head, tail) = out.split_at_mut(full);
       wasm128::focal_lut_fill_wasm(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale);
+      focal_lut_fill_scalar(tail, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start + full as f32, scale);
+      return;
+    }
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if out.len() >= SIMD_MIN_SPAN {
+      let full = out.len() - out.len() % 4;
+      let (head, tail) = out.split_at_mut(full);
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::focal_lut_fill_sse2(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale)
+      };
       focal_lut_fill_scalar(tail, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start + full as f32, scale);
       return;
     }
@@ -433,6 +506,22 @@ pub(crate) fn composite_over_span(dst: &mut [u32], src: &[u32], k: u32) {
       let (dst_v, dst_tail) = dst.split_at_mut(full);
       let (src_v, src_tail) = src.split_at(full);
       wasm128::composite_over_wasm(dst_v, src_v, k);
+      composite_over_scalar(dst_tail, src_tail, k);
+      return;
+    }
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN {
+      let n = dst.len().min(src.len());
+      let full = n - n % 4;
+      let (dst_v, dst_tail) = dst.split_at_mut(full);
+      let (src_v, src_tail) = src.split_at(full);
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::composite_over_sse2(dst_v, src_v, k)
+      };
       composite_over_scalar(dst_tail, src_tail, k);
       return;
     }
@@ -517,6 +606,20 @@ pub(crate) fn linear_lut_over(dst: &mut [u32], lut: &[u32], row_base: f32, dt: f
       return;
     }
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN {
+      let full = dst.len() - dst.len() % 4;
+      let (head, tail) = dst.split_at_mut(full);
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::linear_lut_over_sse2(head, lut, row_base, dt, x_start, scale)
+      };
+      linear_lut_over_scalar(tail, lut, row_base, dt, x_start + full as f32, scale);
+      return;
+    }
+  }
   linear_lut_over_scalar(dst, lut, row_base, dt, x_start, scale);
 }
 
@@ -558,6 +661,20 @@ pub(crate) fn radial_lut_over(dst: &mut [u32], lut: &[u32], dd0x: f32, dd0y: f32
       let full = dst.len() - dst.len() % 4;
       let (head, tail) = dst.split_at_mut(full);
       wasm128::radial_lut_over_wasm(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale);
+      radial_lut_over_scalar(tail, lut, dd0x, dd0y, da, db, inv_r, x_start + full as f32, scale);
+      return;
+    }
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN {
+      let full = dst.len() - dst.len() % 4;
+      let (head, tail) = dst.split_at_mut(full);
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::radial_lut_over_sse2(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale)
+      };
       radial_lut_over_scalar(tail, lut, dd0x, dd0y, da, db, inv_r, x_start + full as f32, scale);
       return;
     }
@@ -607,6 +724,20 @@ pub(crate) fn focal_lut_over(dst: &mut [u32], lut: &[u32], g0x: f32, g0y: f32, s
       let full = dst.len() - dst.len() % 4;
       let (head, tail) = dst.split_at_mut(full);
       wasm128::focal_lut_over_wasm(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale);
+      focal_lut_over_scalar(tail, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start + full as f32, scale);
+      return;
+    }
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN {
+      let full = dst.len() - dst.len() % 4;
+      let (head, tail) = dst.split_at_mut(full);
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::focal_lut_over_sse2(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale)
+      };
       focal_lut_over_scalar(tail, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start + full as f32, scale);
       return;
     }
@@ -668,6 +799,18 @@ pub(crate) fn alpha_blend_solid(dst: &mut [u8], coverage: &[u8], alpha: u8) {
     alpha_blend_solid_scalar(tail, &coverage[full..n], alpha);
     return;
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    // SAFETY: SSE2 is part of the x86_64 baseline.
+    #[allow(unsafe_code)]
+    unsafe {
+      sse2::alpha_blend_solid_sse2(head, &coverage[..full], alpha)
+    };
+    alpha_blend_solid_scalar(tail, &coverage[full..n], alpha);
+    return;
+  }
   alpha_blend_solid_scalar(&mut dst[..n], &coverage[..n], alpha);
 }
 
@@ -696,6 +839,18 @@ pub(crate) fn alpha_blend_product(dst: &mut [u8], lhs: &[u8], rhs: &[u8]) {
     let full = n - n % 16;
     let (head, tail) = dst[..n].split_at_mut(full);
     wasm128::alpha_blend_product_wasm(head, &lhs[..full], &rhs[..full]);
+    alpha_blend_product_scalar(tail, &lhs[full..n], &rhs[full..n]);
+    return;
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    // SAFETY: SSE2 is part of the x86_64 baseline.
+    #[allow(unsafe_code)]
+    unsafe {
+      sse2::alpha_blend_product_sse2(head, &lhs[..full], &rhs[..full])
+    };
     alpha_blend_product_scalar(tail, &lhs[full..n], &rhs[full..n]);
     return;
   }
@@ -737,6 +892,18 @@ pub(crate) fn alpha_blend_uniform(dst: &mut [u8], coverage: u8, alpha: u8) {
     alpha_blend_uniform_scalar(tail, source);
     return;
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if dst.len() >= SIMD_MIN_SPAN {
+    let full = dst.len() - dst.len() % 16;
+    let (head, tail) = dst.split_at_mut(full);
+    // SAFETY: SSE2 is part of the x86_64 baseline.
+    #[allow(unsafe_code)]
+    unsafe {
+      sse2::alpha_blend_uniform_sse2(head, source as u8)
+    };
+    alpha_blend_uniform_scalar(tail, source);
+    return;
+  }
   alpha_blend_uniform_scalar(dst, source);
 }
 
@@ -767,6 +934,18 @@ pub(crate) fn alpha_composite_over(dst: &mut [u8], src: &[u8], opacity: u8) {
     let full = n - n % 16;
     let (head, tail) = dst[..n].split_at_mut(full);
     wasm128::alpha_composite_over_wasm(head, &src[..full], opacity);
+    alpha_composite_over_scalar(tail, &src[full..n], opacity);
+    return;
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    // SAFETY: SSE2 is part of the x86_64 baseline.
+    #[allow(unsafe_code)]
+    unsafe {
+      sse2::alpha_composite_over_sse2(head, &src[..full], opacity)
+    };
     alpha_composite_over_scalar(tail, &src[full..n], opacity);
     return;
   }
@@ -801,6 +980,18 @@ pub(crate) fn alpha_multiply(dst: &mut [u8], factors: &[u8]) {
     alpha_multiply_scalar(tail, &factors[full..n]);
     return;
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    // SAFETY: SSE2 is part of the x86_64 baseline.
+    #[allow(unsafe_code)]
+    unsafe {
+      sse2::alpha_multiply_sse2(head, &factors[..full])
+    };
+    alpha_multiply_scalar(tail, &factors[full..n]);
+    return;
+  }
   alpha_multiply_scalar(&mut dst[..n], &factors[..n]);
 }
 
@@ -828,6 +1019,18 @@ pub(crate) fn alpha_matte(dst: &mut [u8], src: &[u8], opacity: u8, inverted: boo
     let full = n - n % 16;
     let (head, tail) = dst[..n].split_at_mut(full);
     wasm128::alpha_matte_wasm(head, &src[..full], opacity, inverted);
+    alpha_matte_scalar(tail, &src[full..n], opacity, inverted);
+    return;
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    // SAFETY: SSE2 is part of the x86_64 baseline.
+    #[allow(unsafe_code)]
+    unsafe {
+      sse2::alpha_matte_sse2(head, &src[..full], opacity, inverted)
+    };
     alpha_matte_scalar(tail, &src[full..n], opacity, inverted);
     return;
   }
@@ -863,6 +1066,18 @@ pub(crate) fn alpha_mask_combine(dst: &mut [u8], src: &[u8], mode: u8, inverted:
     alpha_mask_combine_scalar(tail, &src[full..n], mode, inverted, opacity);
     return;
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 16;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    // SAFETY: SSE2 is part of the x86_64 baseline.
+    #[allow(unsafe_code)]
+    unsafe {
+      sse2::alpha_mask_combine_sse2(head, &src[..full], mode, inverted, opacity)
+    };
+    alpha_mask_combine_scalar(tail, &src[full..n], mode, inverted, opacity);
+    return;
+  }
   alpha_mask_combine_scalar(&mut dst[..n], &src[..n], mode, inverted, opacity);
 }
 
@@ -887,6 +1102,10 @@ mod neon;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[path = "simd/wasm.rs"]
 mod wasm128;
+
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[path = "simd/sse2.rs"]
+mod sse2;
 
 #[cfg(test)]
 #[path = "tests/simd.rs"]
