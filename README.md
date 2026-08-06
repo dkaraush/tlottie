@@ -3,7 +3,7 @@
 Library for drawing [lottie animations](https://en.wikipedia.org/wiki/Lottie_(file_format)), written in Rust.
 
 - Micro-optimized and [benchmarked](#benchmarks) across 17k+ animations from Telegram, against [rlottie](https://github.com/Samsung/rlottie) and [thorvg](https://github.com/thorvg/thorvg).
-- SIMD on ARM NEON, and WASM: [web demo](https://dkaraush.github.io/tlottie/examples/web/).
+- SIMD on ARM NEON, x86_64 SSE2, and WASM: [web demo](https://dkaraush.github.io/tlottie/examples/web/). All three are baseline features of their target, so there is no runtime dispatch.
 - Support of `fitz` modifier and color replacements.
 - Support of rendering into only alpha channel bitmap.
 - Safe. Lottie JSON is treated as untrusted input.
@@ -36,4 +36,4 @@ Frame time, mainly compared to [rlottie2019](https://github.com/TelegramMessenge
 - [linux x86](https://dkaraush.github.io/tlottie/benchmarks/linux.html)[^2]: **-72.6%** at 64px, **-49.8%** at 320px, **-32.8%** at 720px
 
 [^1]: Listed dependencies are only for GPU renderers, that are currently work in progress, expected to be useful only on large canvas sizes.
-[^2]: Tested on Threadripper running at all cores, a bit skeptical about such results.
+[^2]: Tested on Threadripper running at all cores, a bit skeptical about such results. Measured before the SSE2 backend existed, so these are tlottie's scalar path against rlottie's — x86_64 is faster than this now.
