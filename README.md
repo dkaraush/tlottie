@@ -33,7 +33,7 @@ Frame time, mainly compared to [rlottie2019](https://github.com/TelegramMessenge
 - [android arm, Samsung Fold7](https://dkaraush.github.io/tlottie/benchmarks/android-fold.html): **-64.7%** at 64px, **-55.8%** at 320px, **-52.0%** at 720px
 - [android arm, Samsung F15](https://dkaraush.github.io/tlottie/benchmarks/android-f15.html): **-62.7%** at 64px, **-42.0%** at 320px, **-23.0%** at 720px
 - [macOS arm](https://dkaraush.github.io/tlottie/benchmarks/macos.html): **-61.5%** at 64px, **-47.6%** at 320px, **-27.3%** at 720px
-- [linux x86](https://dkaraush.github.io/tlottie/benchmarks/linux.html)[^2]: **-72.6%** at 64px, **-49.8%** at 320px, **-32.8%** at 720px
+- [linux x86](https://dkaraush.github.io/tlottie/benchmarks/linux.html)[^2]: **-70.0%** at 64px, **-50.2%** at 320px, **-36.4%** at 720px
 
 [^1]: Listed dependencies are only for GPU renderers, that are currently work in progress, expected to be useful only on large canvas sizes.
-[^2]: Tested on Threadripper running at all cores, a bit skeptical about such results. Measured before the SSE2 backend existed, so these are tlottie's scalar path against rlottie's — x86_64 is faster than this now.
+[^2]: Tested on Threadripper PRO 9995WX at full core count, running tlottie's SSE2+AVX2+AVX-512 backend against rlottie's. Relative parity with rlottie2019 is worse here than on smaller cores because the vector span kernels are memory-bound at 720px; tlottie is faster than this on typical x86_64 laptops (see the AVX-512 breakdown in the report).
