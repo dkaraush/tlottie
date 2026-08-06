@@ -1,5 +1,8 @@
 #![allow(unsafe_code)]
 
+use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use std::alloc::{alloc, dealloc, Layout};
 
 use crate::{CPURenderer, Composition, FitzModifier, LayerColorReplacement, Limits, ParseOptions, RenderOptions};
@@ -35,7 +38,7 @@ pub extern "C" fn tlottie_alloc(len: usize) -> *mut u8 {
       // SAFETY: layout is valid and non-zero-sized.
       unsafe { alloc(layout) }
     }
-    _ => std::ptr::null_mut(),
+    _ => core::ptr::null_mut(),
   }
 }
 
@@ -81,33 +84,33 @@ pub unsafe extern "C" fn tlottie_new_with_options(
   replacements_len: usize,
 ) -> *mut Instance {
   if json_ptr.is_null() {
-    return std::ptr::null_mut();
+    return core::ptr::null_mut();
   }
   let Some(fitz_modifier) = FitzModifier::from_u32(fitz_modifier) else {
-    return std::ptr::null_mut();
+    return core::ptr::null_mut();
   };
   if replacements_len != 0 && replacements_ptr.is_null() {
-    return std::ptr::null_mut();
+    return core::ptr::null_mut();
   }
   // SAFETY: caller contract — the range is a live allocation.
-  let json = unsafe { std::slice::from_raw_parts(json_ptr, json_len) };
+  let json = unsafe { core::slice::from_raw_parts(json_ptr, json_len) };
   let raw_replacements = if replacements_len == 0 {
     &[]
   } else {
-    unsafe { std::slice::from_raw_parts(replacements_ptr, replacements_len) }
+    unsafe { core::slice::from_raw_parts(replacements_ptr, replacements_len) }
   };
   let mut layer_color_replacements = Vec::with_capacity(raw_replacements.len());
   for replacement in raw_replacements {
     if replacement.layer_name_prefix_len != 0 && replacement.layer_name_prefix.is_null() {
-      return std::ptr::null_mut();
+      return core::ptr::null_mut();
     }
     let bytes = if replacement.layer_name_prefix_len == 0 {
       &[]
     } else {
-      unsafe { std::slice::from_raw_parts(replacement.layer_name_prefix, replacement.layer_name_prefix_len) }
+      unsafe { core::slice::from_raw_parts(replacement.layer_name_prefix, replacement.layer_name_prefix_len) }
     };
-    let Ok(prefix) = std::str::from_utf8(bytes) else {
-      return std::ptr::null_mut();
+    let Ok(prefix) = core::str::from_utf8(bytes) else {
+      return core::ptr::null_mut();
     };
     layer_color_replacements.push(LayerColorReplacement {
       layer_name_prefix: prefix.to_owned(),
@@ -126,7 +129,7 @@ pub unsafe extern "C" fn tlottie_new_with_options(
       rgba: Vec::new(),
       alpha8: Vec::new(),
     })),
-    Err(_) => std::ptr::null_mut(),
+    Err(_) => core::ptr::null_mut(),
   }
 }
 
@@ -196,13 +199,13 @@ pub unsafe extern "C" fn tlottie_render(inst: *mut Instance, frame: f32, width: 
 pub unsafe extern "C" fn tlottie_render_with_options(inst: *mut Instance, frame: f32, width: u32, height: u32, antialias: u32, curve_tolerance: f32) -> *const u8 {
   // SAFETY: caller contract.
   let Some(inst) = (unsafe { inst.as_mut() }) else {
-    return std::ptr::null_mut();
+    return core::ptr::null_mut();
   };
   if !curve_tolerance.is_finite() || curve_tolerance <= 0.0 {
-    return std::ptr::null_mut();
+    return core::ptr::null_mut();
   }
   let Some(px) = (width as usize).checked_mul(height as usize) else {
-    return std::ptr::null_mut();
+    return core::ptr::null_mut();
   };
   // Resize-only: render() fully overwrites all px pixels, so re-zeroing
   // an already-sized buffer is pure memset waste (profiled ~1MB/frame).
@@ -225,10 +228,10 @@ pub unsafe extern "C" fn tlottie_render_with_options(inst: *mut Instance, frame:
     )
     .is_err()
   {
-    return std::ptr::null_mut();
+    return core::ptr::null_mut();
   }
   let Some(bytes) = px.checked_mul(4) else {
-    return std::ptr::null_mut();
+    return core::ptr::null_mut();
   };
   // Same resize-only rationale: the conversion loop below writes every
   // byte of the RGBA buffer.
@@ -251,10 +254,10 @@ pub unsafe extern "C" fn tlottie_render_alpha8(inst: *mut Instance, frame: f32, 
 #[no_mangle]
 pub unsafe extern "C" fn tlottie_render_alpha8_with_options(inst: *mut Instance, frame: f32, width: u32, height: u32, antialias: u32, curve_tolerance: f32) -> *const u8 {
   let Some(inst) = (unsafe { inst.as_mut() }) else {
-    return std::ptr::null();
+    return core::ptr::null();
   };
   if render_alpha8(inst, frame, width, height, antialias, curve_tolerance).is_none() {
-    return std::ptr::null();
+    return core::ptr::null();
   }
   inst.alpha8.as_ptr()
 }
@@ -271,13 +274,13 @@ pub unsafe extern "C" fn tlottie_render_alpha8_color(inst: *mut Instance, frame:
 #[no_mangle]
 pub unsafe extern "C" fn tlottie_render_alpha8_color_with_options(inst: *mut Instance, frame: f32, width: u32, height: u32, antialias: u32, color: u32, curve_tolerance: f32) -> *const u8 {
   let Some(inst) = (unsafe { inst.as_mut() }) else {
-    return std::ptr::null();
+    return core::ptr::null();
   };
   let Some(px) = render_alpha8(inst, frame, width, height, antialias, curve_tolerance) else {
-    return std::ptr::null();
+    return core::ptr::null();
   };
   let Some(bytes) = px.checked_mul(4) else {
-    return std::ptr::null();
+    return core::ptr::null();
   };
   if inst.rgba.len() != bytes {
     inst.rgba.resize(bytes, 0);

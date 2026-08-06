@@ -892,6 +892,8 @@ mod wasm128;
 #[path = "tests/simd.rs"]
 mod tests;
 
+#[cfg(not(feature = "std"))]
+use crate::compat::FloatExt as _;
 #[cfg(test)]
 #[path = "tests/alpha_simd.rs"]
 mod alpha_tests;

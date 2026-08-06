@@ -4,6 +4,7 @@
 //! interned easing LUTs come with the performance phases.
 
 use crate::math::{Color, Vec2};
+use alloc::vec::Vec;
 
 /// Temporal easing between two keyframes: a cubic bezier through (0,0),
 /// (ox,oy), (ix,iy), (1,1) mapping normalized time to normalized progress.

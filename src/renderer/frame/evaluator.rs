@@ -1,6 +1,7 @@
 //! Shape evaluation shared by the frame walker and CPU test oracle.
 
 use super::*;
+use alloc::vec::Vec;
 
 pub(crate) struct ShapeWalker<'a> {
   pub(crate) scratch: &'a mut RenderScratch,
@@ -29,13 +30,13 @@ enum PendingPaint {
   },
   Gradient {
     rule: FillRule,
-    lut: std::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
+    lut: alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
     lut_id: u64,
     map: GradientMap,
   },
   Stroke {
     color: Option<Color>,
-    lut: Option<(std::sync::Arc<[u32; GRADIENT_LUT_SIZE]>, u64, GradientMap)>,
+    lut: Option<(alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>, u64, GradientMap)>,
     opacity: f32,
     hw: f32,
     cap: crate::stroke::Cap,
@@ -69,7 +70,7 @@ pub(crate) enum DrawJob {
     contours: Vec<Contour>,
     borrowed: Option<usize>,
     rule: FillRule,
-    lut: std::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
+    lut: alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
     map: GradientMap,
   },
 }

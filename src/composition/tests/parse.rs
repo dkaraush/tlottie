@@ -1,5 +1,8 @@
 use super::*;
 use crate::FitzModifier;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
 
 const MINIMAL: &str = r#"{"v":"5.5.2","fr":60,"ip":0,"op":180,"w":512,"h":512,"nm":"t","layers":[]}"#;
 

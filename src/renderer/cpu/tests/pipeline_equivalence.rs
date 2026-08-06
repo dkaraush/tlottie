@@ -1,6 +1,8 @@
 use crate::renderer::cpu::executor::{render_pooled, RenderScratch};
 use crate::renderer::frame::FrameRenderer;
 use crate::{Composition, Limits, RenderOptions};
+use alloc::format;
+use alloc::vec;
 
 #[test]
 fn single_mask_fast_path_matches_accumulator_formula() {

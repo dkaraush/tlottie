@@ -63,6 +63,8 @@ pub struct SourceColorReplacement {
   pub target_color: u32,
 }
 
+use alloc::string::String;
+use alloc::vec::Vec;
 /// Options applied while a [`crate::Composition`] is parsed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParseOptions {

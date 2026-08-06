@@ -6,12 +6,16 @@
 
 #![allow(missing_docs)]
 
+#[cfg(not(feature = "std"))]
+use crate::compat::FloatExt as _;
 use crate::error::{Error, Result};
 use crate::geometry::{clip_contour, clip_to_quad, flatten_path, rect_contour, Contour};
 use crate::limits::Limits;
 use crate::math::{Color, Mat2x3, Vec2};
 use crate::model::{shapes_have_multiple_visible_paints, shapes_static, Composition, FillRule, Layer, LayerKind};
 use crate::renderer::cpu::executor::{layer_transform_at, opacity_byte, parent_chain_matrix, ClipQuad, DrawJob, GradientMapKind, PendingJob, RenderCtx, RenderScratch, ShapeWalker, MAX_PRECOMP_DEPTH};
+use alloc::vec;
+use alloc::vec::Vec;
 
 use super::renderer::*;
 
@@ -176,10 +180,10 @@ struct CachedLayerJobs {
 
 #[derive(Default)]
 struct StaticJobCache {
-  entries: std::collections::HashMap<u128, CachedLayerJobs>,
-  seen: std::collections::HashSet<u128>,
-  rejected: std::collections::HashSet<u128>,
-  static_flags: std::collections::HashMap<(usize, usize), bool>,
+  entries: crate::compat::HashMap<u128, CachedLayerJobs>,
+  seen: crate::compat::HashSet<u128>,
+  rejected: crate::compat::HashSet<u128>,
+  static_flags: crate::compat::HashMap<(usize, usize), bool>,
   bytes: usize,
   #[cfg(test)]
   hits: usize,
@@ -269,7 +273,7 @@ fn static_jobs_bytes(context: &StaticContext, jobs: &Vec<CachedJob>) -> usize {
         .saturating_add(contour.anchors.capacity().saturating_mul(core::mem::size_of::<bool>()));
     }
     if let CachedPaint::Gradient(paint) = &job.paint {
-      let ptr = std::sync::Arc::as_ptr(&paint.lut);
+      let ptr = alloc::sync::Arc::as_ptr(&paint.lut);
       if !gradient_luts.contains(&ptr) {
         gradient_luts.push(ptr);
         bytes = bytes.saturating_add(core::mem::size_of::<[u32; GRADIENT_LUT_SIZE]>());

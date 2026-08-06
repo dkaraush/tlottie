@@ -58,7 +58,7 @@ pub enum GradientKind {
 #[derive(Clone, Debug)]
 pub struct GradientPaint {
   pub rule: Rule,
-  pub lut: std::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
+  pub lut: alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
   pub transform: GradientTransform,
   pub kind: GradientKind,
   pub(crate) source_key: u128,

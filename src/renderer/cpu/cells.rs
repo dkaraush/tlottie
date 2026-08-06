@@ -15,6 +15,7 @@
 
 use crate::geometry::Contour;
 use crate::model::FillRule;
+use alloc::vec::Vec;
 
 /// Subpixel bits (24.8 fixed point, FreeType's PIXEL_BITS = 8).
 const PIX_B: i32 = 8;

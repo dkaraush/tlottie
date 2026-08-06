@@ -1,4 +1,6 @@
 use super::*;
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Deterministic xorshift — no dev-dependency needed.
 struct Rng(u64);

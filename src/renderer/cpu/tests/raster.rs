@@ -1,6 +1,8 @@
 use super::*;
 use crate::geometry::Contour;
 use crate::math::Vec2;
+use alloc::vec;
+use alloc::vec::Vec;
 
 fn cov_sum(r: &mut Rasterizer, rule: FillRule) -> u64 {
   let mut total = 0u64;

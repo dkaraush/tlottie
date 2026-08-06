@@ -8,6 +8,8 @@
 //! Unsupported shape/layer types are skipped silently for now; the
 //! supported-feature report lands with a later phase.
 
+#[cfg(not(feature = "std"))]
+use crate::compat::FloatExt as _;
 use crate::composition::options::{LayerColorReplacement, ParseOptions, SourceColorReplacement};
 use crate::error::{Error, JsonErrorKind, Limit, Result};
 use crate::json::Cursor;
@@ -19,6 +21,9 @@ use crate::model::{
 };
 use crate::property::{Easing, Keyframe, Lerp, Property, Timeline};
 use crate::stroke::{Cap, Join};
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Maximum nesting of `gr` shape groups (separate from raw JSON depth).
 const MAX_GROUP_DEPTH: usize = 32;

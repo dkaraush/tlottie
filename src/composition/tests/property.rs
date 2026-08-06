@@ -1,5 +1,7 @@
 use super::*;
 use crate::composition::property::{Easing, Keyframe, Property, Timeline};
+use alloc::vec;
+use alloc::vec::Vec;
 
 fn animated(kfs: Vec<Keyframe<f32>>) -> Property<f32> {
   let mut it = kfs.into_iter();

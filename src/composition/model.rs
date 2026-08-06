@@ -1,8 +1,13 @@
 //! The immutable parsed animation model. Shared (`Arc`) across render
 //! instances; render-time state lives elsewhere.
 
+#[cfg(not(feature = "std"))]
+use crate::compat::FloatExt as _;
 use crate::math::{Color, Vec2};
 use crate::property::{Lerp, Property};
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Raw float list (gradient stop data); lerps pointwise when lengths match.
 #[derive(Debug, Clone, Default, PartialEq)]
