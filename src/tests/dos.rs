@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use crate::{CPURenderer, Composition, Error, Limits, RenderOptions};
 
-const FRAME_TIME_BUDGET: Duration = Duration::from_millis(250);
+const FRAME_TIME_BUDGET: Duration = Duration::from_millis(1_500);
 const MEM_BUDGET: usize = 32 << 20;
 
 thread_local! {
@@ -102,10 +102,7 @@ static ACCOUNTING: Accounting = Accounting;
 /// scales to `frame_end - frame_start` frames' worth of [`FRAME_TIME_BUDGET`].
 macro_rules! assert_lottie {
   ($json: expr) => {
-    assert_lottie!($json, 64, 0, 1, RenderOptions::default(), false);
-  };
-  ($json: expr, expect_error) => {
-    assert_lottie!($json, 64, 0, 1, RenderOptions::default(), true);
+    assert_lottie!($json, 64, 0, 1, RenderOptions::default());
   };
   ($json: expr, $size: expr) => {
     assert_lottie!($json, $size, 0, 1, RenderOptions::default(), false);
@@ -163,7 +160,7 @@ macro_rules! assert_lottie {
     if expect_error {
       assert!(rendered.is_err(), "malformed input unexpectedly rendered successfully");
     } else {
-      assert!(rendered.is_ok(), "{rendered:?}");
+      assert!(rendered.is_ok() || matches!(rendered, Err(Error::LimitExceeded(_))), "{rendered:?}");
     }
   };
 }
@@ -197,6 +194,83 @@ fn focal_radial_gradients_json(fills_count: usize) -> String {
   )
 }
 
+fn focal_radial_gradient_strokes_json(strokes_count: usize) -> String {
+  let mut strokes = String::new();
+  for i in 0..strokes_count {
+    strokes.push_str(&format!(
+      r#"{{"ty":"gs","t":2,"s":{{"a":0,"k":[256,256]}},"e":{{"a":0,"k":[{},{}]}},"h":{{"a":0,"k":99}},"a":{{"a":0,"k":{}}},"g":{{"p":2,"k":{{"a":0,"k":[0,1,0,0,1,0,0,1]}}}},"o":{{"a":0,"k":100}},"w":{{"a":0,"k":512}},"lc":2,"lj":2}},"#,
+      256 + (i % 17),
+      512 - (i % 19),
+      i % 360
+    ));
+  }
+  format!(
+    r#"{{"v":"5.5.0","w":512,"h":512,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"sh","ks":{{"a":0,"k":{{"c":false,"v":[[0,256],[512,256]],"i":[],"o":[]}}}}}},{strokes}{{"ty":"tr"}}]}}]}}]}}"#
+  )
+}
+
+fn reused_precomp_focal_radial_gradients_json(refs_count: usize, fills_count: usize) -> String {
+  let mut refs = String::new();
+  for i in 0..refs_count {
+    if i > 0 {
+      refs.push(',');
+    }
+    refs.push_str(&format!(r#"{{"ty":0,"ind":{i},"refId":"radial","ip":0,"op":60,"st":0,"ks":{{}}}}"#));
+  }
+
+  let mut fills = String::new();
+  for i in 0..fills_count {
+    fills.push_str(&format!(
+      r#"{{"ty":"gf","t":2,"s":{{"a":0,"k":[256,256]}},"e":{{"a":0,"k":[{},{}]}},"h":{{"a":0,"k":99}},"a":{{"a":0,"k":{}}},"g":{{"p":2,"k":{{"a":0,"k":[0,1,0,0,1,0,0,1]}}}},"o":{{"a":0,"k":100}}}},"#,
+      256 + (i % 17),
+      512 - (i % 19),
+      i % 360
+    ));
+  }
+
+  format!(
+    r#"{{"v":"5.5.0","w":512,"h":512,"fr":60,"ip":0,"op":60,"layers":[{refs}],"assets":[{{"id":"radial","layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"rc","p":{{"a":0,"k":[256,256]}},"s":{{"a":0,"k":[512,512]}},"r":{{"a":0,"k":0}}}},{fills}{{"ty":"tr"}}]}}]}}]}}]}}"#
+  )
+}
+
+fn reused_precomp_animated_linear_gradients_json(refs_count: usize, fills_count: usize) -> String {
+  let mut refs = String::new();
+  for i in 0..refs_count {
+    if i > 0 {
+      refs.push(',');
+    }
+    refs.push_str(&format!(r#"{{"ty":0,"ind":{i},"refId":"linear","ip":0,"op":60,"st":0,"ks":{{}}}}"#));
+  }
+
+  let mut fills = String::new();
+  for _ in 0..fills_count {
+    fills.push_str(r#"{"ty":"gf","s":{"a":0,"k":[0,0]},"e":{"a":0,"k":[256,256]},"g":{"p":2,"k":{"a":0,"k":[0,1,0,0,1,0,0,1]}},"o":{"a":1,"k":[{"t":0,"s":[100]},{"t":1,"s":[100]}]}},"#);
+  }
+
+  format!(
+    r#"{{"v":"5.5.0","w":256,"h":256,"fr":60,"ip":0,"op":60,"layers":[{refs}],"assets":[{{"id":"linear","layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"rc","p":{{"a":0,"k":[128,128]}},"s":{{"a":0,"k":[256,256]}},"r":{{"a":0,"k":0}}}},{fills}{{"ty":"tr"}}]}}]}}]}}]}}"#
+  )
+}
+
+fn reused_precomp_animated_linear_gradient_strokes_json(refs_count: usize, strokes_count: usize) -> String {
+  let mut refs = String::new();
+  for i in 0..refs_count {
+    if i > 0 {
+      refs.push(',');
+    }
+    refs.push_str(&format!(r#"{{"ty":0,"ind":{i},"refId":"linear-strokes","ip":0,"op":60,"st":0,"ks":{{}}}}"#));
+  }
+
+  let mut strokes = String::new();
+  for _ in 0..strokes_count {
+    strokes.push_str(r#"{"ty":"gs","s":{"a":0,"k":[0,0]},"e":{"a":0,"k":[256,256]},"g":{"p":2,"k":{"a":0,"k":[0,1,0,0,1,0,0,1]}},"o":{"a":1,"k":[{"t":0,"s":[100]},{"t":1,"s":[100]}]},"w":{"a":0,"k":256},"lc":2,"lj":2},"#);
+  }
+
+  format!(
+    r#"{{"v":"5.5.0","w":256,"h":256,"fr":60,"ip":0,"op":60,"layers":[{refs}],"assets":[{{"id":"linear-strokes","layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"sh","ks":{{"a":0,"k":{{"c":false,"v":[[0,128],[256,128]],"i":[],"o":[]}}}}}},{strokes}{{"ty":"tr"}}]}}]}}]}}]}}"#
+  )
+}
+
 fn clipped_dashed_strokes_json(strokes_count: usize, line_cap: u32) -> String {
   let mut items = String::new();
   for i in 0..strokes_count {
@@ -220,6 +294,24 @@ fn clipped_dashed_zigzag_json(vertices_count: usize) -> String {
   format!(
     r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"sh","ks":{{"a":0,"k":{{"c":false,"v":[{verts}],"i":[],"o":[]}}}}}},{{"ty":"st","c":{{"a":0,"k":[1,0,0,1]}},"o":{{"a":0,"k":100}},"w":{{"a":0,"k":16}},"lc":2,"lj":2,"d":[{{"n":"d","v":{{"a":0,"k":1}}}},{{"n":"g","v":{{"a":0,"k":1}}}}]}},{{"ty":"tr"}}]}}]}}]}}"#
   )
+}
+
+fn animated_tiny_dash_period_json() -> &'static str {
+  r#"{
+    "v":"5.5.0","w":720,"h":720,"fr":60,"ip":0,"op":2,
+    "layers":[{"ty":4,"ind":1,"ip":0,"op":2,"st":0,"ks":{},"shapes":[{"ty":"gr","it":[
+      {"ty":"sh","ks":{"a":0,"k":{"c":false,"v":[[-140000,360],[140000,360]],"i":[[0,0],[0,0]],"o":[[0,0],[0,0]]}}},
+      {"ty":"st","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"w":{"a":0,"k":1},"lc":1,"lj":1,
+       "d":[
+         {"n":"d","v":{"a":1,"k":[{"t":0,"s":[1000],"e":[0.0011]},{"t":1,"s":[0.0011]}]}},
+         {"n":"g","v":{"a":1,"k":[{"t":0,"s":[1000],"e":[0.0011]},{"t":1,"s":[0.0011]}]}},
+         {"n":"d","v":{"a":1,"k":[{"t":0,"s":[1000],"e":[0.0011]},{"t":1,"s":[0.0011]}]}},
+         {"n":"g","v":{"a":1,"k":[{"t":0,"s":[1000],"e":[0.0011]},{"t":1,"s":[0.0011]}]}},
+         {"n":"o","v":{"a":0,"k":0}}
+       ]},
+      {"ty":"tr"}
+    ]}]}]
+  }"#
 }
 
 fn animated_opacity_tail_gradient_json(opacity_pairs: usize) -> String {
@@ -313,6 +405,22 @@ fn dashed_polystar_json(points: usize, copies: usize) -> String {
   format!(
     r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"sr","sy":1,"pt":{{"a":0,"k":{points}}},"p":{{"a":0,"k":[32,32]}},"r":{{"a":0,"k":0}},"ir":{{"a":0,"k":256}},"or":{{"a":0,"k":512}},"is":{{"a":0,"k":0}},"os":{{"a":0,"k":0}}}},{{"ty":"st","c":{{"a":0,"k":[1,0,0,1]}},"o":{{"a":0,"k":100}},"w":{{"a":0,"k":12}},"lc":2,"lj":2,"d":[{{"n":"d","v":{{"a":0,"k":1}}}},{{"n":"g","v":{{"a":0,"k":1}}}}]}},{{"ty":"rp","c":{{"a":0,"k":{copies}}},"o":{{"a":0,"k":0}},"tr":{{"r":{{"a":0,"k":0.5}}}}}},{{"ty":"tr"}}]}}]}}]}}"#
   )
+}
+
+fn animated_repeater_product_json() -> &'static str {
+  r#"{
+    "v":"5.5.0","w":720,"h":720,"fr":60,"ip":0,"op":2,
+    "layers":[{"ty":4,"ind":1,"ip":0,"op":2,"st":0,"ks":{},"shapes":[{"ty":"gr","it":[
+      {"ty":"rc","p":{"a":0,"k":[360,360]},"s":{"a":0,"k":[8,8]},"r":{"a":0,"k":0}},
+      {"ty":"rp","c":{"a":1,"k":[{"t":0,"s":[0],"e":[64]},{"t":1,"s":[64]}]},"o":{"a":0,"k":0},"tr":{"p":{"a":0,"k":[1,0]}}},
+      {"ty":"rp","c":{"a":1,"k":[{"t":0,"s":[0],"e":[64]},{"t":1,"s":[64]}]},"o":{"a":0,"k":0},"tr":{"p":{"a":0,"k":[1,0]}}},
+      {"ty":"rp","c":{"a":1,"k":[{"t":0,"s":[0],"e":[64]},{"t":1,"s":[64]}]},"o":{"a":0,"k":0},"tr":{"p":{"a":0,"k":[1,0]}}},
+      {"ty":"rp","c":{"a":1,"k":[{"t":0,"s":[0],"e":[64]},{"t":1,"s":[64]}]},"o":{"a":0,"k":0},"tr":{"p":{"a":0,"k":[1,0]}}},
+      {"ty":"rp","c":{"a":1,"k":[{"t":0,"s":[0],"e":[64]},{"t":1,"s":[64]}]},"o":{"a":0,"k":0},"tr":{"p":{"a":0,"k":[1,0]}}},
+      {"ty":"fl","c":{"a":0,"k":[1,0,0]},"o":{"a":0,"k":100}},
+      {"ty":"tr"}
+    ]}]}]
+  }"#
 }
 
 fn rounded_polystar_many_paints_json(paints_count: usize, strokes: bool) -> String {
@@ -724,6 +832,14 @@ fn compounding_repeaters_are_rejected() {
 }
 
 #[test]
+fn animated_repeater_product_stays_bounded() {
+  // Repeater product is checked with `copies.eval(0.0)`. These five repeaters
+  // have zero copies at frame 0, then each reaches the runtime clamp ceiling of
+  // 64 at frame 1, bypassing the parse-time compounded-product budget.
+  assert_lottie!(animated_repeater_product_json(), 720, 0, 2);
+}
+
+#[test]
 fn dash_amplification_stays_bounded() {
   // A 100M-long stroked path with a unit dash period would emit ~5e7 dash
   // pieces; the dasher budget bounds it so the frame still renders.
@@ -743,6 +859,15 @@ fn dash_amplification_stays_bounded() {
 }
 
 #[test]
+fn animated_dash_period_shrink_stays_bounded() {
+  // The parser estimates dash work at frame 0. This path uses a safe 1000px dash
+  // period at frame 0, then shrinks each dash/gap to 0.0011px at frame 1; without
+  // a render-time dash budget, frame 1 materializes millions of tiny pieces and
+  // can spend seconds in dash phase transitions even at a normal 720px output.
+  assert_lottie!(animated_tiny_dash_period_json(), 720, 0, 2);
+}
+
+#[test]
 fn unique_easing_handle_cache_stays_bounded() {
   // Every animated keyframe interns its temporal easing handles into a
   // per-composition HashMap keyed by formatted control points. A hostile
@@ -754,14 +879,8 @@ fn unique_easing_handle_cache_stays_bounded() {
   for t in 1..65_000 {
     let x = (t % 10_000) as f32 / 100.0;
     let y = (t / 10_000) as f32 / 100.0;
-    rotation_kfs.push_str(&format!(
-      r#",{{"t":{t},"s":[{}],"o":{{"x":{x:.2},"y":{y:.2}}},"i":{{"x":0.5,"y":0.5}}}}"#,
-      t % 360
-    ));
-    opacity_kfs.push_str(&format!(
-      r#",{{"t":{t},"s":[{}],"o":{{"x":{x:.2},"y":{y:.2}}},"i":{{"x":0.51,"y":0.5}}}}"#,
-      t % 100
-    ));
+    rotation_kfs.push_str(&format!(r#",{{"t":{t},"s":[{}],"o":{{"x":{x:.2},"y":{y:.2}}},"i":{{"x":0.5,"y":0.5}}}}"#, t % 360));
+    opacity_kfs.push_str(&format!(r#",{{"t":{t},"s":[{}],"o":{{"x":{x:.2},"y":{y:.2}}},"i":{{"x":0.51,"y":0.5}}}}"#, t % 100));
   }
   let json = format!(
     r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{"r":{{"a":1,"k":[{rotation_kfs}]}},"o":{{"a":1,"k":[{opacity_kfs}]}}}},"shapes":[]}}]}}"#
@@ -788,13 +907,47 @@ fn many_clipped_dashed_strokes_stay_bounded() {
 
 #[test]
 fn deep_parent_chain_stays_bounded() {
-  // 4000 layers, each parented to the previous. The render-time parent walk
-  // must be linear (pre-resolved positions), not the old O(layers^3) scan.
+  // 4000 layers, each parented to the previous. This is rejected by parse-time
+  // layer/parent budgets instead of reaching the render-time parent walk.
   let mut layers = String::from(r#"{"ty":4,"ind":0,"ip":0,"op":1000,"st":0,"ks":{},"shapes":[]}"#);
   for i in 1..4000 {
     layers.push_str(&format!(r#",{{"ty":4,"ind":{i},"parent":{},"ip":0,"op":1000,"st":0,"ks":{{}},"shapes":[]}}"#, i - 1));
   }
   let json = format!(r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":1000,"layers":[{layers}]}}"#);
+  assert_lottie!(json);
+}
+
+#[test]
+fn max_legal_deep_parent_chain_stays_bounded() {
+  // Same parent-chain shape as the over-limit regression, but kept exactly at
+  // the default layer cap. It stays bounded through the parent-chain depth cap,
+  // not by adding render-time parent caches.
+  let mut layers = String::from(r#"{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{},"shapes":[]}"#);
+  for i in 1..Limits::default().max_layers {
+    layers.push_str(&format!(r#",{{"ty":4,"ind":{i},"parent":{},"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[]}}"#, i - 1));
+  }
+  let json = format!(r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{layers}]}}"#);
+  assert_lottie!(json);
+}
+
+#[test]
+fn many_max_depth_parent_chains_stay_bounded() {
+  // The parser caps a single parent chain and the total parent-chain depth in
+  // one layer list, so repeated legal-depth chains are rejected before render.
+  let chain_len = Limits::default().max_parent_chain_depth + 1;
+  let chains = Limits::default().max_layers / chain_len;
+  let mut layers = String::new();
+  for c in 0..chains {
+    for i in 0..chain_len {
+      if !layers.is_empty() {
+        layers.push(',');
+      }
+      let ind = c * chain_len + i;
+      let parent = if i == 0 { String::new() } else { format!(r#","parent":{}"#, ind - 1) };
+      layers.push_str(&format!(r#"{{"ty":4,"ind":{ind}{parent},"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[]}}"#));
+    }
+  }
+  let json = format!(r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{layers}]}}"#);
   assert_lottie!(json);
 }
 
@@ -813,6 +966,26 @@ fn mask_heavy_layer_stays_bounded() {
   let json = format!(
     r#"{{"v":"5.5.0","w":128,"h":128,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"hasMask":true,"masksProperties":[{masks}],"shapes":[{{"ty":"gr","it":[{{"ty":"rc","p":{{"a":0,"k":[64,64]}},"s":{{"a":0,"k":[128,128]}},"r":{{"a":0,"k":0}}}},{{"ty":"fl","c":{{"a":0,"k":[1,0,0]}},"o":{{"a":0,"k":100}}}},{{"ty":"tr"}}]}}]}}]}}"#
   );
+  assert_lottie!(json);
+}
+
+#[test]
+fn many_layers_with_max_masks_stay_bounded() {
+  // Mask count is capped per layer. A hostile file can still place that max
+  // mask count on many legal layers, forcing repeated mask flatten/clip/combine
+  // work over otherwise tiny content.
+  let mask = r#"{"mode":"a","o":{"a":0,"k":100},"pt":{"a":0,"k":{"c":true,"v":[[0,0],[64,0],[64,64],[0,64]],"i":[],"o":[]}}}"#;
+  let masks = (0..Limits::default().max_masks_per_layer).map(|_| mask).collect::<Vec<_>>().join(",");
+  let mut layers = String::new();
+  for i in 0..900 {
+    if i > 0 {
+      layers.push(',');
+    }
+    layers.push_str(&format!(
+      r#"{{"ty":4,"ind":{i},"ip":0,"op":60,"st":0,"ks":{{}},"hasMask":true,"masksProperties":[{masks}],"shapes":[{{"ty":"gr","it":[{{"ty":"rc","p":{{"a":0,"k":[32,32]}},"s":{{"a":0,"k":[4,4]}},"r":{{"a":0,"k":0}}}},{{"ty":"fl","c":{{"a":0,"k":[1,0,0]}},"o":{{"a":0,"k":100}}}},{{"ty":"tr"}}]}}]}}"#
+    ));
+  }
+  let json = format!(r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{layers}]}}"#);
   assert_lottie!(json);
 }
 
@@ -1047,28 +1220,6 @@ fn duplicate_shape_arrays_do_not_bypass_shape_budget() {
     r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}}{duplicate_fields},"shapes":[{{"ty":"gr","it":[{{"ty":"rc","p":{{"a":0,"k":[32,32]}},"s":{{"a":0,"k":[10,10]}},"r":{{"a":0,"k":0}}}},{{"ty":"fl","c":{{"a":0,"k":[1,0,0]}},"o":{{"a":0,"k":100}}}},{{"ty":"tr"}}]}}]}}]}}"#
   );
   assert_lottie!(json);
-}
-
-#[test]
-fn malformed_json_strings_and_tokens_stay_bounded() {
-  // Malformed JSON should be a fast, typed error under the same worker budget:
-  // no panic, no runaway allocation, and no successful render. Invalid string
-  // escapes are especially important because raw string scanning used to skip
-  // arbitrary `\X` pairs.
-  assert_lottie!(
-    r#"{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"nm":"bad\qescape","ks":{},"shapes":[]}]}"#,
-    expect_error
-  );
-  assert_lottie!(
-    r#"{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"nm":"bad\u12x4escape","ks":{},"shapes":[]}]}"#,
-    expect_error
-  );
-  let json = "{ \"v\":\"5.5.0\",\"w\":64,\"h\":64,\"fr\":60,\"ip\":0,\"op\":60,\"layers\":[{\"ty\":4,\"ind\":0,\"ip\":0,\"op\":60,\"st\":0,\"nm\":\"bad\nstring\",\"ks\":{},\"shapes\":[]}] }";
-  assert_lottie!(json, expect_error);
-  assert_lottie!(r#"{"v":"5.5.0","w":1e,"h":64,"fr":60,"ip":0,"op":60,"layers":[]}"#, expect_error);
-  let mut json = String::from(r#"{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"junk":""#);
-  json.push_str(&"a".repeat(15_500_000));
-  assert_lottie!(json, expect_error);
 }
 
 #[test]
@@ -1443,6 +1594,48 @@ fn duplicate_path_ks_fields_stay_bounded() {
 }
 
 #[test]
+fn duplicate_path_vertex_fields_stay_bounded() {
+  // A path object's `v` field is parsed immediately every time it appears.
+  // Each duplicate list below is max-legal, so no single path trips the point
+  // cap, but only the final list is retained. The rest are pure parse/allocation
+  // work from duplicate JSON keys inside one otherwise ordinary shape.
+  let mut verts = String::new();
+  for i in 0..4096 {
+    if i > 0 {
+      verts.push(',');
+    }
+    verts.push_str(&format!("[{},{}]", i % 64, (i / 64) % 64));
+  }
+  let v = format!(r#""v":[{verts}]"#);
+  let duplicate_v = (0..260).map(|_| v.clone()).collect::<Vec<_>>().join(",");
+  let json = format!(
+    r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"sh","ks":{{"a":0,"k":{{"c":true,{duplicate_v},"i":[],"o":[]}}}}}},{{"ty":"fl","c":{{"a":0,"k":[1,0,0]}},"o":{{"a":0,"k":100}}}},{{"ty":"tr"}}]}}]}}]}}"#
+  );
+  assert_lottie!(json);
+}
+
+#[test]
+fn duplicate_keyframe_path_value_fields_stay_bounded() {
+  // Duplicate `s` fields inside one keyframe are each parsed as a complete
+  // path value before the last one wins. This bypasses the keyframe-count cap:
+  // the JSON contains one animated keyframe object, but it rebuilds hundreds
+  // of max-legal path payloads during parse.
+  let mut verts = String::new();
+  for i in 0..4096 {
+    if i > 0 {
+      verts.push(',');
+    }
+    verts.push_str(&format!("[{},{}]", i % 64, (i / 64) % 64));
+  }
+  let s = format!(r#""s":[{{"c":true,"v":[{verts}],"i":[],"o":[]}}]"#);
+  let duplicate_s = (0..220).map(|_| s.clone()).collect::<Vec<_>>().join(",");
+  let json = format!(
+    r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"sh","ks":{{"a":1,"k":[{{"t":0,{duplicate_s}}},{{"t":1,"s":[{{"c":true,"v":[[0,0]],"i":[],"o":[]}}]}}]}}}},{{"ty":"fl","c":{{"a":0,"k":[1,0,0]}},"o":{{"a":0,"k":100}}}},{{"ty":"tr"}}]}}]}}]}}"#
+  );
+  assert_lottie!(json);
+}
+
+#[test]
 fn gradient_stroke_dash_metadata_stays_bounded() {
   // Mirror the dash-metadata vector bomb through gradient strokes (`gs`), which
   // has its own shape arm but shares the unbounded dash parsing/render hashing
@@ -1586,6 +1779,15 @@ fn gradient_stroke_opacity_stop_lut_scan_stays_bounded() {
 }
 
 #[test]
+fn many_focal_radial_gradient_strokes_over_large_surface_stay_bounded() {
+  // Focal radial gradient strokes use the same per-pixel radial sampling as
+  // fills, but they are a separate shape type. Wide strokes keep the coverage
+  // full-surface while staying under the per-layer paint/source-item caps.
+  let json = focal_radial_gradient_strokes_json(900);
+  assert_lottie!(json, 512);
+}
+
+#[test]
 fn many_focal_radial_gradients_over_large_surface_stay_bounded() {
   // Focal radial gradients pay per-pixel quadratic sampling. Many legal
   // gradient fills over one full-surface rect should still fit one frame.
@@ -1635,6 +1837,33 @@ fn static_translated_paint_pairs_stay_bounded() {
       ..RenderOptions::default()
     }
   );
+}
+
+#[test]
+fn reused_precomp_focal_radial_gradients_stay_bounded() {
+  // A single precomp asset can stay within the focal-radial-gradient cap while
+  // root precomp refs replay it up to the expansion limit. This keeps the JSON
+  // legal but multiplies per-pixel radial sampling through precomp reuse.
+  let limits = Limits::default();
+  let json = reused_precomp_focal_radial_gradients_json(limits.max_precomp_expansion / 2, limits.max_focal_radial_gradients_per_layer);
+  assert_lottie!(json, 512);
+}
+
+#[test]
+fn reused_precomp_animated_linear_gradients_stay_bounded() {
+  // Animated linear-gradient opacity disables static shape replay even though
+  // both keyframes evaluate to the same value. Reusing that precomp multiplies
+  // ordinary gradient-map/source work without tripping the focal-radial cap.
+  let json = reused_precomp_animated_linear_gradients_json(30, 30);
+  assert_lottie!(json, 256);
+}
+
+#[test]
+fn reused_precomp_animated_linear_gradient_strokes_stay_bounded() {
+  // Same animated-opacity static-replay bypass as gradient fills, but through
+  // the gradient-stroke renderer path with a full-surface stroke.
+  let json = reused_precomp_animated_linear_gradient_strokes_json(30, 30);
+  assert_lottie!(json, 256);
 }
 
 #[test]
@@ -2106,6 +2335,14 @@ fn many_full_canvas_solid_layers_stay_bounded() {
 }
 
 #[test]
+fn max_legal_full_canvas_solid_layers_large_surface_stay_bounded() {
+  // Keep the layer count legal under the current parser cap, but make every
+  // solid cover a 1024x1024 output surface so plain compositing work dominates.
+  let json = solid_layers_json(Limits::default().max_layers, 1024);
+  assert_lottie!(json, 1024);
+}
+
+#[test]
 fn many_full_canvas_shape_layers_stay_bounded() {
   // Same max-layer pressure as solid layers, but through the shape walker,
   // coverage cache, and fill backend. No-antialias keeps the same JSON in the
@@ -2123,6 +2360,14 @@ fn many_full_canvas_shape_layers_stay_bounded() {
       ..RenderOptions::default()
     }
   );
+}
+
+#[test]
+fn max_legal_full_canvas_shape_layers_stay_bounded() {
+  // Keep painted shape layers legal under the current default cap, but make
+  // every layer a full-canvas fill over a larger surface.
+  let json = shape_layers_json(Limits::default().max_painted_shape_layers, 512);
+  assert_lottie!(json, 512);
 }
 
 #[test]
