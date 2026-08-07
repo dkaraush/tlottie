@@ -536,17 +536,19 @@ impl RenderCtx<'_> {
         // contours costs more than the saved walk. Keep the exact-context
         // path there; this cache targets the small-icon regime where the
         // retained-state gap was measured.
-        let translation_parametric = clip.is_empty() && layer_static && width.max(height) <= 320;
-        let mut canonical_m = m;
-        if translation_parametric {
-          canonical_m.tx = 0.0;
-          canonical_m.ty = 0.0;
-        }
-        let static_context = layer_static.then(|| StaticContext::new(self.comp, layer, canonical_m, content_opacity, color_override, width, height, antialias, self.curve_tolerance, clip));
-        let replay_translation = if translation_parametric { (m.tx, m.ty) } else { (0.0, 0.0) };
+        // Capture always runs at the real device matrix, bounded.
+        //
+        // Capturing at a canonical origin instead, so that a pure
+        // translation became a replay parameter, forced the recording pass
+        // to run `unbounded`: clipping cannot be baked in when the position
+        // is meant to vary. That handed the rasteriser unclipped geometry,
+        // which no other frame ever produces, and dropped scanlines on the
+        // recording frame — a visible hole in 31 of 260 sampled Telegram
+        // fixtures. It also measured flat, so the reuse was not worth it.
+        let static_context = layer_static.then(|| StaticContext::new(self.comp, layer, m, content_opacity, color_override, width, height, antialias, self.curve_tolerance, clip));
         let signature = static_context.as_ref().map(StaticContext::signature);
         if let (Some(context), Some(signature)) = (static_context.as_ref(), signature) {
-          if static_jobs.replay(signature, context, replay_translation.0, replay_translation.1, renderer) {
+          if static_jobs.replay(signature, context, 0.0, 0.0, renderer) {
             return Ok(());
           }
         }
@@ -560,9 +562,9 @@ impl RenderCtx<'_> {
           height,
           antialias,
           color_override,
-          unbounded: record && translation_parametric,
+          unbounded: false,
         };
-        let (arena, pending) = walker.walk_shapes(&layer.shapes, if record { canonical_m } else { m }, content_opacity, 0)?;
+        let (arena, pending) = walker.walk_shapes(&layer.shapes, m, content_opacity, 0)?;
         let mut recorded = record.then(|| Vec::with_capacity(pending.len()));
         walker.collect_shape_jobs(&arena, &pending, renderer, recorded.as_mut(), !record);
         for (contour, _) in arena {
@@ -570,7 +572,7 @@ impl RenderCtx<'_> {
         }
         if let (Some(context), Some(signature), Some(jobs)) = (static_context, signature, recorded) {
           for job in &jobs {
-            job.replay(replay_translation.0, replay_translation.1, renderer);
+            job.replay(0.0, 0.0, renderer);
           }
           static_jobs.insert(signature, context, jobs);
         }
