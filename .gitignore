@@ -1,6 +1,5 @@
 .DS_Store
 md/
-!md/VULKAN.md
 .idea/
 target/
 __pycache__/
