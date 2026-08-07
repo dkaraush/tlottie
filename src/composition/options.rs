@@ -63,6 +63,36 @@ pub struct SourceColorReplacement {
   pub target_color: u32,
 }
 
+/// Byte order of the premultiplied pixels a renderer writes.
+///
+/// The blend pipeline itself is channel-order agnostic — every stage reads a
+/// channel at bit N and writes it back at bit N — so the order is applied
+/// once, by pre-swapping the parsed model's colors. Rendering therefore costs
+/// exactly the same in either order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ChannelOrder {
+  /// `0xAABBGGRR` words: `[R, G, B, A]` bytes in little-endian memory.
+  /// Matches Android's `Bitmap.Config.ARGB_8888`.
+  #[default]
+  Rgba = 0,
+  /// `0xAARRGGBB` words: `[B, G, R, A]` bytes in little-endian memory.
+  /// Matches Qt's `QImage::Format_ARGB32_Premultiplied`, Direct2D /
+  /// DXGI `B8G8R8A8_UNORM`, and Cairo's `CAIRO_FORMAT_ARGB32` — i.e. what
+  /// desktop compositors take without a conversion pass.
+  Bgra = 1,
+}
+
+impl ChannelOrder {
+  pub(crate) fn from_u32(value: u32) -> Option<Self> {
+    match value {
+      0 => Some(Self::Rgba),
+      1 => Some(Self::Bgra),
+      _ => None,
+    }
+  }
+}
+
 /// Options applied while a [`crate::Composition`] is parsed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParseOptions {
@@ -72,4 +102,7 @@ pub struct ParseOptions {
   pub layer_color_replacements: Vec<LayerColorReplacement>,
   /// Exact source-color replacements, resolved once during parsing.
   pub source_color_replacements: Vec<SourceColorReplacement>,
+  /// Byte order of the rendered pixels. Applied after every color
+  /// replacement, so replacement colors are still matched as `0xAARRGGBB`.
+  pub channel_order: ChannelOrder,
 }

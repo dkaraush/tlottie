@@ -2116,7 +2116,7 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
     apply_layer_replacements(&mut asset.layers, &options.layer_color_replacements);
   }
 
-  Ok(Composition {
+  let mut composition = Composition {
     width: width as u32,
     height: height as u32,
     frame_rate: frame_rate as f32,
@@ -2125,7 +2125,14 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
     static_content,
     layers,
     assets,
-  })
+    channel_order: options.channel_order,
+  };
+  // Last step, deliberately: color replacements above match and supply
+  // `0xAARRGGBB`, so the swap has to happen after they have been resolved.
+  if options.channel_order == crate::composition::options::ChannelOrder::Bgra {
+    crate::composition::swizzle::swap_red_blue(&mut composition);
+  }
+  Ok(composition)
 }
 
 #[cfg(test)]

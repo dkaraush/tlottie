@@ -70,6 +70,7 @@ fn empty_comp() -> Composition {
     static_content: false,
     layers: Vec::new(),
     assets: Vec::new(),
+    channel_order: Default::default(),
   }
 }
 

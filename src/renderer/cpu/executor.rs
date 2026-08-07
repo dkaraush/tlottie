@@ -473,7 +473,7 @@ impl RenderCtx<'_> {
             for_rows_boxed(&mut buf_a, w, da, |y, row| {
               let lo = y * w + da.x0;
               if let Some(src_row) = buf_b.get(lo..lo + row.len()) {
-                apply_matte(row, src_row, kind, opacity_byte(src_op) as u8);
+                apply_matte(row, src_row, kind, opacity_byte(src_op) as u8, self.comp.channel_order);
               }
             });
             scratch.put_u32(buf_b);
@@ -798,15 +798,15 @@ pub(crate) fn modulate(pixels: &mut [u32], mask: &[u8]) {
 
 /// Applies a matte source (`src`) onto `dst` premultiplied pixels.
 /// kind: 1 alpha, 2 inverted alpha, 3 luma, 4 inverted luma.
-pub(crate) fn apply_matte(dst: &mut [u32], src: &[u32], kind: u8, source_opacity: u8) {
+pub(crate) fn apply_matte(dst: &mut [u32], src: &[u32], kind: u8, source_opacity: u8, order: crate::ChannelOrder) {
   for (d, &s) in dst.iter_mut().zip(src.iter()) {
     let alpha = (s >> 24) & 0xff;
     let scaled_alpha = (alpha * u32::from(source_opacity) + 127) / 255;
     let factor = match kind {
       1 => scaled_alpha,
       2 => 255 - scaled_alpha,
-      3 => luma_premult(s),
-      _ => 255 - luma_premult(s),
+      3 => luma_premult(s, order),
+      _ => 255 - luma_premult(s, order),
     };
     if factor == 255 {
       continue;
@@ -827,20 +827,30 @@ pub(crate) fn apply_matte(dst: &mut [u32], src: &[u32], kind: u8, source_opacity
 /// Luma of a premultiplied pixel, rlottie semantics: unpremultiply, then
 /// Rec.601 weights on the straight color (the matte's own alpha does not
 /// scale the luma).
-fn luma_premult(p: u32) -> u32 {
+///
+/// The ONLY place in the pipeline where a channel's identity matters, since
+/// the Rec.601 weights differ per channel: under [`ChannelOrder::Bgra`] the
+/// low byte holds blue and bits 16..24 hold red, so the two weights trade
+/// places. Everything else blends channels independently and needs no such
+/// knowledge.
+fn luma_premult(p: u32, order: crate::ChannelOrder) -> u32 {
   let a = (p >> 24) & 0xff;
   if a == 0 {
     return 0;
   }
-  let mut r = p & 0xff;
+  let mut low = p & 0xff;
   let mut g = (p >> 8) & 0xff;
-  let mut b = (p >> 16) & 0xff;
+  let mut high = (p >> 16) & 0xff;
   if a != 255 {
-    r = (r * 255) / a;
+    low = (low * 255) / a;
     g = (g * 255) / a;
-    b = (b * 255) / a;
+    high = (high * 255) / a;
   }
-  ((r * 299 + g * 587 + b * 114) / 1000).min(255)
+  let (low_weight, high_weight) = match order {
+    crate::ChannelOrder::Rgba => (299, 114),
+    crate::ChannelOrder::Bgra => (114, 299),
+  };
+  ((low * low_weight + g * 587 + high * high_weight) / 1000).min(255)
 }
 
 /// Composites premultiplied `src` over `dst` with a global opacity factor.

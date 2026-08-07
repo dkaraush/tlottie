@@ -73,6 +73,7 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs<'_>, String> {
         }
       }
       "--alpha-only" | "--single-color" => options.alpha_only = true,
+      "--bgra" => parse_options.channel_order = tlottie::ChannelOrder::Bgra,
       "--fitz" => parse_options.fitz_modifier = parse_fitz(args.next().ok_or("--fitz requires a value")?)?,
       "--layer-color" => parse_options
         .layer_color_replacements
@@ -179,6 +180,7 @@ fn bench_cmd(args: &[String]) -> ExitCode {
         options.curve_tolerance = value;
       }
       "--alpha-only" | "--single-color" => options.alpha_only = true,
+      "--bgra" => parse_options.channel_order = tlottie::ChannelOrder::Bgra,
       "--fitz" => {
         let Some(value) = args.next() else {
           eprintln!("bench: --fitz requires a value");
