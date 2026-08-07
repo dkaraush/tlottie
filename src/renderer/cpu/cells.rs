@@ -124,14 +124,29 @@ impl CellRaster {
     let exr = rx >> PIX_B;
     let dx_t = i64::from(rx - lx); // > 0 (distinct columns)
     let dy_t = i64::from(ry - ly);
-    // y at the first right boundary, then exact incremental steps.
+    // y at the first right boundary, then exact incremental steps. Euclidean
+    // floor division by the positive divisor `dx_t`, computed as trunc `/`+`%`
+    // (one idiv pair per dividend) plus a negative-remainder fixup — bit-exact
+    // with `div_euclid`/`rem_euclid` (profiled: div_euclid is the sweep
+    // walk hotspot at 720px).
     let bx0 = (exl + 1) << PIX_B;
     let num0 = i64::from(bx0 - lx) * dy_t;
-    let mut ycur = ly + num0.div_euclid(dx_t) as i32;
-    let mut rem = num0.rem_euclid(dx_t);
+    let mut tq = num0 / dx_t;
+    let mut tr = num0 % dx_t;
+    if tr < 0 {
+      tq -= 1;
+      tr += dx_t;
+    }
+    let mut ycur = ly + tq as i32;
+    let mut rem = tr;
     let stepnum = i64::from(ONE) * dy_t;
-    let q = stepnum.div_euclid(dx_t) as i32;
-    let r = stepnum.rem_euclid(dx_t);
+    let mut q = stepnum / dx_t;
+    let mut r = stepnum % dx_t;
+    if r < 0 {
+      q -= 1;
+      r += dx_t;
+    }
+    let q = q as i32;
     // First column: enters at lx, exits at the boundary (fx_b = ONE).
     let fx_a = lx - (exl << PIX_B);
     let d0 = ycur - ly;
