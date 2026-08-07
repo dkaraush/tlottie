@@ -56,6 +56,7 @@ DEFAULT_OUT = ROOT / "target" / "benchmark"
 DEFAULT_SIZES = (64, 320, 720)
 DEFAULT_RENDERERS = ("tlottie", "rlottie", "rlottie_2019", "rlottie_2019_patched", "thorvg")
 RENDERERS = DEFAULT_RENDERERS + ("tlottie-vulkan",)
+TLOTTIE_VERSION_NAMES: tuple[str, ...] = ()
 RLOTTIE_RENDERERS = ("rlottie", "rlottie_2019", "rlottie_2019_patched")
 RENDERER_URLS = {
     "tlottie": "https://github.com/dkaraush/tlottie",
@@ -88,6 +89,31 @@ LIBS = {
     "thorvg": PROJECT_DIRS["thorvg"] / "build-release" / "src" / f"libthorvg-1{LIB_SUFFIX}",
     "tlottie-vulkan": ROOT / "target" / "release" / "tlottie-cli",
 }
+
+
+def add_tlottie_versions(versions: list[str]) -> tuple[str, ...]:
+    """Registers extra tlottie builds (from `--tlottie-version NAME=PATH`) as
+    renderers in `LIBS`/`RENDERERS`. Returns the added renderer names.
+
+    PATH may be a source tree (its `target/release/libtlottie.so` is used) or
+    a direct path to a `libtlottie.so`. `--skip-build` must be used: extra
+    builds are never compiled by this script, only validated for existence.
+    """
+    global RENDERERS, TLOTTIE_VERSION_NAMES
+    added: list[str] = []
+    for spec in versions:
+        name, _, path = spec.partition("=")
+        if not path:
+            raise SystemExit(f"--tlottie-version expects NAME=PATH, got: {spec!r}")
+        if not name or name in LIBS:
+            raise SystemExit(f"--tlottie-version name {name!r} is empty or already a renderer")
+        tree = Path(path)
+        lib = tree / "target" / "release" / f"libtlottie{LIB_SUFFIX}" if tree.is_dir() else tree
+        LIBS[name] = lib
+        RENDERERS = RENDERERS + (name,)
+        added.append(name)
+    TLOTTIE_VERSION_NAMES = tuple(added)
+    return tuple(added)
 
 ANDROID_DEFAULT_OUT = ROOT / "target" / "benchmark-android"
 ANDROID_DEFAULT_DEVICE_ROOT = "/data/local/tmp/tgs_dump"
@@ -425,11 +451,20 @@ if platform.system() == "Darwin":
 def process_memory_mb(pid: int) -> float:
     """Return the process memory metric used by the benchmark, in MiB.
 
+    Both backends report the memory attributable to one (renderer, canvas-size)
+    worker process so renderers compare apples-to-apples.
+
     macOS's resident size includes shared/mapped pages and is a misleading
     comparison between native libraries.  ``ri_phys_footprint`` is the kernel's
     accounting of the process's attributable physical memory and is the value
-    Activity Monitor uses for its Memory column.  Linux has no direct
-    equivalent available here, so retain current RSS there.
+    Activity Monitor uses for its Memory column.
+
+    Linux has no kernel ``footprint`` equivalent, so the fair counterpart is the
+    process's own resident high-water mark (``VmHWM`` in ``/proc/PID/status``),
+    which is the true peak working set of the isolated renderer process rather than a
+    single instantaneous ``VmRSS`` sample.  ``max`` over the sampled points then
+    equals the real peak (the watermark only ever grows), matching the macOS
+    attribution intent.
 
     The historical ``rss_mb`` helper and raw-output ``*_rss_*`` aliases are
     retained for compatibility with existing benchmark consumers.
@@ -441,7 +476,7 @@ def process_memory_mb(pid: int) -> float:
         return 0.0
     try:
         for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-            if line.startswith("VmRSS:"):
+            if line.startswith("VmHWM:"):
                 return float(line.split()[1]) / 1024.0
     except OSError:
         pass
@@ -1501,7 +1536,7 @@ def init_worker(
     _WORKER_ALPHA_ONLY = alpha_only
     for renderer in renderers:
         lib = Path(libs[renderer])
-        if renderer == "tlottie":
+        if renderer == "tlottie" or renderer in TLOTTIE_VERSION_NAMES:
             _WORKER_RENDERERS[renderer] = Tlottie(lib, curve_tolerance, alpha_only)
         elif renderer == "tlottie-vulkan":
             _WORKER_RENDERERS[renderer] = TlottieVulkan(lib, curve_tolerance, alpha_only)
@@ -1636,6 +1671,7 @@ def run_size_batch(
     curve_tolerance: float,
     alpha_only: bool,
     progress: ProgressDisplay | None = None,
+    label: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     sampler = EnergySampler()
     sampler.start()
@@ -1646,6 +1682,7 @@ def run_size_batch(
     progress_every = progress_interval(total)
     owns_progress = progress is None
     progress = progress or ProgressDisplay(f"measure {renderers[0]} {size}px", total)
+    measure_label = label or renderers[0]
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=jobs,
         initializer=init_worker,
@@ -1672,7 +1709,7 @@ def run_size_batch(
                 accuracy_rows.append(accuracy_row)
             if progress.interactive:
                 progress.advance(
-                    f"measure {renderers[0]} {size}px",
+                    f"measure {measure_label} {size}px",
                     display_file(files[done - 1], root),
                 )
             elif should_report_progress(done, total, progress_every):
@@ -3995,6 +4032,19 @@ def main(argv: list[str] | None = None) -> int:
             "or tlottie,rlottie,rlottie_2019,rlottie_2019_patched,thorvg on Android"
         ),
     )
+    ap.add_argument(
+        "--tlottie-version",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help=(
+            "add an extra tlottie build as its own renderer, measured interleaved "
+            "with the primary tlottie in the same run (for A/B of two versions). "
+            "PATH is either the source tree whose target/release/libtlottie.so to use, "
+            "or the .so directly. Repeatable; each NAME becomes a renderer referenceable "
+            "in --renderers (e.g. --tlottie-version=avx=/tmp/tl-avx)"
+        ),
+    )
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--no-open", action="store_true", help="do not open benchmark.html")
     ap.add_argument("--device-root", help="Android fixture root (auto-detected by default)")
@@ -4017,6 +4067,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--sample is currently Android-only")
 
     args.renderers = args.renderers or ",".join(DEFAULT_RENDERERS)
+    tlottie_versions = add_tlottie_versions(args.tlottie_version)
     renderers = tuple(r.strip() for r in args.renderers.split(",") if r.strip())
     bad = [r for r in renderers if r not in RENDERERS]
     if bad:
@@ -4098,11 +4149,20 @@ def main(argv: list[str] | None = None) -> int:
                 f"{args.reps} reps, isolated renderers={','.join(renderers)}",
                 flush=True,
             )
-        for renderer in renderers:
+        # A tlottie A/B (primary + --tlottie-version siblings) is measured in a
+        # single batch so all of them render the same files back-to-back in the
+        # same workers — interleaved per file per rep, the way tlottie is
+        # compared against rlottie. Non-tlottie renderers keep one batch each.
+        tlottie_family = ["tlottie"] if "tlottie" in renderers else []
+        tlottie_family += [r for r in renderers if r in TLOTTIE_VERSION_NAMES]
+        batches = [tuple(tlottie_family)] if tlottie_family else []
+        batches += [(r,) for r in renderers if r != "tlottie" and r not in TLOTTIE_VERSION_NAMES]
+        for batch in batches:
+            label = ",".join(batch)
             if not overall_progress.interactive:
-                print(f"   renderer={renderer}", flush=True)
+                print(f"   renderer={label}", flush=True)
             size_rows, _ = run_size_batch(
-                (renderer,),
+                batch,
                 size,
                 files,
                 args.input,
@@ -4116,6 +4176,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.curve_tolerance,
                 args.alpha_only,
                 overall_progress,
+                label=label,
             )
             all_rows.extend(size_rows)
 

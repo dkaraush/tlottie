@@ -40,16 +40,26 @@ struct CachedJob {
 }
 
 impl CachedJob {
-  fn replay(&self, tx: f32, ty: f32, renderer: &mut impl FrameRenderer) {
+  fn replay(&self, tx: f32, ty: f32, layer_alpha: f32, renderer: &mut impl FrameRenderer) {
     let key = translated_key(self.key, tx, ty);
     let geometry = Geometry::translated(&self.contours, key, tx, ty);
     match &self.paint {
-      CachedPaint::Solid(paint) => renderer.draw(geometry, Paint::Solid(*paint)),
+      CachedPaint::Solid(paint) => {
+        let mut paint = *paint;
+        // An animated layer opacity recorded a 1.0 paint; re-apply the
+        // current fraction (the coverage is geometry-only, so this stays a cheap
+        // per-frame solid blend over the covered pixels — byte-exact fold).
+        if layer_alpha < 1.0 {
+          paint.opacity = layer_alpha;
+        }
+        renderer.draw(geometry, Paint::Solid(paint));
+      }
       CachedPaint::Gradient(paint) => {
         let mut paint = paint.clone();
         paint.transform.tx -= paint.transform.a * tx + paint.transform.c * ty;
         paint.transform.ty -= paint.transform.b * tx + paint.transform.d * ty;
         paint.source_key = translated_key(paint.source_key, tx, ty);
+        paint.alpha = opacity_byte(layer_alpha) as u8;
         renderer.draw(geometry, Paint::Gradient(&paint));
       }
     }
@@ -82,11 +92,14 @@ struct StaticContext {
   antialias: bool,
   curve_tolerance: u32,
   clip: Vec<[u32; 8]>,
+  /// Layer opacity is animated: the paint is frozen at 100% and the current
+  /// frame's opacity is re-applied at replay.
+  dynamic: bool,
 }
 
 impl StaticContext {
   #[allow(clippy::too_many_arguments)]
-  fn new(comp: &Composition, layer: &Layer, matrix: Mat2x3, opacity: f32, color: Option<Color>, width: usize, height: usize, antialias: bool, curve_tolerance: f32, clip: &ClipQuad) -> Self {
+  fn new(comp: &Composition, layer: &Layer, matrix: Mat2x3, opacity: f32, color: Option<Color>, width: usize, height: usize, antialias: bool, curve_tolerance: f32, clip: &ClipQuad, dynamic: bool) -> Self {
     let color = match color {
       Some(color) => [1, color.r.to_bits(), color.g.to_bits(), color.b.to_bits(), color.a.to_bits()],
       None => [0; 5],
@@ -116,6 +129,7 @@ impl StaticContext {
           ]
         })
         .collect(),
+      dynamic,
     }
   }
 
@@ -165,6 +179,7 @@ impl PartialEq for StaticContext {
       && self.antialias == other.antialias
       && self.curve_tolerance == other.curve_tolerance
       && self.clip == other.clip
+      && self.dynamic == other.dynamic
   }
 }
 
@@ -172,6 +187,9 @@ struct CachedLayerJobs {
   context: StaticContext,
   jobs: Vec<CachedJob>,
   bytes: usize,
+  /// Jobs were painted frozen at 100% because the layer opacity animates; every
+  /// replay must re-apply the current frame's layer opacity on top.
+  apply_layer_alpha: bool,
 }
 
 #[derive(Default)]
@@ -199,7 +217,7 @@ impl StaticJobCache {
     is_static
   }
 
-  fn replay(&mut self, signature: u128, context: &StaticContext, tx: f32, ty: f32, renderer: &mut impl FrameRenderer) -> bool {
+  fn replay(&mut self, signature: u128, context: &StaticContext, tx: f32, ty: f32, layer_alpha: f32, renderer: &mut impl FrameRenderer) -> bool {
     let Some(entry) = self.entries.get(&signature) else {
       return false;
     };
@@ -207,8 +225,11 @@ impl StaticJobCache {
     if entry.context != *context {
       return false;
     }
+    // Frozen-at-100% layers (animated layer opacity) pick up the current frame's
+    // opacity here; baked layers replay at 1.0 and keep their paint opacity.
+    let alpha = if entry.apply_layer_alpha { layer_alpha } else { 1.0 };
     for job in &entry.jobs {
-      job.replay(tx, ty, renderer);
+      job.replay(tx, ty, alpha, renderer);
     }
     #[cfg(test)]
     {
@@ -245,7 +266,8 @@ impl StaticJobCache {
       return;
     }
     self.bytes = self.bytes.saturating_add(bytes);
-    self.entries.insert(signature, CachedLayerJobs { context, jobs, bytes });
+    let apply_layer_alpha = context.dynamic;
+    self.entries.insert(signature, CachedLayerJobs { context, jobs, bytes, apply_layer_alpha });
   }
 
   fn reject(&mut self, signature: u128) {
@@ -448,11 +470,13 @@ impl RenderCtx<'_> {
           inherited_color,
           clip,
           precomp_depth,
+          1.0,
+          false,
           renderer,
         )?;
         self.collect_masks(width, height, src, source_matrix, frame, clip, renderer);
         renderer.save_layer();
-        self.collect_layer_content(scratch, static_jobs, width, height, antialias, layer, m, frame, 1.0, inherited_color, clip, precomp_depth, renderer)?;
+        self.collect_layer_content(scratch, static_jobs, width, height, antialias, layer, m, frame, 1.0, inherited_color, clip, precomp_depth, 1.0, false, renderer)?;
         self.collect_masks(width, height, layer, m, frame, clip, renderer);
         renderer.end_layer(Composite::Matte {
           kind,
@@ -479,6 +503,26 @@ impl RenderCtx<'_> {
       if isolate {
         renderer.save_layer();
       }
+      // A single paint can absorb a *constant* layer opacity into its fill and
+      // still replay a static flattened job (byte-exact, baked LUT). When the
+      // layer opacity animates, the folded paint changes every frame and the
+      // static-job cache never hits. Freeze the fill at 100% (constant →
+      // geometry + gradient source stay cached) and re-apply the current alpha on
+      // *every* emission: cache hits, record frames and the deferred loop all
+      // thread `combined_opacity` straight into the paint (SolidPaint.opacity /
+      // GradientPaint.alpha) — no offscreen surface, byte-exact fold.
+      // Small-icon regime: the frozen canonical replay wins there; above 224 the
+      // per-pixel gradient re-composite outweighs the saved walk (measured on
+      // NeonEmoji), so bake the opacity and stay byte-close to baseline.
+      let dynamic_translucent = !isolate
+        && group_opacity < 255
+        && layer.kind == LayerKind::Shape
+        && !layer.transform.opacity.is_static()
+        && layer.transform.geometry_static()
+        && shapes_static(&layer.shapes)
+        && clip.is_empty()
+        && width.max(height) <= 224;
+      let decorrelated_alpha = if dynamic_translucent { combined_opacity } else { 1.0 };
       self.collect_layer_content(
         scratch,
         static_jobs,
@@ -488,10 +532,12 @@ impl RenderCtx<'_> {
         layer,
         m,
         frame,
-        if isolate { 1.0 } else { combined_opacity },
+        if isolate { 1.0 } else if dynamic_translucent { 1.0 } else { combined_opacity },
         inherited_color,
         clip,
         precomp_depth,
+        decorrelated_alpha,
+        dynamic_translucent,
         renderer,
       )?;
       if !layer.masks.is_empty() {
@@ -519,6 +565,8 @@ impl RenderCtx<'_> {
     inherited_color: Option<Color>,
     clip: &ClipQuad,
     precomp_depth: usize,
+    layer_alpha: f32,
+    dynamic_layer: bool,
     renderer: &mut impl FrameRenderer,
   ) -> Result<()> {
     if opacity_byte(content_opacity) == 0 {
@@ -542,15 +590,20 @@ impl RenderCtx<'_> {
           canonical_m.tx = 0.0;
           canonical_m.ty = 0.0;
         }
-        let static_context = layer_static.then(|| StaticContext::new(self.comp, layer, canonical_m, content_opacity, color_override, width, height, antialias, self.curve_tolerance, clip));
+        let static_context = layer_static.then(|| StaticContext::new(self.comp, layer, canonical_m, content_opacity, color_override, width, height, antialias, self.curve_tolerance, clip, dynamic_layer));
         let replay_translation = if translation_parametric { (m.tx, m.ty) } else { (0.0, 0.0) };
         let signature = static_context.as_ref().map(StaticContext::signature);
-        if let (Some(context), Some(signature)) = (static_context.as_ref(), signature) {
-          if static_jobs.replay(signature, context, replay_translation.0, replay_translation.1, renderer) {
-            return Ok(());
-          }
+        let replay_hit = if let (Some(context), Some(signature)) = (static_context.as_ref(), signature) {
+          static_jobs.replay(signature, context, replay_translation.0, replay_translation.1, layer_alpha, renderer)
+        } else {
+          false
+        };
+        if replay_hit {
+          return Ok(());
         }
-        let record = signature.is_some_and(|signature| static_jobs.should_record(signature));
+        // Dynamic layers rebuild and store the frozen canonical job on every miss so
+        // they always emit with this frame's opacity; baked layers defer to the cap.
+        let record = signature.is_some_and(|signature| dynamic_layer || static_jobs.should_record(signature));
         let mut walker = ShapeWalker {
           scratch,
           frame,
@@ -570,7 +623,7 @@ impl RenderCtx<'_> {
         }
         if let (Some(context), Some(signature), Some(jobs)) = (static_context, signature, recorded) {
           for job in &jobs {
-            job.replay(replay_translation.0, replay_translation.1, renderer);
+            job.replay(replay_translation.0, replay_translation.1, if dynamic_layer { layer_alpha } else { 1.0 }, renderer);
           }
           static_jobs.insert(signature, context, jobs);
         }
@@ -725,6 +778,7 @@ impl ShapeWalker<'_> {
               GradientMapKind::Focal { fx, fy, dx, dy, a, r } => GradientKind::Focal { fx, fy, dx, dy, a, r },
             },
             source_key: src_key,
+            alpha: 255,
           };
           if let Some(record) = record.as_deref_mut() {
             record.push(CachedJob {

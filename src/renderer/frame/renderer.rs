@@ -62,6 +62,10 @@ pub struct GradientPaint {
   pub transform: GradientTransform,
   pub kind: GradientKind,
   pub(crate) source_key: u128,
+  /// Extra whole-paint alpha applied at the final source-over (e.g. an
+  /// animated layer opacity deferred out of the frozen LUT). 255 = no-op and
+  /// keeps the legacy bit-exact paths untouched.
+  pub(crate) alpha: u8,
 }
 
 /// Borrowed device-space geometry for one draw operation.

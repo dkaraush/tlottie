@@ -162,6 +162,11 @@ impl Transform {
     self.anchor.is_static() && self.position.is_static() && self.scale.is_static() && self.rotation.is_static() && self.opacity.is_static() && self.skew.is_static() && self.skew_axis.is_static()
   }
 
+  /// True when every geometry track is a constant; opacity may still animate.
+  pub fn geometry_static(&self) -> bool {
+    self.anchor.is_static() && self.position.is_static() && self.scale.is_static() && self.rotation.is_static() && self.skew.is_static() && self.skew_axis.is_static()
+  }
+
   pub fn identity() -> Self {
     Transform {
       anchor: Property::Static(Vec2::ZERO),
