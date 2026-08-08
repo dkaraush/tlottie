@@ -20,7 +20,7 @@
 
 use core::arch::x86_64::{
   _CMP_GE_OQ, _CMP_LT_OQ, _CMP_UNORD_Q, __m512, __m512i, _mm256_setr_epi16, _mm512_add_epi16, _mm512_add_ps, _mm512_and_ps, _mm512_castps_si512, _mm512_castsi128_si512,
-  _mm512_castsi256_si512, _mm512_castsi512_ps, _mm512_castsi512_si256, _mm512_cmpeq_epi32_mask, _mm512_cmp_ps_mask, _mm512_cvtepu8_epi16, _mm512_cvttps_epi32, _mm512_cvtusepi16_epi8,
+  _mm512_castsi256_si512, _mm512_castsi512_ps, _mm512_castsi512_si256, _mm512_cmpeq_epi8_mask, _mm512_cmpeq_epi32_mask, _mm512_cmp_ps_mask, _mm512_cvtepu8_epi16, _mm512_cvttps_epi32, _mm512_cvtusepi16_epi8,
   _mm512_extracti64x4_epi64, _mm512_inserti32x4, _mm512_inserti64x4, _mm512_loadu_si512, _mm512_mask_i32gather_epi32, _mm512_mask_mov_epi32, _mm512_max_epi16, _mm512_max_ps,
   _mm512_min_epi16, _mm512_min_ps, _mm512_mul_ps, _mm512_mullo_epi16, _mm512_set1_epi16, _mm512_set1_epi32, _mm512_set1_ps, _mm512_setr_ps, _mm512_setzero_ps, _mm512_setzero_si512,
   _mm512_shufflehi_epi16, _mm512_shufflelo_epi16, _mm512_sqrt_ps, _mm512_srli_epi16, _mm512_storeu_si512, _mm512_sub_epi16, _mm512_sub_ps, _mm_cvtsi32_si128, _mm_unpacklo_epi8,
@@ -485,5 +485,43 @@ pub(super) fn focal_lut_over_avx512(dst: &mut [u32], lut: &[u32], g0x: f32, g0y:
     let valid = _mm512_cmp_ps_mask::<_CMP_GE_OQ>(det, zero) & _mm512_cmp_ps_mask::<_CMP_GE_OQ>(_mm512_mul_ps(rv, root), zero) & _mm512_cmp_ps_mask::<_CMP_LT_OQ>(abs_ps(root), inf);
     lut_blend_over_k255(chunk, lut, lut_indices(root, valid, scalev));
     kf = _mm512_add_ps(kf, sixteen);
+  }
+}
+
+/// Opaque-source solid fill run detector, 16 pixels/iteration.
+///
+/// `sa == 255` makes full-coverage pixels exactly the source color; a 64-byte
+/// chunk whose bytes are all 0xFF becomes a plain 16-pixel store (`vpmovuswb`
+/// layout is [R,G,B,A]*16 == 64 bytes, so the all-255 coverage test exactly
+/// matches the stored pattern). Chunks with any AA edge fall back to the exact
+/// general kernel, identical to the AVX2/NEON opaque paths.
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512dq,avx512vl")]
+pub(super) fn fill_span_opaque_avx512(dst: &mut [u32], cov: &[u8], color: u32) {
+  let colorv = _mm512_set1_epi32(color as i32);
+  for (dpx, cpx) in dst.chunks_exact_mut(16).zip(cov.chunks_exact(16)) {
+    // SAFETY: chunks_exact(16) yields exactly 16 u32 / 16 u8 slices; the
+    // load and mask compare below use exactly those sizes.
+    #[allow(unsafe_code)]
+    let all255 = unsafe {
+      _mm512_cmpeq_epi8_mask(
+        _mm512_loadu_si512(cpx.as_ptr().cast()),
+        _mm512_set1_epi32(-1),
+      )
+    } == u64::MAX;
+    if all255 {
+      #[allow(unsafe_code)]
+      unsafe {
+        _mm512_storeu_si512(dpx.as_mut_ptr().cast(), colorv)
+      }
+    } else {
+      super::fill_span_solid_scalar(
+        dpx,
+        cpx,
+        (color >> 0) & 0xff,
+        (color >> 8) & 0xff,
+        (color >> 16) & 0xff,
+        255,
+      );
+    }
   }
 }
