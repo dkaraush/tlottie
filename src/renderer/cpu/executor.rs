@@ -799,15 +799,13 @@ pub(crate) fn modulate(pixels: &mut [u32], mask: &[u8]) {
 /// Applies a matte source (`src`) onto `dst` premultiplied pixels.
 /// kind: 1 alpha, 2 inverted alpha, 3 luma, 4 inverted luma.
 pub(crate) fn apply_matte(dst: &mut [u32], src: &[u32], kind: u8, source_opacity: u8, order: crate::ChannelOrder) {
+  if kind == 1 || kind == 2 {
+    crate::simd::apply_matte_alpha(dst, src, source_opacity, kind == 2);
+    return;
+  }
   for (d, &s) in dst.iter_mut().zip(src.iter()) {
-    let alpha = (s >> 24) & 0xff;
-    let scaled_alpha = (alpha * u32::from(source_opacity) + 127) / 255;
-    let factor = match kind {
-      1 => scaled_alpha,
-      2 => 255 - scaled_alpha,
-      3 => luma_premult(s, order),
-      _ => 255 - luma_premult(s, order),
-    };
+    let scaled_alpha = luma_premult(s, order);
+    let factor = if kind == 3 { scaled_alpha } else { 255 - scaled_alpha };
     if factor == 255 {
       continue;
     }

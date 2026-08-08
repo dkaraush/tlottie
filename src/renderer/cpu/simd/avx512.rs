@@ -20,7 +20,7 @@
 
 use core::arch::x86_64::{
   _CMP_GE_OQ, _CMP_LT_OQ, _CMP_UNORD_Q, __m512, __m512i, _mm256_setr_epi16, _mm512_add_epi16, _mm512_add_ps, _mm512_and_ps, _mm512_castps_si512, _mm512_castsi128_si512,
-  _mm512_castsi256_si512, _mm512_castsi512_ps, _mm512_castsi512_si256, _mm512_cmpeq_epi8_mask, _mm512_cmpeq_epi32_mask, _mm512_cmp_ps_mask, _mm512_cvtepu8_epi16, _mm512_cvttps_epi32, _mm512_cvtusepi16_epi8,
+  _mm512_castsi256_si512, _mm512_castsi512_ps, _mm512_castsi512_si256, _mm512_cmpeq_epi16_mask, _mm512_cmpeq_epi8_mask, _mm512_cmpeq_epi32_mask, _mm512_cmp_ps_mask, _mm512_cvtepu8_epi16, _mm512_cvttps_epi32, _mm512_cvtusepi16_epi8,
   _mm512_extracti64x4_epi64, _mm512_inserti32x4, _mm512_inserti64x4, _mm512_loadu_si512, _mm512_mask_i32gather_epi32, _mm512_mask_mov_epi32, _mm512_max_epi16, _mm512_max_ps,
   _mm512_min_epi16, _mm512_min_ps, _mm512_mul_ps, _mm512_mullo_epi16, _mm512_set1_epi16, _mm512_set1_epi32, _mm512_set1_ps, _mm512_setr_ps, _mm512_setzero_ps, _mm512_setzero_si512,
   _mm512_shufflehi_epi16, _mm512_shufflelo_epi16, _mm512_sqrt_ps, _mm512_srli_epi16, _mm512_storeu_si512, _mm512_sub_epi16, _mm512_sub_ps, _mm_cvtsi32_si128, _mm_unpacklo_epi8,
@@ -213,6 +213,28 @@ pub(super) fn alpha_mask_combine_avx512(dst: &mut [u8], src: &[u8], mode: u8, in
 // ---------------------------------------------------------------------------
 // RGBA kernels — 16 pixels per iteration.
 // ---------------------------------------------------------------------------
+
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512dq,avx512vl")]
+pub(super) fn apply_matte_alpha_avx512(dst: &mut [u32], src: &[u32], source_opacity: u8, inverted: bool) {
+  let opacity = _mm512_set1_epi16(i16::from(source_opacity));
+  let full = _mm512_set1_epi16(255);
+  for (dpx, spx) in dst.chunks_exact_mut(16).zip(src.chunks_exact(16)) {
+    let s = load(spx.as_ptr().cast());
+    let mut fl = div255_round(_mm512_mullo_epi16(splat_alpha(lo(s)), opacity));
+    let mut fh = div255_round(_mm512_mullo_epi16(splat_alpha(hi(s)), opacity));
+    if inverted {
+      fl = _mm512_sub_epi16(full, fl);
+      fh = _mm512_sub_epi16(full, fh);
+    }
+    if _mm512_cmpeq_epi16_mask(fl, full) == 0xFFFFFFFF && _mm512_cmpeq_epi16_mask(fh, full) == 0xFFFFFFFF {
+      continue;
+    }
+    let d = load(dpx.as_ptr().cast());
+    let l = div255_round(_mm512_mullo_epi16(lo(d), fl));
+    let h = div255_round(_mm512_mullo_epi16(hi(d), fh));
+    store(dpx.as_mut_ptr().cast(), pack(l, h));
+  }
+}
 
 #[target_feature(enable = "avx2,avx512f,avx512bw,avx512dq,avx512vl")]
 pub(super) fn fill_span_solid_avx512(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb: u32, sa: u32) {

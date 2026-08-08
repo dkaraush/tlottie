@@ -1397,6 +1397,80 @@ fn alpha_mask_combine_scalar(dst: &mut [u8], src: &[u8], mode: u8, inverted: boo
   }
 }
 
+/// Alpha matting of a `u32` RGBA surface: every channel of `dst` is scaled by
+/// `(alpha * opacity + 127) / 255` (or its inverse when `inverted`), where
+/// `alpha` is the source pixel's alpha. Matches `executor::apply_matte` kinds
+/// 1/2 exactly: the scalar's `factor == 255` (no-op) and `factor == 0`
+/// (zero) short-circuits are reproduced by the general `(ch * factor + 127) / 255`
+/// rounding, so the SIMD path runs the general formula with no branches and stays
+/// bit-for-bit identical. Channel-order independent (all channels share one factor).
+pub(crate) fn apply_matte_alpha(dst: &mut [u32], src: &[u32], source_opacity: u8, inverted: bool) {
+  let n = dst.len().min(src.len());
+  #[cfg(target_arch = "aarch64")]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 8;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    // SAFETY: NEON is mandatory on aarch64; the kernel processes whole 8-pixel chunks.
+    #[allow(unsafe_code)]
+    unsafe {
+      neon::apply_matte_alpha_neon(head, &src[..full], source_opacity, inverted)
+    };
+    apply_matte_alpha_scalar(tail, &src[full..n], source_opacity, inverted);
+    return;
+  }
+  #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 4;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    wasm128::apply_matte_alpha_wasm(head, &src[..full], source_opacity, inverted);
+    apply_matte_alpha_scalar(tail, &src[full..n], source_opacity, inverted);
+    return;
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if n >= SIMD_MIN_SPAN {
+    let use_avx2 = use_avx2();
+    let use_avx512 = use_avx512();
+    let full = n - n % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+    let (head, tail) = dst[..n].split_at_mut(full);
+    if use_avx512 {
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx512::apply_matte_alpha_avx512(head, &src[..full], source_opacity, inverted)
+      };
+    } else if use_avx2 {
+      // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx2::apply_matte_alpha_avx2(head, &src[..full], source_opacity, inverted)
+      };
+    } else {
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::apply_matte_alpha_sse2(head, &src[..full], source_opacity, inverted)
+      };
+    }
+    apply_matte_alpha_scalar(tail, &src[full..n], source_opacity, inverted);
+    return;
+  }
+  apply_matte_alpha_scalar(&mut dst[..n], &src[..n], source_opacity, inverted);
+}
+
+fn apply_matte_alpha_scalar(dst: &mut [u32], src: &[u32], source_opacity: u8, inverted: bool) {
+  for (d, &s) in dst.iter_mut().zip(src) {
+    let alpha = (s >> 24) & 0xff;
+    let scaled = (alpha * u32::from(source_opacity) + 127) / 255;
+    let factor = if inverted { 255 - scaled } else { scaled };
+    let p = *d;
+    let a = (((p >> 24) & 0xff) * factor + 127) / 255;
+    let r = (((p >> 16) & 0xff) * factor + 127) / 255;
+    let g = (((p >> 8) & 0xff) * factor + 127) / 255;
+    let b = ((p & 0xff) * factor + 127) / 255;
+    *d = (a << 24) | (r << 16) | (g << 8) | b;
+  }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[path = "simd/neon.rs"]
 mod neon;

@@ -21,7 +21,7 @@
 
 use core::arch::x86_64::{
   _CMP_GE_OQ, _CMP_LT_OQ, _CMP_UNORD_Q, __m256, __m256i, _mm256_add_epi16, _mm256_add_ps, _mm256_and_ps, _mm256_and_si256, _mm256_andnot_ps, _mm256_andnot_si256,
-  _mm256_castps_si256, _mm256_castsi128_si256, _mm256_castsi256_ps, _mm256_castsi256_si128, _mm256_cmp_ps, _mm256_cmpeq_epi8, _mm256_cmpeq_epi32, _mm256_cmpgt_epi32, _mm256_cvtepu8_epi16, _mm256_cvttps_epi32,
+  _mm256_castps_si256, _mm256_castsi128_si256, _mm256_castsi256_ps, _mm256_castsi256_si128, _mm256_cmp_ps, _mm256_cmpeq_epi16, _mm256_cmpeq_epi8, _mm256_cmpeq_epi32, _mm256_cmpgt_epi32, _mm256_cvtepu8_epi16, _mm256_cvttps_epi32,
   _mm256_extracti128_si256, _mm256_inserti128_si256, _mm256_loadu_si256, _mm256_mask_i32gather_epi32, _mm256_max_epi16, _mm256_max_ps, _mm256_min_epi16, _mm256_min_ps, _mm256_movemask_epi8,
   _mm256_mul_ps, _mm256_mullo_epi16, _mm256_or_ps, _mm256_or_si256, _mm256_packus_epi16, _mm256_permute4x64_epi64, _mm256_set1_epi8, _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_ps, _mm256_setr_epi16,
   _mm256_setr_ps, _mm256_setzero_ps, _mm256_setzero_si256, _mm256_shufflehi_epi16, _mm256_shufflelo_epi16, _mm256_sqrt_ps, _mm256_srli_epi16, _mm256_storeu_si256, _mm256_sub_epi16,
@@ -216,6 +216,28 @@ pub(super) fn alpha_mask_combine_avx2(dst: &mut [u8], src: &[u8], mode: u8, inve
 // ---------------------------------------------------------------------------
 // RGBA kernels — 8 pixels per iteration.
 // ---------------------------------------------------------------------------
+
+#[target_feature(enable = "avx2")]
+pub(super) fn apply_matte_alpha_avx2(dst: &mut [u32], src: &[u32], source_opacity: u8, inverted: bool) {
+  let opacity = _mm256_set1_epi16(i16::from(source_opacity));
+  let full = _mm256_set1_epi16(255);
+  for (dpx, spx) in dst.chunks_exact_mut(8).zip(src.chunks_exact(8)) {
+    let s = load(spx.as_ptr().cast());
+    let mut fl = div255_round(_mm256_mullo_epi16(splat_alpha(lo(s)), opacity));
+    let mut fh = div255_round(_mm256_mullo_epi16(splat_alpha(hi(s)), opacity));
+    if inverted {
+      fl = _mm256_sub_epi16(full, fl);
+      fh = _mm256_sub_epi16(full, fh);
+    }
+    if _mm256_movemask_epi8(_mm256_cmpeq_epi16(fl, full)) == -1 && _mm256_movemask_epi8(_mm256_cmpeq_epi16(fh, full)) == -1 {
+      continue;
+    }
+    let d = load(dpx.as_ptr().cast());
+    let l = div255_round(_mm256_mullo_epi16(lo(d), fl));
+    let h = div255_round(_mm256_mullo_epi16(hi(d), fh));
+    store(dpx.as_mut_ptr().cast(), pack(l, h));
+  }
+}
 
 #[target_feature(enable = "avx2")]
 pub(super) fn fill_span_solid_avx2(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb: u32, sa: u32) {

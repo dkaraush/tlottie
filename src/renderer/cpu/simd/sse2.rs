@@ -32,7 +32,7 @@
 //! `#[target_feature(enable = "sse2")]` function.
 
 use core::arch::x86_64::{
-  __m128, __m128i, _mm_add_epi16, _mm_add_ps, _mm_and_ps, _mm_and_si128, _mm_andnot_ps, _mm_andnot_si128, _mm_castps_si128, _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_cmpge_ps, _mm_cmplt_ps,
+  __m128, __m128i, _mm_add_epi16, _mm_add_ps, _mm_and_ps, _mm_and_si128, _mm_andnot_ps, _mm_andnot_si128, _mm_castps_si128, _mm_castsi128_ps, _mm_cmpeq_epi16, _mm_cmpeq_epi32, _mm_cmpge_ps, _mm_cmplt_ps,
   _mm_cmpunord_ps, _mm_cvtsi32_si128, _mm_cvttps_epi32, _mm_loadu_si128, _mm_max_epi16, _mm_max_ps, _mm_min_epi16, _mm_min_ps, _mm_movemask_epi8, _mm_mul_ps, _mm_mullo_epi16, _mm_or_ps, _mm_or_si128,
   _mm_packus_epi16, _mm_set1_epi16, _mm_set1_epi32, _mm_set1_ps, _mm_setr_epi16, _mm_setr_ps, _mm_setzero_ps, _mm_setzero_si128, _mm_shufflehi_epi16, _mm_shufflelo_epi16, _mm_sqrt_ps, _mm_srli_epi16,
   _mm_storeu_si128, _mm_sub_epi16, _mm_sub_ps, _mm_unpackhi_epi8, _mm_unpacklo_epi16, _mm_unpacklo_epi8,
@@ -120,6 +120,33 @@ pub(super) fn alpha_blend_solid_sse2(dst: &mut [u8], coverage: &[u8], alpha: u8)
     let sl = div255_round(_mm_mullo_epi16(lo(c), alpha));
     let sh = div255_round(_mm_mullo_epi16(hi(c), alpha));
     store(dst.as_mut_ptr(), _mm_packus_epi16(alpha_over8(lo(d), sl), alpha_over8(hi(d), sh)));
+  }
+}
+
+#[target_feature(enable = "sse2")]
+pub(super) fn apply_matte_alpha_sse2(dst: &mut [u32], src: &[u32], source_opacity: u8, inverted: bool) {
+  let opacity = _mm_set1_epi16(i16::from(source_opacity));
+  let full = _mm_set1_epi16(255);
+  for (dpx, spx) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+    let s = load(spx.as_ptr().cast());
+    // `splat_alpha` replicates each pixel's alpha (lane 3/7 of the half)
+    // across its four channel lanes, then `div255(alpha * op)` yields the
+    // per-pixel factor on every channel lane; the scalar's factor==255 ("leave
+    // dst unchanged") fast path is recovered chunk-wide for all-opaque chunks, and
+    // factor==0 is reproduced exactly by the general rounding below.
+    let mut fl = div255_round(_mm_mullo_epi16(splat_alpha(lo(s)), opacity));
+    let mut fh = div255_round(_mm_mullo_epi16(splat_alpha(hi(s)), opacity));
+    if inverted {
+      fl = _mm_sub_epi16(full, fl);
+      fh = _mm_sub_epi16(full, fh);
+    }
+    if _mm_movemask_epi8(_mm_cmpeq_epi16(fl, full)) == 0xFFFF && _mm_movemask_epi8(_mm_cmpeq_epi16(fh, full)) == 0xFFFF {
+      continue;
+    }
+    let d = load(dpx.as_ptr().cast());
+    let l = div255_round(_mm_mullo_epi16(lo(d), fl));
+    let h = div255_round(_mm_mullo_epi16(hi(d), fh));
+    store(dpx.as_mut_ptr().cast(), _mm_packus_epi16(l, h));
   }
 }
 

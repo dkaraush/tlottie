@@ -411,3 +411,25 @@ fn premult(w: u32) -> u32 {
   let b = (w & 0xff).min(a);
   (a << 24) | (r << 16) | (g << 8) | b
 }
+
+#[test]
+fn apply_matte_alpha_matches_scalar() {
+  let mut rng = Rng(0xdead_2026_beef_cafe);
+  for len in [1usize, 3, 4, 7, 8, 15, 16, 17, 64, 257] {
+    for _case in 0..200 {
+      let src: Vec<u32> = (0..len).map(|_| premult(rng.next() as u32)).collect();
+      let base: Vec<u32> = (0..len).map(|_| premult(rng.next() as u32)).collect();
+      let op = rng.next() as u8;
+      for &inv in &[false, true] {
+        let mut a = base.clone();
+        let mut b = base.clone();
+        let mut c = base.clone();
+        apply_matte_alpha(&mut a, &src, op, inv);
+        apply_matte_alpha_scalar(&mut b, &src, op, inv);
+        crate::renderer::cpu::executor::apply_matte(&mut c, &src, if inv { 2 } else { 1 }, op, crate::ChannelOrder::Rgba);
+        assert_eq!(a, b, "simd vs scalar len={len} op={op} inv={inv}");
+        assert_eq!(b, c, "simd scalar vs executor len={len} op={op} inv={inv}");
+      }
+    }
+  }
+}
