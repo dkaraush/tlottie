@@ -266,7 +266,7 @@ impl Canvas<'_> {
         // gradient_row_capture (src plane materialized to DRAM) for
         // every cov hit throws the bytes away. The fused gradient_row
         // is bit-identical and round-trip-free.
-        let capture = capture_enabled && px_total * 4 + spans.len() * 12 + 64 <= COV_ENTRY_MAX;
+        let capture = capture_enabled && px_total * 4 + spans.len() * 12 + 64 <= SRC_ENTRY_MAX;
         for &s in spans {
           let (y, x0, len, cov) = unpack_span(s);
           let lo = y.saturating_mul(w).saturating_add(x0);
@@ -315,7 +315,7 @@ impl Canvas<'_> {
         // Oversized planes (720px gradients) previously re-captured every
         // frame just to be rejected by insert — measured at 49% of the
         // worst effects file.
-        let capture = capture_enabled && data.len() * 4 + e.rows.len() * 12 + 64 <= COV_ENTRY_MAX;
+        let capture = capture_enabled && data.len() * 4 + e.rows.len() * 12 + 64 <= SRC_ENTRY_MAX;
         let mut off = 0usize;
         for &(y, x0, len) in &e.rows {
           let (y, x0, len) = (y as usize, x0 as usize, len as usize);
@@ -534,7 +534,7 @@ impl Canvas<'_> {
       let mut had = false;
       match &e.data {
         PlaneData::Cov(data) => {
-          let caps = capture_enabled && data.len() * 4 + e.rows.len() * 12 + 64 <= COV_ENTRY_MAX;
+          let caps = capture_enabled && data.len() * 4 + e.rows.len() * 12 + 64 <= SRC_ENTRY_MAX;
           let mut off = 0usize;
           for &(y, x0, len) in &e.rows {
             let (y, x0, len) = (y as usize, x0 as usize, len as usize);
@@ -555,7 +555,7 @@ impl Canvas<'_> {
         }
         PlaneData::Spans(spans) => {
           let px_total: usize = spans.iter().map(|&s| unpack_span(s).2).sum();
-          let caps = capture_enabled && px_total * 4 + spans.len() * 12 + 64 <= COV_ENTRY_MAX;
+          let caps = capture_enabled && px_total * 4 + spans.len() * 12 + 64 <= SRC_ENTRY_MAX;
           for &s in spans {
             let (y, x0, len, cov) = unpack_span(s);
             let lo = y.saturating_mul(w).saturating_add(x0);
