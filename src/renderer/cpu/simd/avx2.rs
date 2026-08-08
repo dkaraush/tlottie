@@ -21,9 +21,9 @@
 
 use core::arch::x86_64::{
   _CMP_GE_OQ, _CMP_LT_OQ, _CMP_UNORD_Q, __m256, __m256i, _mm256_add_epi16, _mm256_add_ps, _mm256_and_ps, _mm256_and_si256, _mm256_andnot_ps, _mm256_andnot_si256,
-  _mm256_castps_si256, _mm256_castsi128_si256, _mm256_castsi256_ps, _mm256_castsi256_si128, _mm256_cmp_ps, _mm256_cmpeq_epi32, _mm256_cmpgt_epi32, _mm256_cvtepu8_epi16, _mm256_cvttps_epi32,
+  _mm256_castps_si256, _mm256_castsi128_si256, _mm256_castsi256_ps, _mm256_castsi256_si128, _mm256_cmp_ps, _mm256_cmpeq_epi8, _mm256_cmpeq_epi32, _mm256_cmpgt_epi32, _mm256_cvtepu8_epi16, _mm256_cvttps_epi32,
   _mm256_extracti128_si256, _mm256_inserti128_si256, _mm256_loadu_si256, _mm256_mask_i32gather_epi32, _mm256_max_epi16, _mm256_max_ps, _mm256_min_epi16, _mm256_min_ps, _mm256_movemask_epi8,
-  _mm256_mul_ps, _mm256_mullo_epi16, _mm256_or_ps, _mm256_or_si256, _mm256_packus_epi16, _mm256_permute4x64_epi64, _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_ps, _mm256_setr_epi16,
+  _mm256_mul_ps, _mm256_mullo_epi16, _mm256_or_ps, _mm256_or_si256, _mm256_packus_epi16, _mm256_permute4x64_epi64, _mm256_set1_epi8, _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_ps, _mm256_setr_epi16,
   _mm256_setr_ps, _mm256_setzero_ps, _mm256_setzero_si256, _mm256_shufflehi_epi16, _mm256_shufflelo_epi16, _mm256_sqrt_ps, _mm256_srli_epi16, _mm256_storeu_si256, _mm256_sub_epi16,
   _mm256_sub_ps, _mm_cvtsi32_si128, _mm_unpacklo_epi8, _mm_unpacklo_epi16,
 };
@@ -473,5 +473,42 @@ pub(super) fn focal_lut_over_avx2(dst: &mut [u32], lut: &[u32], g0x: f32, g0y: f
     let valid = _mm256_and_ps(_mm256_and_ps(_mm256_cmp_ps(det, zero, _CMP_GE_OQ), _mm256_cmp_ps(_mm256_mul_ps(rv, root), zero, _CMP_GE_OQ)), _mm256_cmp_ps(abs_ps(root), inf, _CMP_LT_OQ));
     lut_blend_over_k255(chunk, lut, lut_indices(root, valid, scalev));
     kf = _mm256_add_ps(kf, eight);
+  }
+}
+
+/// Opaque (sa=255) 8-pixel solid fill: if every coverage byte in the chunk is
+/// 255 the output is exactly `color` (a plain vector store, matching the scalar
+/// `run.fill(color)`), otherwise each pixel falls back to the exact scalar formula.
+/// Splits the caller's span into SIMD_MIN_SPAN-aligned chunks; the caller handles
+/// the scalar tail. Bit-exact: all-255 chunks store the source color verbatim,
+/// and mixed chunks run the identical rounded scalar math.
+#[target_feature(enable = "avx2")]
+pub(super) fn fill_span_opaque_avx2(dst: &mut [u32], cov: &[u8], color: u32) {
+  let colorv = _mm256_set1_epi32(color as i32);
+  for (dpx, cpx) in dst.chunks_exact_mut(8).zip(cov.chunks_exact(8)) {
+    // SAFETY: chunks_exact(8) yields exactly 8 u32 / 8 u8 slices; the
+    // stores/loads below use exactly those sizes.
+    #[allow(unsafe_code)]
+    let all255 = unsafe {
+      _mm256_movemask_epi8(_mm256_cmpeq_epi8(
+        _mm256_loadu_si256(cpx.as_ptr().cast()),
+        _mm256_set1_epi8(-1),
+      ))
+    } == !0;
+    if all255 {
+      #[allow(unsafe_code)]
+      unsafe {
+        _mm256_storeu_si256(dpx.as_mut_ptr().cast(), colorv)
+      }
+    } else {
+      super::fill_span_solid_scalar(
+        dpx,
+        cpx,
+        (color >> 0) & 0xff,
+        (color >> 8) & 0xff,
+        (color >> 16) & 0xff,
+        255,
+      );
+    }
   }
 }

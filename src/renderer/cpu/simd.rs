@@ -66,6 +66,20 @@ pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb:
       fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
       return;
     }
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    if large_canvas && dst.len() >= SIMD_MIN_SPAN && use_avx2() {
+      let n = dst.len().min(cov.len());
+      let full = n - n % 8;
+      let (dst_v, dst_tail) = dst.split_at_mut(full);
+      let (cov_v, cov_tail) = cov.split_at(full);
+      // SAFETY: `use_avx2()` gates on `is_x86_feature_detected!("avx2")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx2::fill_span_opaque_avx2(dst_v, cov_v, color)
+      }
+      fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
+      return;
+    }
     let n = dst.len().min(cov.len());
     let mut i = 0usize;
     while i < n {
