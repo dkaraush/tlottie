@@ -443,7 +443,7 @@ pub(super) fn apply_matte_alpha_neon(dst: &mut [u32], src: &[u32], source_opacit
       vmovn_u16(div255_round(vmulq_u16(vmovl_u8(d4.0), f))),
       vmovn_u16(div255_round(vmulq_u16(vmovl_u8(d4.1), f))),
       vmovn_u16(div255_round(vmulq_u16(vmovl_u8(d4.2), f))),
-      vmovn_u16(div255_round(vmovl_u8(d4.3), f)),
+      vmovn_u16(div255_round(vmulq_u16(vmovl_u8(d4.3), f))),
     );
     // SAFETY: same 32-byte span as the load above.
     #[allow(unsafe_code)]
