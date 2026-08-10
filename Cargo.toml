@@ -75,3 +75,7 @@ strip = "symbols"
 [profile.release-nostd]
 inherits = "release"
 panic = "abort"
+# Line tables so Rust frames symbolicate in a crash dump. On MSVC this lands
+# in the PDB, not the binary, so the shipped library does not grow; without it
+# a crash inside the renderer is a bare address.
+debug = "line-tables-only"
