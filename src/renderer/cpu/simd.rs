@@ -30,14 +30,19 @@ fn use_avx2() -> bool {
   *CACHE.get_or_init(|| std::is_x86_feature_detected!("avx2"))
 }
 
-/// Cached (once per process) runtime AVX-512 availability. Requires both `avx512f`
-/// and `avx512bw` (the kernels also use `avx512dq`/`avx512vl`, which ship
-/// on every CPU with the first two in practice); otherwise the AVX2 kernels run.
+/// Cached (once per process) runtime AVX-512 availability. Must match the full
+/// `#[target_feature(enable = ...)]` set the AVX-512 kernels declare — `avx2`,
+/// `avx512f`, `avx512bw`, `avx512dq`, `avx512vl` — so every dispatched
+/// function is safe on the running CPU; otherwise the AVX2 kernels run.
 #[cfg(target_arch = "x86_64")]
 fn use_avx512() -> bool {
   static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
   *CACHE.get_or_init(|| {
-    std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw") && std::is_x86_feature_detected!("avx512vl")
+    std::is_x86_feature_detected!("avx2")
+      && std::is_x86_feature_detected!("avx512f")
+      && std::is_x86_feature_detected!("avx512bw")
+      && std::is_x86_feature_detected!("avx512dq")
+      && std::is_x86_feature_detected!("avx512vl")
   })
 }
 /// Coverage-modulated solid source-over: for each pixel,
@@ -73,7 +78,7 @@ pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb:
         let full = n - n % 16;
         let (dst_v, dst_tail) = dst.split_at_mut(full);
         let (cov_v, cov_tail) = cov.split_at(full);
-        // SAFETY: `use_avx512()` gates on avx512f/avx512bw/avx512vl.
+        // SAFETY: `use_avx512()` gates on avx2/avx512f/avx512bw/avx512dq/avx512vl.
         #[allow(unsafe_code)]
         unsafe {
           avx512::fill_span_opaque_avx512(dst_v, cov_v, color)
@@ -154,7 +159,7 @@ pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb:
       let (dst_v, dst_tail) = dst.split_at_mut(full);
       let (cov_v, cov_tail) = cov.split_at(full.min(cov.len()));
       if use_avx512 {
-        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
         #[allow(unsafe_code)]
         unsafe {
           avx512::fill_span_solid_avx512(dst_v, cov_v, sr, sg, sb, sa)
@@ -279,7 +284,7 @@ pub(crate) fn fill_span_uniform(dst: &mut [u32], cov: u8, sr: u32, sg: u32, sb: 
       let full = dst.len() - dst.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
       let (dst_v, dst_tail) = dst.split_at_mut(full);
       if use_avx512 {
-        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
         #[allow(unsafe_code)]
         unsafe {
           avx512::fill_span_uniform_avx512(dst_v, ca, s_r, s_g, s_b)
@@ -368,7 +373,7 @@ pub(crate) fn linear_lut_fill(out: &mut [u32], lut: &[u32], row_base: f32, dt: f
       let full = out.len() - out.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
       let (head, tail) = out.split_at_mut(full);
       if use_avx512 {
-        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
         #[allow(unsafe_code)]
         unsafe {
           avx512::linear_lut_fill_avx512(head, lut, row_base, dt, x_start, scale)
@@ -453,7 +458,7 @@ pub(crate) fn radial_lut_fill(out: &mut [u32], lut: &[u32], dd0x: f32, dd0y: f32
       let full = out.len() - out.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
       let (head, tail) = out.split_at_mut(full);
       if use_avx512 {
-        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
         #[allow(unsafe_code)]
         unsafe {
           avx512::radial_lut_fill_avx512(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale)
@@ -536,7 +541,7 @@ pub(crate) fn focal_lut_fill(out: &mut [u32], lut: &[u32], g0x: f32, g0y: f32, s
       let full = out.len() - out.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
       let (head, tail) = out.split_at_mut(full);
       if use_avx512 {
-        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
         #[allow(unsafe_code)]
         unsafe {
           avx512::focal_lut_fill_avx512(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale)
@@ -646,7 +651,7 @@ pub(crate) fn composite_over_span(dst: &mut [u32], src: &[u32], k: u32) {
       let (dst_v, dst_tail) = dst.split_at_mut(full);
       let (src_v, src_tail) = src.split_at(full);
       if use_avx512 {
-        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
         #[allow(unsafe_code)]
         unsafe {
           avx512::composite_over_avx512(dst_v, src_v, k)
@@ -756,7 +761,7 @@ pub(crate) fn linear_lut_over(dst: &mut [u32], lut: &[u32], row_base: f32, dt: f
       let full = dst.len() - dst.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
       let (head, tail) = dst.split_at_mut(full);
       if use_avx512 {
-        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
         #[allow(unsafe_code)]
         unsafe {
           avx512::linear_lut_over_avx512(head, lut, row_base, dt, x_start, scale)
@@ -831,7 +836,7 @@ pub(crate) fn radial_lut_over(dst: &mut [u32], lut: &[u32], dd0x: f32, dd0y: f32
       let full = dst.len() - dst.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
       let (head, tail) = dst.split_at_mut(full);
       if use_avx512 {
-        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
         #[allow(unsafe_code)]
         unsafe {
           avx512::radial_lut_over_avx512(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale)
@@ -910,7 +915,7 @@ pub(crate) fn focal_lut_over(dst: &mut [u32], lut: &[u32], g0x: f32, g0y: f32, s
       let full = dst.len() - dst.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
       let (head, tail) = dst.split_at_mut(full);
       if use_avx512 {
-        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
         #[allow(unsafe_code)]
         unsafe {
           avx512::focal_lut_over_avx512(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale)
@@ -996,7 +1001,7 @@ pub(crate) fn alpha_blend_solid(dst: &mut [u8], coverage: &[u8], alpha: u8) {
     let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
     let (head, tail) = dst[..n].split_at_mut(full);
     if use_avx512 {
-      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
       #[allow(unsafe_code)]
       unsafe {
         avx512::alpha_blend_solid_avx512(head, &coverage[..full], alpha)
@@ -1055,7 +1060,7 @@ pub(crate) fn alpha_blend_product(dst: &mut [u8], lhs: &[u8], rhs: &[u8]) {
     let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
     let (head, tail) = dst[..n].split_at_mut(full);
     if use_avx512 {
-      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
       #[allow(unsafe_code)]
       unsafe {
         avx512::alpha_blend_product_avx512(head, &lhs[..full], &rhs[..full])
@@ -1121,7 +1126,7 @@ pub(crate) fn alpha_blend_uniform(dst: &mut [u8], coverage: u8, alpha: u8) {
     let full = dst.len() - dst.len() % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
     let (head, tail) = dst.split_at_mut(full);
     if use_avx512 {
-      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
       #[allow(unsafe_code)]
       unsafe {
         avx512::alpha_blend_uniform_avx512(head, source as u8)
@@ -1182,7 +1187,7 @@ pub(crate) fn alpha_composite_over(dst: &mut [u8], src: &[u8], opacity: u8) {
     let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
     let (head, tail) = dst[..n].split_at_mut(full);
     if use_avx512 {
-      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
       #[allow(unsafe_code)]
       unsafe {
         avx512::alpha_composite_over_avx512(head, &src[..full], opacity)
@@ -1241,7 +1246,7 @@ pub(crate) fn alpha_multiply(dst: &mut [u8], factors: &[u8]) {
     let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
     let (head, tail) = dst[..n].split_at_mut(full);
     if use_avx512 {
-      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
       #[allow(unsafe_code)]
       unsafe {
         avx512::alpha_multiply_avx512(head, &factors[..full])
@@ -1299,7 +1304,7 @@ pub(crate) fn alpha_matte(dst: &mut [u8], src: &[u8], opacity: u8, inverted: boo
     let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
     let (head, tail) = dst[..n].split_at_mut(full);
     if use_avx512 {
-      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
       #[allow(unsafe_code)]
       unsafe {
         avx512::alpha_matte_avx512(head, &src[..full], opacity, inverted)
@@ -1359,7 +1364,7 @@ pub(crate) fn alpha_mask_combine(dst: &mut [u8], src: &[u8], mode: u8, inverted:
     let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
     let (head, tail) = dst[..n].split_at_mut(full);
     if use_avx512 {
-      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
       #[allow(unsafe_code)]
       unsafe {
         avx512::alpha_mask_combine_avx512(head, &src[..full], mode, inverted, opacity)
@@ -1433,7 +1438,7 @@ pub(crate) fn apply_matte_alpha(dst: &mut [u32], src: &[u32], source_opacity: u8
     let full = n - n % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
     let (head, tail) = dst[..n].split_at_mut(full);
     if use_avx512 {
-      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx512f"|"avx512bw"|"avx512vl")`.
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
       #[allow(unsafe_code)]
       unsafe {
         avx512::apply_matte_alpha_avx512(head, &src[..full], source_opacity, inverted)
