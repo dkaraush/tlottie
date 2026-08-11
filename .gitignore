@@ -3,3 +3,4 @@ md/
 .idea/
 target/
 __pycache__/
+.opencode/
