@@ -24,17 +24,24 @@ const SIMD_MIN_SPAN: usize = 16;
 
 /// Cached (once per process) runtime AVX2 availability. CPUs without AVX2
 /// fall back to the SSE2 kernels; every x86_64 core has at least SSE2.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
 fn use_avx2() -> bool {
   static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
   *CACHE.get_or_init(|| std::is_x86_feature_detected!("avx2"))
+}
+
+/// `is_x86_feature_detected!` is a `std` macro, so `no_std` reads CPUID
+/// directly. See [`cpuid`] — a `std` test pins the two to the same answer.
+#[cfg(all(target_arch = "x86_64", not(feature = "std")))]
+fn use_avx2() -> bool {
+  cpuid::avx2()
 }
 
 /// Cached (once per process) runtime AVX-512 availability. Must match the full
 /// `#[target_feature(enable = ...)]` set the AVX-512 kernels declare — `avx2`,
 /// `avx512f`, `avx512bw`, `avx512dq`, `avx512vl` — so every dispatched
 /// function is safe on the running CPU; otherwise the AVX2 kernels run.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "std"))]
 fn use_avx512() -> bool {
   static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
   *CACHE.get_or_init(|| {
@@ -44,6 +51,12 @@ fn use_avx512() -> bool {
       && std::is_x86_feature_detected!("avx512dq")
       && std::is_x86_feature_detected!("avx512vl")
   })
+}
+
+/// See [`use_avx2`]: CPUID directly when there is no `std` to ask.
+#[cfg(all(target_arch = "x86_64", not(feature = "std")))]
+fn use_avx512() -> bool {
+  cpuid::avx512()
 }
 /// Coverage-modulated solid source-over: for each pixel,
 /// `ca = (cov*sa+127)/255`, source channels scaled by `ca`, then
@@ -1483,6 +1496,10 @@ mod neon;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[path = "simd/wasm.rs"]
 mod wasm128;
+
+#[cfg(target_arch = "x86_64")]
+#[path = "simd/cpuid.rs"]
+mod cpuid;
 
 #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
 #[path = "simd/sse2.rs"]
