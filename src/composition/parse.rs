@@ -67,6 +67,48 @@ fn for_each_field<'a>(c: &mut Cursor<'a>, mut f: impl FnMut(&mut Cursor<'a>, &'a
   }
 }
 
+#[derive(Default)]
+struct SeenFields(u64);
+
+impl SeenFields {
+  #[inline(always)]
+  fn first(&mut self, bit: u32) -> bool {
+    debug_assert!(bit < 64);
+    let mask = 1u64 << bit;
+    let first = self.0 & mask == 0;
+    self.0 |= mask;
+    first
+  }
+}
+
+macro_rules! match_once {
+  ($seen:ident, $key:expr, { $($field:literal => $body:block $(,)?) * _ => $fallback:block $(,)? }) => {
+    match_once!(@build $seen, $key, 0u32, (), $($field => $body,)* _ => $fallback)
+  };
+  (@build $seen:ident, $key:expr, $bit:expr, ($($arms:tt)*), _ => $fallback:block) => {{
+    match $key {
+      $($arms)*
+      _ => $fallback,
+    }
+  }};
+  (@build $seen:ident, $key:expr, $bit:expr, ($($arms:tt)*), $field:literal => $body:block, $($rest:tt)*) => {
+    match_once!(@build $seen, $key, (($bit) + 1u32), (
+      $($arms)*
+      $field if $seen.first($bit) => $body,
+    ), $($rest)*)
+  };
+}
+
+macro_rules! parse_object_once {
+  ($cursor:expr, |$value:ident, $key:ident| { $($field:literal => $body:block $(,)?) * _ => $fallback:block $(,)? }) => {{
+    let mut seen = SeenFields::default();
+    for_each_field($cursor, |$value, $key| {
+      match_once!(seen, $key, { $($field => $body,)* _ => $fallback });
+      Ok(())
+    })
+  }};
+}
+
 /// Iterates elements of a JSON array. The callback must consume each element.
 fn for_each_element<'a>(c: &mut Cursor<'a>, mut f: impl FnMut(&mut Cursor<'a>) -> Result<()>) -> Result<()> {
   c.skip_ws();
@@ -107,6 +149,8 @@ fn parse_scalar(c: &mut Cursor<'_>) -> Result<f32> {
       if value.is_none() {
         value = Some(parse_f32(c)?);
       } else {
+        // Extra scalar-array components are ignored by the model; validate
+        // them as JSON without paying number parsing costs for huge tails.
         c.skip_value()?;
       }
       Ok(())
@@ -125,6 +169,8 @@ fn parse_vec2(c: &mut Cursor<'_>) -> Result<Vec2> {
     if let Some(slot) = got.get_mut(i) {
       *slot = Some(parse_f32(c)?);
     } else {
+      // Vec2 tails are ignored. `skip_value` still validates JSON structure
+      // but avoids str::parse on attacker-sized numeric arrays.
       c.skip_value()?;
     }
     i += 1;
@@ -142,9 +188,10 @@ fn parse_color(c: &mut Cursor<'_>) -> Result<Color> {
   let mut comps: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
   let mut i = 0usize;
   for_each_element(c, |c| {
-    let v = parse_f32(c)?;
     if let Some(slot) = comps.get_mut(i) {
-      *slot = v;
+      *slot = parse_f32(c)?;
+    } else {
+      c.skip_value()?;
     }
     i += 1;
     Ok(())
@@ -165,9 +212,12 @@ fn parse_color(c: &mut Cursor<'_>) -> Result<Color> {
   })
 }
 
-fn parse_f32_list(c: &mut Cursor<'_>) -> Result<FloatList> {
+fn parse_f32_list(c: &mut Cursor<'_>, max_len: usize, limit: Limit) -> Result<FloatList> {
   let mut out = Vec::new();
   for_each_element(c, |c| {
+    if out.len() >= max_len {
+      return Err(Error::LimitExceeded(limit));
+    }
     out.push(parse_f32(c)?);
     Ok(())
   })?;
@@ -190,13 +240,29 @@ fn parse_bool(c: &mut Cursor<'_>) -> Result<bool> {
 
 /// Path contour object `{c, v, i, o}`. Also accepts the array-wrapped form
 /// `[{...}]` used in keyframe `s` fields.
-fn parse_path_value(c: &mut Cursor<'_>) -> Result<PathData> {
+fn parse_vec2_list(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<Vec2>> {
+  let mut out = Vec::new();
+  for_each_element(c, |c| {
+    if out.len() >= limits.max_path_points {
+      return Err(Error::LimitExceeded(Limit::PathPoints));
+    }
+    let point = parse_vec2(c)?;
+    if point.x.abs() > limits.max_path_coordinate_abs || point.y.abs() > limits.max_path_coordinate_abs {
+      return Err(Error::LimitExceeded(Limit::PathCoordinate));
+    }
+    out.push(point);
+    Ok(())
+  })?;
+  Ok(out)
+}
+
+fn parse_path_value(c: &mut Cursor<'_>, limits: &Limits) -> Result<PathData> {
   c.skip_ws();
   if c.peek() == Some(b'[') {
     let mut path: Option<PathData> = None;
     for_each_element(c, |c| {
       if path.is_none() {
-        path = Some(parse_path_object(c)?);
+        path = Some(parse_path_object(c, limits)?);
       } else {
         c.skip_value()?;
       }
@@ -204,29 +270,17 @@ fn parse_path_value(c: &mut Cursor<'_>) -> Result<PathData> {
     })?;
     return path.ok_or_else(|| invalid(c, "empty path keyframe value"));
   }
-  parse_path_object(c)
+  parse_path_object(c, limits)
 }
 
-fn parse_vec2_list(c: &mut Cursor<'_>) -> Result<Vec<Vec2>> {
-  let mut out = Vec::new();
-  for_each_element(c, |c| {
-    out.push(parse_vec2(c)?);
-    Ok(())
-  })?;
-  Ok(out)
-}
-
-fn parse_path_object(c: &mut Cursor<'_>) -> Result<PathData> {
+fn parse_path_object(c: &mut Cursor<'_>, limits: &Limits) -> Result<PathData> {
   let mut data = PathData::default();
-  for_each_field(c, |c, key| {
-    match key {
-      b"v" => data.vertices = parse_vec2_list(c)?,
-      b"i" => data.in_tangents = parse_vec2_list(c)?,
-      b"o" => data.out_tangents = parse_vec2_list(c)?,
-      b"c" => data.closed = parse_bool(c)?,
-      _ => c.skip_value()?,
-    }
-    Ok(())
+  parse_object_once!(c, |c, key| {
+    b"v" => { data.vertices = parse_vec2_list(c, limits)?; },
+    b"i" => { data.in_tangents = parse_vec2_list(c, limits)?; },
+    b"o" => { data.out_tangents = parse_vec2_list(c, limits)?; },
+    b"c" => { data.closed = parse_bool(c)?; },
+    _ => { c.skip_value()?; },
   })?;
   let n = data.vertices.len();
   // Tolerate missing/short tangent arrays by padding with zeros (= corners).
@@ -243,27 +297,27 @@ fn parse_path_object(c: &mut Cursor<'_>) -> Result<PathData> {
 
 /// Parses a property object `{a, k, ...}`. Whether `k` is static or animated
 /// is decided by its own shape (array of objects = keyframes), not by `a`.
-fn parse_property<T: Lerp>(c: &mut Cursor<'_>, limits: &Limits, parse_val: fn(&mut Cursor<'_>) -> Result<T>) -> Result<Property<T>> {
+fn parse_property<T: Lerp + PartialEq, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(c: &mut Cursor<'_>, limits: &Limits, parse_val: F) -> Result<Property<T>> {
   let mut property: Option<Property<T>> = None;
-  for_each_field(c, |c, key| {
-    if key == b"k" {
-      property = Some(parse_property_k(c, limits, parse_val)?);
-      return Ok(());
-    }
-    c.skip_value()
+  parse_object_once!(c, |c, key| {
+    b"k" => { property = Some(parse_property_k(c, limits, parse_val)?); },
+    _ => { c.skip_value()?; },
   })?;
   property.ok_or_else(|| invalid(c, "property missing k"))
 }
 
-fn parse_property_k<T: Lerp>(kc: &mut Cursor<'_>, limits: &Limits, parse_val: fn(&mut Cursor<'_>) -> Result<T>) -> Result<Property<T>> {
+fn parse_property_k<T: Lerp + PartialEq, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(kc: &mut Cursor<'_>, limits: &Limits, parse_val: F) -> Result<Property<T>> {
   kc.skip_ws();
   if kc.peek() == Some(b'[') {
     // Peek inside: array of objects → keyframes; anything else → static.
     let mut probe = kc.fork_at(kc.pos() + 1);
     probe.skip_ws();
     if probe.peek() == Some(b'{') {
-      kc.mark_animated_property();
-      return parse_keyframes(kc, limits, parse_val).map(Property::Animated);
+      let property = parse_keyframes(kc, limits, parse_val)?;
+      if matches!(property, Property::Animated(_)) {
+        kc.mark_animated_property();
+      }
+      return Ok(property);
     }
   }
   Ok(Property::Static(parse_val(kc)?))
@@ -278,7 +332,7 @@ struct RawKeyframe<T> {
 }
 
 /// Parses `[{t, s, e?, i, o, h?}, ...]` into a non-empty Timeline.
-fn parse_keyframes<T: Lerp>(c: &mut Cursor<'_>, limits: &Limits, parse_val: fn(&mut Cursor<'_>) -> Result<T>) -> Result<Timeline<T>> {
+fn parse_keyframes<T: Lerp + PartialEq, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(c: &mut Cursor<'_>, limits: &Limits, parse_val: F) -> Result<Property<T>> {
   let mut raw: Vec<RawKeyframe<T>> = Vec::new();
   for_each_element(c, |c| {
     if raw.len() >= limits.max_keyframes {
@@ -317,10 +371,27 @@ fn parse_keyframes<T: Lerp>(c: &mut Cursor<'_>, limits: &Limits, parse_val: fn(&
   });
   let mut it = kfs.into_iter();
   let first = it.next().ok_or_else(|| invalid(c, "empty keyframe list"))?;
-  Ok(Timeline { first, rest: it.collect(), sorted })
+  let rest: Vec<Keyframe<T>> = it.collect();
+  if timeline_is_constant(&first, &rest) {
+    return Ok(Property::Static(first.value));
+  }
+  Ok(Property::Animated(Timeline { first, rest, sorted }))
 }
 
-fn parse_one_keyframe<T: Lerp>(c: &mut Cursor<'_>, parse_val: fn(&mut Cursor<'_>) -> Result<T>) -> Result<RawKeyframe<T>> {
+fn timeline_is_constant<T: PartialEq>(first: &Keyframe<T>, rest: &[Keyframe<T>]) -> bool {
+  if first.spatial.is_some() {
+    return false;
+  }
+  let value = &first.value;
+  if first.end.as_ref().is_some_and(|end| end != value) {
+    return false;
+  }
+  rest
+    .iter()
+    .all(|keyframe| keyframe.spatial.is_none() && &keyframe.value == value && keyframe.end.as_ref().is_none_or(|end| end == value))
+}
+
+fn parse_one_keyframe<T: Lerp, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(c: &mut Cursor<'_>, parse_val: F) -> Result<RawKeyframe<T>> {
   let mut t = 0.0f32;
   let mut value: Option<T> = None;
   let mut end: Option<T> = None;
@@ -329,19 +400,16 @@ fn parse_one_keyframe<T: Lerp>(c: &mut Cursor<'_>, parse_val: fn(&mut Cursor<'_>
   let mut i = (Easing::LINEAR.ix, Easing::LINEAR.iy);
   let mut to: Option<Vec2> = None;
   let mut ti: Option<Vec2> = None;
-  for_each_field(c, |c, key| {
-    match key {
-      b"t" => t = parse_f32(c)?,
-      b"s" => value = Some(parse_val(c)?),
-      b"e" => end = Some(parse_val(c)?),
-      b"h" => hold = parse_bool(c)?,
-      b"o" => o = parse_easing_handle(c)?,
-      b"i" => i = parse_easing_handle(c)?,
-      b"to" => to = parse_vec2(c).ok(),
-      b"ti" => ti = parse_vec2(c).ok(),
-      _ => c.skip_value()?,
-    }
-    Ok(())
+  parse_object_once!(c, |c, key| {
+    b"t" => { t = parse_f32(c)?; },
+    b"s" => { value = Some(parse_val(c)?); },
+    b"e" => { end = Some(parse_val(c)?); },
+    b"h" => { hold = parse_bool(c)?; },
+    b"o" => { o = parse_easing_handle(c)?; },
+    b"i" => { i = parse_easing_handle(c)?; },
+    b"to" => { to = parse_vec2(c).ok(); },
+    b"ti" => { ti = parse_vec2(c).ok(); },
+    _ => { c.skip_value()?; },
   })?;
   let easing = if hold {
     Easing::HOLD
@@ -362,13 +430,10 @@ fn parse_one_keyframe<T: Lerp>(c: &mut Cursor<'_>, parse_val: fn(&mut Cursor<'_>
 fn parse_easing_handle(c: &mut Cursor<'_>) -> Result<(f32, f32)> {
   let mut x = 0.0f32;
   let mut y = 0.0f32;
-  for_each_field(c, |c, key| {
-    match key {
-      b"x" => x = parse_scalar(c)?,
-      b"y" => y = parse_scalar(c)?,
-      _ => c.skip_value()?,
-    }
-    Ok(())
+  parse_object_once!(c, |c, key| {
+    b"x" => { x = parse_scalar(c)?; },
+    b"y" => { y = parse_scalar(c)?; },
+    _ => { c.skip_value()?; },
   })?;
   // X (time axis) is NOT clamped: AE exports overshoot/anticipation
   // handles with x outside [0,1] and rlottie's VInterpolator uses them
@@ -383,26 +448,16 @@ fn parse_easing_handle(c: &mut Cursor<'_>) -> Result<(f32, f32)> {
 
 fn parse_transform(c: &mut Cursor<'_>, limits: &Limits) -> Result<Transform> {
   let mut tf = Transform::identity();
-  let mut p_pos: Option<usize> = None;
-  for_each_field(c, |c, key| {
-    match key {
-      b"a" => tf.anchor = parse_property(c, limits, parse_vec2)?,
-      b"p" => {
-        p_pos = Some(c.pos());
-        c.skip_value()?;
-      }
-      b"s" => tf.scale = parse_property(c, limits, parse_vec2)?,
-      b"r" => tf.rotation = parse_property(c, limits, parse_scalar)?,
-      b"o" => tf.opacity = parse_property(c, limits, parse_scalar)?,
-      b"sk" => tf.skew = parse_property(c, limits, parse_scalar)?,
-      b"sa" => tf.skew_axis = parse_property(c, limits, parse_scalar)?,
-      _ => c.skip_value()?, // rx/ry/rz, or unknown
-    }
-    Ok(())
+  parse_object_once!(c, |c, key| {
+    b"a" => { tf.anchor = parse_property(c, limits, parse_vec2)?; },
+    b"p" => { tf.position = parse_position(c, limits)?; },
+    b"s" => { tf.scale = parse_property(c, limits, parse_vec2)?; },
+    b"r" => { tf.rotation = parse_property(c, limits, parse_scalar)?; },
+    b"o" => { tf.opacity = parse_property(c, limits, parse_scalar)?; },
+    b"sk" => { tf.skew = parse_property(c, limits, parse_scalar)?; },
+    b"sa" => { tf.skew_axis = parse_property(c, limits, parse_scalar)?; },
+    _ => { c.skip_value()?; },
   })?;
-  if let Some(pos) = p_pos {
-    tf.position = parse_position(&mut c.fork_at(pos), limits)?;
-  }
   Ok(tf)
 }
 
@@ -410,37 +465,46 @@ fn parse_transform(c: &mut Cursor<'_>, limits: &Limits) -> Result<Transform> {
 /// form `{s: true, x: {a,k}, y: {a,k}}`.
 fn parse_position(c: &mut Cursor<'_>, limits: &Limits) -> Result<Position> {
   let mut split = false;
-  let mut k_pos: Option<usize> = None;
+  let mut k: Option<Property<Vec2>> = None;
+  let mut x: Option<Property<f32>> = None;
+  let mut y: Option<Property<f32>> = None;
   let mut x_pos: Option<usize> = None;
   let mut y_pos: Option<usize> = None;
-  for_each_field(c, |c, key| {
-    match key {
-      b"s" => split = parse_bool(c)?,
-      b"k" => {
-        k_pos = Some(c.pos());
-        c.skip_value()?;
-      }
-      b"x" => {
+  parse_object_once!(c, |c, key| {
+    b"s" => { split = parse_bool(c)?; },
+    b"k" => { k = Some(parse_property_k(c, limits, parse_vec2)?); },
+    b"x" => {
+      if split {
+        x = Some(parse_property(c, limits, parse_scalar)?);
+      } else {
         x_pos = Some(c.pos());
         c.skip_value()?;
       }
-      b"y" => {
+    },
+    b"y" => {
+      if split {
+        y = Some(parse_property(c, limits, parse_scalar)?);
+      } else {
         y_pos = Some(c.pos());
         c.skip_value()?;
       }
-      _ => c.skip_value()?,
-    }
-    Ok(())
+    },
+    _ => { c.skip_value()?; },
   })?;
   if split {
-    let xp = x_pos.ok_or_else(|| invalid(c, "split position missing x"))?;
-    let yp = y_pos.ok_or_else(|| invalid(c, "split position missing y"))?;
-    let x = parse_property(&mut c.fork_at(xp), limits, parse_scalar)?;
-    let y = parse_property(&mut c.fork_at(yp), limits, parse_scalar)?;
+    let x = match (x, x_pos) {
+      (Some(x), _) => x,
+      (None, Some(pos)) => parse_property(&mut c.fork_at(pos), limits, parse_scalar)?,
+      (None, None) => return Err(invalid(c, "split position missing x")),
+    };
+    let y = match (y, y_pos) {
+      (Some(y), _) => y,
+      (None, Some(pos)) => parse_property(&mut c.fork_at(pos), limits, parse_scalar)?,
+      (None, None) => return Err(invalid(c, "split position missing y")),
+    };
     Ok(Position::Split { x, y })
   } else {
-    let kp = k_pos.ok_or_else(|| invalid(c, "position missing k"))?;
-    let p = parse_property_k(&mut c.fork_at(kp), limits, parse_vec2)?;
+    let p = k.ok_or_else(|| invalid(c, "position missing k"))?;
     Ok(Position::Combined(p))
   }
 }
@@ -455,19 +519,101 @@ enum ParsedItem {
   Ignored,
 }
 
-fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &mut usize) -> Result<(Vec<Shape>, Option<Transform>)> {
+#[derive(Default)]
+struct ShapeCounts {
+  items: usize,
+  paints: usize,
+  paint_source_items: usize,
+  focal_radial_gradients: usize,
+  round_corners: usize,
+  trims: usize,
+}
+
+fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &mut ShapeCounts) -> Result<(Vec<Shape>, Option<Transform>)> {
   if depth > MAX_GROUP_DEPTH {
     return Err(Error::LimitExceeded(Limit::NestingDepth));
   }
   let mut shapes = Vec::new();
   let mut transform: Option<Transform> = None;
+  let mut dashed_strokes = 0usize;
+  let mut gradient_strokes = 0usize;
+  let mut max_dashed_source_segment = 0.0f32;
+  let mut dashed_source_len = 0.0f32;
+  let mut dashed_piece_estimate = 0usize;
+  let mut repeater_product = 1usize;
+  let mut source_items = 0usize;
   for_each_element(c, |c| {
-    *count += 1;
-    if *count > limits.max_shapes_per_layer {
+    count.items += 1;
+    if count.items > limits.max_shapes_per_layer {
       return Err(Error::LimitExceeded(Limit::ShapesPerLayer));
     }
     match parse_shape_item(c, limits, depth, count)? {
-      ParsedItem::Shape(s) => shapes.push(s),
+      ParsedItem::Shape(s) => {
+        if is_paint(&s) {
+          count.paints += 1;
+          if count.paints > limits.max_paints_per_layer {
+            return Err(Error::LimitExceeded(Limit::PaintsPerLayer));
+          }
+          count.paint_source_items = count.paint_source_items.saturating_add(source_items);
+          if count.paint_source_items > limits.max_paint_source_items_per_layer {
+            return Err(Error::LimitExceeded(Limit::PaintSourceItemsPerLayer));
+          }
+        }
+        if is_focal_radial_gradient(&s) {
+          count.focal_radial_gradients += 1;
+          if count.focal_radial_gradients > limits.max_focal_radial_gradients_per_layer {
+            return Err(Error::LimitExceeded(Limit::FocalRadialGradientsPerLayer));
+          }
+        }
+        if matches!(s, Shape::RoundCorners(_)) {
+          count.round_corners += 1;
+          if count.round_corners > limits.max_round_corners_per_layer {
+            return Err(Error::LimitExceeded(Limit::RoundCornersPerLayer));
+          }
+        }
+        if matches!(s, Shape::Trim(_)) {
+          count.trims += 1;
+          if count.trims > limits.max_trims_per_layer {
+            return Err(Error::LimitExceeded(Limit::TrimsPerLayer));
+          }
+        }
+        if let Some(copies) = repeater_copies(&s) {
+          repeater_product = repeater_product.saturating_mul(copies.max(1));
+          if repeater_product > limits.max_repeater_product_per_group {
+            return Err(Error::LimitExceeded(Limit::RepeaterProductPerGroup));
+          }
+        }
+        if is_dashed_stroke(&s) {
+          dashed_strokes += 1;
+          if dashed_strokes > limits.max_dashed_strokes_per_group {
+            return Err(Error::LimitExceeded(Limit::DashedStrokesPerGroup));
+          }
+          if is_round_join_dashed_stroke(&s) && max_dashed_source_segment > limits.max_dashed_path_segment_span {
+            return Err(Error::LimitExceeded(Limit::DashedPathSegment));
+          }
+          if let Some(pieces) = dash_piece_estimate(&s, dashed_source_len) {
+            dashed_piece_estimate = dashed_piece_estimate.saturating_add(pieces);
+            if dashed_piece_estimate > limits.max_dashed_piece_estimate_per_group {
+              return Err(Error::LimitExceeded(Limit::DashedPiecesPerGroup));
+            }
+          }
+        }
+        if matches!(s, Shape::GradientStroke(_)) {
+          gradient_strokes += 1;
+          if gradient_strokes > limits.max_gradient_strokes_per_group {
+            return Err(Error::LimitExceeded(Limit::GradientStrokesPerGroup));
+          }
+        }
+        max_dashed_source_segment = max_dashed_source_segment.max(max_path_segment_span(&s));
+        dashed_source_len += path_segment_span_sum(&s);
+        if is_geometry_source(&s) {
+          source_items += 1;
+        }
+        if shapes.last().is_some_and(|previous| redundant_opaque_gradient_fill(previous, &s)) {
+          return Ok(());
+        }
+        shapes.push(s);
+      }
       ParsedItem::GroupTransform(t) => transform = Some(t),
       ParsedItem::Ignored => {}
     }
@@ -476,10 +622,197 @@ fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
   Ok((shapes, transform))
 }
 
-fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &mut usize) -> Result<ParsedItem> {
+fn is_paint(shape: &Shape) -> bool {
+  matches!(shape, Shape::Fill(_) | Shape::Stroke(_) | Shape::GradientFill(_) | Shape::GradientStroke(_))
+}
+
+fn is_geometry_source(shape: &Shape) -> bool {
+  matches!(shape, Shape::Path(_) | Shape::Rect(_) | Shape::Ellipse(_) | Shape::Polystar(_) | Shape::Group(_))
+}
+
+fn is_focal_radial_gradient(shape: &Shape) -> bool {
+  match shape {
+    Shape::GradientFill(fill) => fill.kind == GradientKind::Radial && fill.highlight_len.eval(0.0).abs() > 0.001,
+    Shape::GradientStroke(stroke) => stroke.kind == GradientKind::Radial && stroke.highlight_len.eval(0.0).abs() > 0.001,
+    _ => false,
+  }
+}
+
+fn redundant_opaque_gradient_fill(previous: &Shape, next: &Shape) -> bool {
+  let (Shape::GradientFill(previous), Shape::GradientFill(next)) = (previous, next) else {
+    return false;
+  };
+  previous.kind == next.kind
+    && previous.rule == next.rule
+    && previous.color_count == next.color_count
+    && same_static_property(&previous.start, &next.start)
+    && same_static_property(&previous.end, &next.end)
+    && same_static_property(&previous.highlight_len, &next.highlight_len)
+    && same_static_property(&previous.highlight_angle, &next.highlight_angle)
+    && same_static_property(&previous.stops, &next.stops)
+    && same_opaque_static_opacity(&previous.opacity, &next.opacity)
+    && opaque_gradient_stops(&previous.stops, previous.color_count)
+}
+
+fn same_static_property<T: PartialEq>(a: &Property<T>, b: &Property<T>) -> bool {
+  match (a, b) {
+    (Property::Static(a), Property::Static(b)) => a == b,
+    _ => false,
+  }
+}
+
+fn same_opaque_static_opacity(a: &Property<f32>, b: &Property<f32>) -> bool {
+  match (a, b) {
+    (Property::Static(a), Property::Static(b)) => a == b && *a >= 100.0,
+    _ => false,
+  }
+}
+
+fn opaque_gradient_stops(stops: &Property<FloatList>, color_count: usize) -> bool {
+  let Property::Static(stops) = stops else {
+    return false;
+  };
+  stops.0.len() == color_count.saturating_mul(4)
+}
+
+fn is_dashed_stroke(shape: &Shape) -> bool {
+  match shape {
+    Shape::Stroke(stroke) => !stroke.dashes.is_empty(),
+    Shape::GradientStroke(stroke) => !stroke.dashes.is_empty(),
+    _ => false,
+  }
+}
+
+fn is_round_join_dashed_stroke(shape: &Shape) -> bool {
+  match shape {
+    Shape::Stroke(stroke) => !stroke.dashes.is_empty() && stroke.join == Join::Round,
+    Shape::GradientStroke(stroke) => !stroke.dashes.is_empty() && stroke.join == Join::Round,
+    _ => false,
+  }
+}
+
+fn repeater_copies(shape: &Shape) -> Option<usize> {
+  let Shape::Repeater(repeater) = shape else {
+    return None;
+  };
+  let copies = property_max_abs_f32(&repeater.copies)?.ceil();
+  if copies.is_finite() {
+    Some(copies as usize)
+  } else {
+    Some(usize::MAX)
+  }
+}
+
+fn dash_piece_estimate(shape: &Shape, source_len: f32) -> Option<usize> {
+  let dashes = match shape {
+    Shape::Stroke(stroke) => &stroke.dashes,
+    Shape::GradientStroke(stroke) => &stroke.dashes,
+    _ => return None,
+  };
+  let period = dash_period(dashes)?;
+  Some((source_len / period).ceil().max(0.0) as usize)
+}
+
+fn dash_period(dashes: &[DashElement]) -> Option<f32> {
+  if dashes.len() < 2 {
+    return None;
+  }
+  let mut values: Vec<f32> = dashes.iter().filter_map(|dash| property_min_abs_f32(&dash.value)).collect();
+  if values.len() < 2 {
+    return None;
+  }
+  // Match renderer dash_pattern(): role tags are ignored, an even-length list
+  // gets a synthesized gap, then the final value is consumed as offset.
+  if values.len() % 2 == 0 {
+    let last = values.last().copied().unwrap_or(0.0);
+    let prev = values.get(values.len() - 2).copied().unwrap_or(0.0);
+    if let Some(slot) = values.last_mut() {
+      *slot = prev;
+    }
+    values.push(last);
+  }
+  values.pop();
+  let period: f32 = values.iter().map(|v| v.max(0.0)).sum();
+  (period > 0.001).then_some(period)
+}
+
+fn property_min_abs_f32(property: &Property<f32>) -> Option<f32> {
+  let finite_abs = |value: f32| value.is_finite().then_some(value.abs());
+  match property {
+    Property::Static(value) => finite_abs(*value),
+    Property::Animated(timeline) => {
+      let mut min = finite_abs(timeline.first.value);
+      if let Some(value) = timeline.first.end.and_then(finite_abs) {
+        min = Some(min.map_or(value, |current| current.min(value)));
+      }
+      for keyframe in &timeline.rest {
+        if let Some(value) = finite_abs(keyframe.value) {
+          min = Some(min.map_or(value, |current| current.min(value)));
+        }
+        if let Some(value) = keyframe.end.and_then(finite_abs) {
+          min = Some(min.map_or(value, |current| current.min(value)));
+        }
+      }
+      min
+    }
+  }
+}
+
+fn property_max_abs_f32(property: &Property<f32>) -> Option<f32> {
+  let finite_abs = |value: f32| value.is_finite().then_some(value.abs());
+  match property {
+    Property::Static(value) => finite_abs(*value),
+    Property::Animated(timeline) => {
+      let mut max = finite_abs(timeline.first.value);
+      if let Some(value) = timeline.first.end.and_then(finite_abs) {
+        max = Some(max.map_or(value, |current| current.max(value)));
+      }
+      for keyframe in &timeline.rest {
+        if let Some(value) = finite_abs(keyframe.value) {
+          max = Some(max.map_or(value, |current| current.max(value)));
+        }
+        if let Some(value) = keyframe.end.and_then(finite_abs) {
+          max = Some(max.map_or(value, |current| current.max(value)));
+        }
+      }
+      max
+    }
+  }
+}
+
+fn max_path_segment_span(shape: &Shape) -> f32 {
+  let Shape::Path(path) = shape else {
+    return 0.0;
+  };
+  let data = path.path.eval(0.0);
+  data
+    .vertices
+    .windows(2)
+    .map(|w| match w {
+      [a, b] => (b.x - a.x).abs().max((b.y - a.y).abs()),
+      _ => 0.0,
+    })
+    .fold(0.0, f32::max)
+}
+
+fn path_segment_span_sum(shape: &Shape) -> f32 {
+  let Shape::Path(path) = shape else {
+    return 0.0;
+  };
+  let data = path.path.eval(0.0);
+  data
+    .vertices
+    .windows(2)
+    .map(|w| match w {
+      [a, b] => (b.x - a.x).abs().max((b.y - a.y).abs()),
+      _ => 0.0,
+    })
+    .sum()
+}
+
+fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &mut ShapeCounts) -> Result<ParsedItem> {
   // Record positions of every field we might need, dispatch after `ty` is known.
   let mut ty: Option<[u8; 2]> = None;
-  let mut ty_pos: Option<usize> = None;
   let mut hidden = false;
   let mut it_pos: Option<usize> = None;
   let mut parsed_group: Option<(Vec<Shape>, Option<Transform>)> = None;
@@ -513,145 +846,132 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
   let mut miter_limit = 0.0f32;
   let obj_start = c.pos();
 
-  for_each_field(c, |c, key| {
-    match key {
-      b"t" => {
-        grad_type = parse_f32(c)?;
-        Ok(())
-      }
-      b"e" => {
-        e_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"g" => {
-        g_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"ty" => {
-        ty_pos = Some(c.pos());
-        let s = c.read_string_bytes()?;
-        let mut tag = [0u8; 2];
-        if let (Some(&b0), b1) = (s.first(), s.get(1)) {
-          tag[0] = b0;
-          tag[1] = b1.copied().unwrap_or(0);
-        }
-        ty = Some(tag);
-        Ok(())
-      }
-      b"hd" => {
-        hidden = parse_bool(c)?;
-        Ok(())
-      }
-      b"it" => {
-        if ty == Some(*b"gr") {
-          parsed_group = Some(parse_shape_list(c, limits, depth + 1, count)?);
-          it_pos = None;
-          Ok(())
-        } else {
-          it_pos = Some(c.pos());
-          c.skip_value()
-        }
-      }
-      b"ks" => {
-        if ty == Some(*b"sh") {
-          parsed_path = Some(parse_property(c, limits, parse_path_value)?);
-          ks_pos = None;
-          Ok(())
-        } else {
-          ks_pos = Some(c.pos());
-          c.skip_value()
-        }
-      }
-      b"p" => {
-        p_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"s" => {
-        s_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"r" => {
-        r_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"c" => {
-        c_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"o" => {
-        o_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"a" => {
-        a_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"w" => {
-        w_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"m" => {
-        trim_mode = parse_f32(c)?;
-        Ok(())
-      }
-      b"sy" => {
-        star_type = parse_f32(c)?;
-        Ok(())
-      }
-      b"h" => {
-        h_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"tr" => {
-        tr_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"d" => {
-        d_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"pt" => {
-        pt_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"ir" => {
-        ir_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"or" => {
-        or_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"is" => {
-        is_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"os" => {
-        os_pos = Some(c.pos());
-        c.skip_value()
-      }
-      b"lc" => {
-        line_cap = parse_f32(c)?;
-        Ok(())
-      }
-      b"lj" => {
-        line_join = parse_f32(c)?;
-        Ok(())
-      }
-      b"ml" => {
-        // Usually a plain number, but some exporters write it as an
-        // animated-property object {"a":0,"k":4}; take the value at
-        // frame 0 (animated miter limit is not a real-world case).
-        c.skip_ws();
-        if c.peek() == Some(b'{') {
-          miter_limit = parse_property(c, limits, parse_f32)?.eval(0.0);
-        } else {
-          miter_limit = parse_f32(c)?;
-        }
-        Ok(())
-      }
-      _ => c.skip_value(),
+  parse_object_once!(c, |c, key| {
+    b"t" => {
+      grad_type = parse_f32(c)?;
     }
+    b"e" => {
+      e_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"g" => {
+      g_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"ty" => {
+      let s = c.read_string_bytes()?;
+      let mut tag = [0u8; 2];
+      if let (Some(&b0), b1) = (s.first(), s.get(1)) {
+        tag[0] = b0;
+        tag[1] = b1.copied().unwrap_or(0);
+      }
+      ty = Some(tag);
+    }
+    b"hd" => {
+      hidden = parse_bool(c)?;
+    }
+    b"it" => {
+      if ty == Some(*b"gr") {
+        parsed_group = Some(parse_shape_list(c, limits, depth + 1, count)?);
+        it_pos = None;
+      } else {
+        it_pos = Some(c.pos());
+        c.skip_value()?;
+      }
+    }
+    b"ks" => {
+      if ty == Some(*b"sh") {
+        parsed_path = Some(parse_property(c, limits, |c| parse_path_value(c, limits))?);
+        ks_pos = None;
+      } else {
+        ks_pos = Some(c.pos());
+        c.skip_value()?;
+      }
+    }
+    b"p" => {
+      p_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"s" => {
+      s_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"r" => {
+      r_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"c" => {
+      c_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"o" => {
+      o_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"a" => {
+      a_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"w" => {
+      w_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"m" => {
+      trim_mode = parse_f32(c)?;
+    }
+    b"sy" => {
+      star_type = parse_f32(c)?;
+    }
+    b"h" => {
+      h_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"tr" => {
+      tr_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"d" => {
+      d_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"pt" => {
+      pt_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"ir" => {
+      ir_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"or" => {
+      or_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"is" => {
+      is_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"os" => {
+      os_pos = Some(c.pos());
+      c.skip_value()?;
+    }
+    b"lc" => {
+      line_cap = parse_f32(c)?;
+    }
+    b"lj" => {
+      line_join = parse_f32(c)?;
+    }
+    b"ml" => {
+      // Usually a plain number, but some exporters write it as an
+      // animated-property object {"a":0,"k":4}; take the value at
+      // frame 0 (animated miter limit is not a real-world case).
+      c.skip_ws();
+      if c.peek() == Some(b'{') {
+        miter_limit = parse_property(c, limits, parse_f32)?.eval(0.0);
+      } else {
+        miter_limit = parse_f32(c)?;
+      }
+    }
+    _ => { c.skip_value()? },
   })?;
 
   let Some(ty) = ty else {
@@ -676,21 +996,10 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
       None => Ok(Property::Static(default)),
     }
   };
-  // Path direction on primitives: `d` == 3 reverses the winding (rlottie
-  // passes direction() into addRect/addOval/addPolystar). Malformed `d`
-  // reads as the default (1 = clockwise).
-  let direction_reversed = |c: &Cursor<'_>, pos: Option<usize>| -> bool {
-    // rlottie's streaming parseObject (lottieparser.cpp) Skip()s every
-    // key that appears BEFORE `ty`; the type sub-parser then reads only
-    // the keys after it. A `d` written before `ty` is therefore dropped
-    // and the primitive keeps its default CW winding — key-ORDER
-    // dependent. Match it: honor `d` only when it follows `ty`
-    // (Batoshik coins ring: reversed-ellipse dash phase, 55.4 → 5.3).
-    match (pos, ty_pos) {
-      (Some(p), Some(tp)) if p > tp => parse_f32(&mut c.fork_at(p)).unwrap_or(1.0) == 3.0,
-      _ => false,
-    }
-  };
+  // Path direction on primitives: `d` == 3 reverses the winding. rlottie
+  // supports this too, but accidentally ignores `d` if it appears before
+  // `ty`; honor the authored field order-independently.
+  let direction_reversed = |c: &Cursor<'_>, pos: Option<usize>| -> bool { pos.is_some_and(|p| parse_f32(&mut c.fork_at(p)).unwrap_or(1.0) == 3.0) };
 
   match &ty {
     b"gr" => {
@@ -718,7 +1027,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
             offset: obj_start,
             what: "path shape missing ks",
           })?;
-          parse_property(&mut c.fork_at(ks_pos), limits, parse_path_value)?
+          parse_property(&mut c.fork_at(ks_pos), limits, |c| parse_path_value(c, limits))?
         }
       };
       Ok(ParsedItem::Shape(Shape::Path(PathShape { path })))
@@ -925,10 +1234,14 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
           None => Ok(Property::Static(default)),
         }
       };
+      let points = prop_scalar_req(pt_pos, 5.0)?;
+      if points.eval(0.0).abs() > limits.max_polystar_points {
+        return Err(Error::LimitExceeded(Limit::PolystarPoints));
+      }
       Ok(ParsedItem::Shape(Shape::Polystar(Box::new(PolystarShape {
         star: star_type as i64 != 2,
         reversed: direction_reversed(c, d_pos),
-        points: prop_scalar_req(pt_pos, 5.0)?,
+        points,
         position: prop_vec2(c, p_pos, "polystar missing p")?,
         rotation: prop_scalar_req(r_pos, 0.0)?,
         inner_radius: prop_scalar_req(ir_pos, 0.0)?,
@@ -943,6 +1256,9 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
         Some(pos) => parse_property(&mut c.fork_at(pos), limits, parse_scalar)?,
         None => Property::Static(1.0),
       };
+      if property_max_abs_f32(&copies).is_some_and(|copies| copies > limits.max_repeater_copies) {
+        return Err(Error::LimitExceeded(Limit::RepeaterCopies));
+      }
       let offset = prop_scalar(c, o_pos, 0.0)?;
       let (transform, start_opacity, end_opacity) = match tr_pos {
         Some(pos) => parse_repeater_transform(&mut c.fork_at(pos), limits)?,
@@ -982,6 +1298,9 @@ fn parse_dashes(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<DashElement>>
       Ok(())
     })?;
     if let (b'd' | b'g' | b'o', Some(pos)) = (kind, v_pos) {
+      if out.len() >= limits.max_dash_elements {
+        return Err(Error::LimitExceeded(Limit::DashElements));
+      }
       let value = parse_property(&mut c.fork_at(pos), limits, parse_scalar)?;
       out.push(DashElement { value });
     }
@@ -993,20 +1312,13 @@ fn parse_dashes(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<DashElement>>
 /// `g` object of a gradient: `{p: colorStopCount, k: {a, k: [floats]}}`.
 fn parse_gradient_stops(c: &mut Cursor<'_>, limits: &Limits) -> Result<(Property<FloatList>, usize)> {
   let mut count = 0usize;
-  let mut k_pos: Option<usize> = None;
-  for_each_field(c, |c, key| {
-    match key {
-      b"p" => count = parse_f32(c)? as usize,
-      b"k" => {
-        k_pos = Some(c.pos());
-        c.skip_value()?;
-      }
-      _ => c.skip_value()?,
-    }
-    Ok(())
+  let mut stops: Option<Property<FloatList>> = None;
+  parse_object_once!(c, |c, key| {
+    b"p" => { count = parse_f32(c)? as usize; },
+    b"k" => { stops = Some(parse_property(c, limits, |c| parse_f32_list(c, limits.max_gradient_stop_values, Limit::GradientStopValues))?); },
+    _ => { c.skip_value()?; },
   })?;
-  let pos = k_pos.ok_or_else(|| invalid(c, "gradient stops missing k"))?;
-  let stops = parse_property(&mut c.fork_at(pos), limits, parse_f32_list)?;
+  let stops = stops.ok_or_else(|| invalid(c, "gradient stops missing k"))?;
   if count == 0 {
     // Infer: all floats are color stops.
     if let Property::Static(FloatList(v)) = &stops {
@@ -1020,7 +1332,7 @@ fn parse_gradient_stops(c: &mut Cursor<'_>, limits: &Limits) -> Result<(Property
 // Layers
 // ---------------------------------------------------------------------------
 
-fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
+fn parse_layer(c: &mut Cursor<'_>, limits: &Limits, total_masks: &mut usize, total_painted_shape_layers: &mut usize, total_solid_layers: &mut usize) -> Result<Layer> {
   let mut ty = 255u8;
   let mut index = 0i32;
   let mut parent: Option<i32> = None;
@@ -1037,6 +1349,7 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
   let mut layer_h: Option<f32> = None;
   let mut masks_pos: Option<usize> = None;
   let mut has_mask = false;
+  let mut paint_count = 0usize;
   let mut matte: Option<u8> = None;
   let mut matte_src = false;
   let mut solid_w = 0.0f32;
@@ -1046,13 +1359,22 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
   let mut auto_orient = false;
   let mut name = String::new();
 
-  for_each_field(c, |c, key| {
-    match key {
-      b"ty" => ty = parse_f32(c)? as u8,
-      b"nm" => name = String::from_utf8_lossy(c.read_string_bytes()?).into_owned(),
-      b"ind" => index = parse_f32(c)? as i32,
-      b"parent" => parent = Some(parse_f32(c)? as i32),
-      b"ip" => in_point = parse_f32(c)?.round(), // patched parser: round()
+  parse_object_once!(c, |c, key| {
+      b"ty" => {
+        ty = parse_f32(c)? as u8;
+      }
+      b"nm" => {
+        name = String::from_utf8_lossy(c.read_string_bytes()?).into_owned();
+      }
+      b"ind" => {
+        index = parse_f32(c)? as i32;
+      }
+      b"parent" => {
+        parent = Some(parse_f32(c)? as i32);
+      }
+      b"ip" => {
+        in_point = parse_f32(c)?.round();
+      }
       b"op" => {
         let authored = parse_f32(c)?;
         let rounded = authored.round();
@@ -1064,11 +1386,21 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
       }
       // rlottie stores start_time as an int (mStartFrame); fractional
       // st truncates, shifting precomp child frames by one otherwise.
-      b"st" => start_time = parse_f32(c)?.trunc(),
-      b"sr" => time_stretch = parse_f32(c)?,
-      b"hd" => hidden = parse_bool(c)?,
-      b"w" => layer_w = Some(parse_f32(c)?),
-      b"h" => layer_h = Some(parse_f32(c)?),
+      b"st" => {
+        start_time = parse_f32(c)?.trunc();
+      }
+      b"sr" => {
+        time_stretch = parse_f32(c)?;
+      }
+      b"hd" => {
+        hidden = parse_bool(c)?;
+      }
+      b"w" => {
+        layer_w = Some(parse_f32(c)?);
+      }
+      b"h" => {
+        layer_h = Some(parse_f32(c)?);
+      }
       b"refId" => {
         let raw = c.read_string_bytes()?;
         ref_id = Some(String::from_utf8_lossy(raw).into_owned());
@@ -1091,10 +1423,18 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
           matte = Some(v);
         }
       }
-      b"td" => matte_src = parse_f32(c)? != 0.0,
-      b"ao" => auto_orient = parse_bool(c)?,
-      b"sw" => solid_w = parse_f32(c)?,
-      b"sh" => solid_h = parse_f32(c)?,
+      b"td" => {
+        matte_src = parse_f32(c)? != 0.0;
+      }
+      b"ao" => {
+        auto_orient = parse_bool(c)?;
+      }
+      b"sw" => {
+        solid_w = parse_f32(c)?;
+      }
+      b"sh" => {
+        solid_h = parse_f32(c)?;
+      }
       b"sc" => {
         let raw = c.read_string_bytes()?;
         solid_color = parse_hex_color(raw);
@@ -1104,8 +1444,9 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
       }
       b"shapes" => {
         if ty == 4 {
-          let mut count = 0usize;
+          let mut count = ShapeCounts::default();
           let (list, _) = parse_shape_list(c, limits, 0, &mut count)?;
+          paint_count = count.paints;
           parsed_shapes = Some(list);
           shapes_pos = None;
         } else {
@@ -1113,9 +1454,7 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
           c.skip_value()?;
         }
       }
-      _ => c.skip_value()?,
-    }
-    Ok(())
+      _ => { c.skip_value()? },
   })?;
 
   let kind = match ty {
@@ -1128,9 +1467,16 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
   let mut shapes = parsed_shapes.unwrap_or_default();
   if kind == LayerKind::Shape && shapes_pos.is_some() {
     if let Some(pos) = shapes_pos {
-      let mut count = 0usize;
+      let mut count = ShapeCounts::default();
       let (list, _) = parse_shape_list(&mut c.fork_at(pos), limits, 0, &mut count)?;
+      paint_count = count.paints;
       shapes = list;
+    }
+  }
+  if kind == LayerKind::Shape && paint_count > 0 {
+    *total_painted_shape_layers += 1;
+    if *total_painted_shape_layers > limits.max_painted_shape_layers {
+      return Err(Error::LimitExceeded(Limit::PaintedShapeLayers));
     }
   }
   let precomp_size = match (kind, layer_w, layer_h) {
@@ -1144,10 +1490,20 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits) -> Result<Layer> {
     Some(pos) if has_mask => parse_masks(&mut c.fork_at(pos), limits)?,
     _ => Vec::new(),
   };
+  *total_masks = total_masks.saturating_add(masks.len());
+  if *total_masks > limits.max_masks {
+    return Err(Error::LimitExceeded(Limit::Masks));
+  }
   let solid = match (kind, solid_color) {
     (LayerKind::Solid, Some(color)) if solid_w > 0.0 && solid_h > 0.0 => Some((solid_w, solid_h, color)),
     _ => None,
   };
+  if solid.is_some() {
+    *total_solid_layers += 1;
+    if *total_solid_layers > limits.max_solid_layers {
+      return Err(Error::LimitExceeded(Limit::SolidLayers));
+    }
+  }
   let time_remap = match (kind, time_remap_pos) {
     (LayerKind::Precomp, Some(pos)) => Some(parse_property(&mut c.fork_at(pos), limits, parse_scalar)?),
     _ => None,
@@ -1196,8 +1552,11 @@ struct FitzEntry {
   replacements: [u32; 5],
 }
 
-fn parse_fitz_entries(c: &mut Cursor<'_>, entries: &mut Vec<FitzEntry>) -> Result<()> {
+fn parse_fitz_entries(c: &mut Cursor<'_>, entries: &mut Vec<FitzEntry>, limits: &Limits) -> Result<()> {
   for_each_element(c, |c| {
+    if entries.len() >= limits.max_fitz_entries {
+      return Err(Error::LimitExceeded(Limit::FitzEntries));
+    }
     let mut entry = FitzEntry { original: 0, replacements: [0; 5] };
     for_each_field(c, |c, key| {
       let target = match key {
@@ -1340,6 +1699,196 @@ fn apply_layer_replacements(layers: &mut [Layer], replacements: &[LayerColorRepl
   }
 }
 
+#[derive(Clone, Copy, Default)]
+struct ExpansionCost {
+  layers: usize,
+  focal_radial_gradients: usize,
+}
+
+impl ExpansionCost {
+  fn add_layer(&mut self, layer: &Layer) {
+    self.layers = self.layers.saturating_add(1);
+    if layer.kind == LayerKind::Shape {
+      self.focal_radial_gradients = self.focal_radial_gradients.saturating_add(focal_radial_gradients_in_shapes(&layer.shapes));
+    }
+  }
+
+  fn add(&mut self, other: Self) {
+    self.layers = self.layers.saturating_add(other.layers);
+    self.focal_radial_gradients = self.focal_radial_gradients.saturating_add(other.focal_radial_gradients);
+  }
+
+  fn validate(&self, limits: &Limits) -> Result<()> {
+    if self.layers > limits.max_precomp_expansion {
+      return Err(Error::LimitExceeded(Limit::PrecompExpansion));
+    }
+    if self.focal_radial_gradients > limits.max_focal_radial_gradient_expansion {
+      return Err(Error::LimitExceeded(Limit::FocalRadialGradientExpansion));
+    }
+    Ok(())
+  }
+}
+
+fn focal_radial_gradients_in_shapes(shapes: &[Shape]) -> usize {
+  shapes.iter().map(focal_radial_gradients_in_shape).sum()
+}
+
+fn focal_radial_gradients_in_shape(shape: &Shape) -> usize {
+  match shape {
+    Shape::Group(group) => focal_radial_gradients_in_shapes(&group.shapes),
+    shape if is_focal_radial_gradient(shape) => 1,
+    _ => 0,
+  }
+}
+
+fn validate_precomp_expansion(layers: &[Layer], assets: &[Asset], limits: &Limits) -> Result<()> {
+  let mut asset_by_id = std::collections::HashMap::new();
+  for (index, asset) in assets.iter().enumerate() {
+    asset_by_id.entry(asset.id.as_str()).or_insert(index);
+  }
+  let mut memo: Vec<Option<ExpansionCost>> = vec![None; assets.len()];
+  let mut visiting = vec![false; assets.len()];
+  let total = layer_list_expansion(layers, assets, &asset_by_id, &mut memo, &mut visiting, limits)?;
+  total.validate(limits)
+}
+
+fn layer_list_expansion<'a>(
+  layers: &[Layer],
+  assets: &'a [Asset],
+  asset_by_id: &std::collections::HashMap<&'a str, usize>,
+  memo: &mut [Option<ExpansionCost>],
+  visiting: &mut [bool],
+  limits: &Limits,
+) -> Result<ExpansionCost> {
+  let mut total = ExpansionCost::default();
+  for layer in layers {
+    total.add_layer(layer);
+    if let (LayerKind::Precomp, Some(ref_id)) = (layer.kind, layer.ref_id.as_deref()) {
+      if let Some(&asset_index) = asset_by_id.get(ref_id) {
+        total.add(asset_expansion(asset_index, assets, asset_by_id, memo, visiting, limits)?);
+      }
+    }
+    total.validate(limits)?;
+  }
+  Ok(total)
+}
+
+fn asset_expansion<'a>(
+  asset_index: usize,
+  assets: &'a [Asset],
+  asset_by_id: &std::collections::HashMap<&'a str, usize>,
+  memo: &mut [Option<ExpansionCost>],
+  visiting: &mut [bool],
+  limits: &Limits,
+) -> Result<ExpansionCost> {
+  if let Some(total) = memo.get(asset_index).copied().flatten() {
+    return Ok(total);
+  }
+  let Some(slot) = visiting.get_mut(asset_index) else {
+    return Ok(ExpansionCost::default());
+  };
+  if *slot {
+    return Err(Error::LimitExceeded(Limit::PrecompExpansion));
+  }
+  *slot = true;
+  let total = layer_list_expansion(&assets[asset_index].layers, assets, asset_by_id, memo, visiting, limits)?;
+  visiting[asset_index] = false;
+  if let Some(slot) = memo.get_mut(asset_index) {
+    *slot = Some(total);
+  }
+  Ok(total)
+}
+
+fn validate_layer_parent_chains(layers: &[Layer], limits: &Limits) -> Result<()> {
+  if !layers.iter().any(|layer| layer.parent.is_some()) {
+    return Ok(());
+  }
+
+  let lookup = ParentLookup::new(layers);
+  let mut depths: Vec<Option<usize>> = vec![None; layers.len()];
+  let mut visiting = vec![false; layers.len()];
+
+  let mut total_depth = 0usize;
+  for slot in 0..layers.len() {
+    total_depth = total_depth.saturating_add(parent_chain_depth(slot, layers, &lookup, &mut depths, &mut visiting, limits)?);
+    if total_depth > limits.max_parent_chain_total_depth {
+      return Err(Error::LimitExceeded(Limit::ParentChainTotalDepth));
+    }
+  }
+  Ok(())
+}
+
+enum ParentLookup<'a> {
+  Linear(&'a [Layer]),
+  Sorted(Vec<(i32, usize)>),
+}
+
+impl<'a> ParentLookup<'a> {
+  fn new(layers: &'a [Layer]) -> Self {
+    if layers.len() <= 256 {
+      return Self::Linear(layers);
+    }
+
+    let mut by_index: Vec<(i32, usize)> = layers.iter().enumerate().map(|(slot, layer)| (layer.index, slot)).collect();
+    by_index.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    Self::Sorted(by_index)
+  }
+
+  #[inline]
+  fn first_layer_with_index(&self, parent: i32) -> Option<usize> {
+    match self {
+      Self::Linear(layers) => layers.iter().position(|layer| layer.index == parent),
+      Self::Sorted(by_index) => {
+        let pos = by_index.partition_point(|&(index, _)| index < parent);
+        by_index.get(pos).and_then(|&(index, slot)| (index == parent).then_some(slot))
+      }
+    }
+  }
+}
+
+fn parent_chain_depth(slot: usize, layers: &[Layer], lookup: &ParentLookup<'_>, depths: &mut [Option<usize>], visiting: &mut [bool], limits: &Limits) -> Result<usize> {
+  if let Some(depth) = depths[slot] {
+    return Ok(depth);
+  }
+  if visiting[slot] {
+    return Err(Error::LimitExceeded(Limit::ParentChainDepth));
+  }
+
+  visiting[slot] = true;
+  let depth = match layers[slot].parent.and_then(|parent| lookup.first_layer_with_index(parent)) {
+    Some(parent) => parent_chain_depth(parent, layers, lookup, depths, visiting, limits)?.saturating_add(1),
+    None => 0,
+  };
+  visiting[slot] = false;
+
+  if depth > limits.max_parent_chain_depth {
+    return Err(Error::LimitExceeded(Limit::ParentChainDepth));
+  }
+  depths[slot] = Some(depth);
+  Ok(depth)
+}
+
+fn parse_layer_list(
+  c: &mut Cursor<'_>,
+  limits: &Limits,
+  total_layers: &mut usize,
+  total_masks: &mut usize,
+  total_painted_shape_layers: &mut usize,
+  total_solid_layers: &mut usize,
+) -> Result<Vec<Layer>> {
+  let mut layers = Vec::new();
+  for_each_element(c, |c| {
+    *total_layers += 1;
+    if *total_layers > limits.max_layers {
+      return Err(Error::LimitExceeded(Limit::Layers));
+    }
+    layers.push(parse_layer(c, limits, total_masks, total_painted_shape_layers, total_solid_layers)?);
+    Ok(())
+  })?;
+  validate_layer_parent_chains(&layers, limits)?;
+  Ok(layers)
+}
+
 /// `#rrggbb` or `#rrggbbaa` solid-layer color.
 fn parse_hex_color(raw: &[u8]) -> Option<Color> {
   let hex = raw.strip_prefix(b"#").unwrap_or(raw);
@@ -1370,26 +1919,16 @@ fn parse_repeater_transform(c: &mut Cursor<'_>, limits: &Limits) -> Result<(Tran
   let mut tf = Transform::identity();
   let mut so = Property::Static(100.0);
   let mut eo = Property::Static(100.0);
-  let mut p_pos: Option<usize> = None;
-  for_each_field(c, |c, key| {
-    match key {
-      b"a" => tf.anchor = parse_property(c, limits, parse_vec2)?,
-      b"p" => {
-        p_pos = Some(c.pos());
-        c.skip_value()?;
-      }
-      b"s" => tf.scale = parse_property(c, limits, parse_vec2)?,
-      b"r" => tf.rotation = parse_property(c, limits, parse_scalar)?,
-      b"o" => tf.opacity = parse_property(c, limits, parse_scalar)?,
-      b"so" => so = parse_property(c, limits, parse_scalar)?,
-      b"eo" => eo = parse_property(c, limits, parse_scalar)?,
-      _ => c.skip_value()?,
-    }
-    Ok(())
+  parse_object_once!(c, |c, key| {
+    b"a" => { tf.anchor = parse_property(c, limits, parse_vec2)?; },
+    b"p" => { tf.position = parse_position(c, limits)?; },
+    b"s" => { tf.scale = parse_property(c, limits, parse_vec2)?; },
+    b"r" => { tf.rotation = parse_property(c, limits, parse_scalar)?; },
+    b"o" => { tf.opacity = parse_property(c, limits, parse_scalar)?; },
+    b"so" => { so = parse_property(c, limits, parse_scalar)?; },
+    b"eo" => { eo = parse_property(c, limits, parse_scalar)?; },
+    _ => { c.skip_value()?; },
   })?;
-  if let Some(pos) = p_pos {
-    tf.position = parse_position(&mut c.fork_at(pos), limits)?;
-  }
   Ok((tf, so, eo))
 }
 
@@ -1397,6 +1936,9 @@ fn parse_repeater_transform(c: &mut Cursor<'_>, limits: &Limits) -> Result<(Tran
 fn parse_masks(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<Mask>> {
   let mut out = Vec::new();
   for_each_element(c, |c| {
+    if out.len() >= limits.max_masks_per_layer {
+      return Err(Error::LimitExceeded(Limit::MasksPerLayer));
+    }
     let mut mode = b'a';
     let mut invert = false;
     let mut pt_pos: Option<usize> = None;
@@ -1424,7 +1966,10 @@ fn parse_masks(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<Mask>> {
     if mode == b'n' {
       return Ok(());
     }
-    let path = parse_property(&mut c.fork_at(pt_pos), limits, parse_path_value)?;
+    let path = parse_property(&mut c.fork_at(pt_pos), limits, |c| parse_path_value(c, limits))?;
+    if path_property_exceeds_points(&path, limits.max_mask_path_points) {
+      return Err(Error::LimitExceeded(Limit::MaskPathPoints));
+    }
     let opacity = match o_pos {
       Some(pos) => parse_property(&mut c.fork_at(pos), limits, parse_scalar)?,
       None => Property::Static(100.0),
@@ -1435,38 +1980,47 @@ fn parse_masks(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<Mask>> {
   Ok(out)
 }
 
+fn path_property_exceeds_points(path: &Property<PathData>, max_points: usize) -> bool {
+  match path {
+    Property::Static(data) => data.vertices.len() > max_points,
+    Property::Animated(timeline) => {
+      timeline.first.value.vertices.len() > max_points
+        || timeline.first.end.as_ref().is_some_and(|data| data.vertices.len() > max_points)
+        || timeline
+          .rest
+          .iter()
+          .any(|kf| kf.value.vertices.len() > max_points || kf.end.as_ref().is_some_and(|data| data.vertices.len() > max_points))
+    }
+  }
+}
+
 /// One entry of the top-level `assets` array. Only precomp assets (those
 /// with a `layers` list) are kept; image assets are ignored.
-fn parse_asset(c: &mut Cursor<'_>, limits: &Limits, total_layers: &mut usize) -> Result<Option<Asset>> {
+fn parse_asset(
+  c: &mut Cursor<'_>,
+  limits: &Limits,
+  total_layers: &mut usize,
+  total_masks: &mut usize,
+  total_painted_shape_layers: &mut usize,
+  total_solid_layers: &mut usize,
+) -> Result<Option<Asset>> {
   let mut id = String::new();
-  let mut layers_pos: Option<usize> = None;
-  for_each_field(c, |c, key| {
-    match key {
+  let mut layers = Vec::new();
+  let mut has_layers = false;
+  parse_object_once!(c, |c, key| {
       b"id" => {
         let raw = c.read_string_bytes()?;
         id = String::from_utf8_lossy(raw).into_owned();
       }
       b"layers" => {
-        layers_pos = Some(c.pos());
-        c.skip_value()?;
+        has_layers = true;
+        layers = parse_layer_list(c, limits, total_layers, total_masks, total_painted_shape_layers, total_solid_layers)?;
       }
-      _ => c.skip_value()?,
-    }
-    Ok(())
+      _ => { c.skip_value()? },
   })?;
-  let Some(pos) = layers_pos else {
+  if !has_layers {
     return Ok(None);
-  };
-  let mut layers = Vec::new();
-  let mut lc = c.fork_at(pos);
-  for_each_element(&mut lc, |c| {
-    *total_layers += 1;
-    if *total_layers > limits.max_layers {
-      return Err(Error::LimitExceeded(Limit::Layers));
-    }
-    layers.push(parse_layer(c, limits)?);
-    Ok(())
-  })?;
+  }
   Ok(Some(Asset { id, layers }))
 }
 
@@ -1488,40 +2042,39 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
   let mut layers: Vec<Layer> = Vec::new();
   let mut assets: Vec<Asset> = Vec::new();
   let mut total_layers = 0usize;
+  let mut total_masks = 0usize;
+  let mut total_painted_shape_layers = 0usize;
+  let mut total_solid_layers = 0usize;
   let mut fitz_entries = Vec::new();
 
-  for_each_field(&mut c, |c, key| {
-    match key {
-      b"w" => width = Some(c.parse_f64()?),
-      b"h" => height = Some(c.parse_f64()?),
-      b"fr" => frame_rate = Some(c.parse_f64()?),
-      b"ip" => in_point = Some(c.parse_f64()?),
-      b"op" => out_point = Some(c.parse_f64()?),
+  parse_object_once!(&mut c, |c, key| {
+      b"w" => { width = Some(c.parse_f64()?); },
+      b"h" => { height = Some(c.parse_f64()?); },
+      b"fr" => { frame_rate = Some(c.parse_f64()?); },
+      b"ip" => { in_point = Some(c.parse_f64()?); },
+      b"op" => { out_point = Some(c.parse_f64()?); },
       b"layers" => {
-        for_each_element(c, |c| {
-          total_layers += 1;
-          if total_layers > limits.max_layers {
-            return Err(Error::LimitExceeded(Limit::Layers));
-          }
-          layers.push(parse_layer(c, limits)?);
-          Ok(())
-        })?;
+        layers = parse_layer_list(c, limits, &mut total_layers, &mut total_masks, &mut total_painted_shape_layers, &mut total_solid_layers)?;
       }
       b"assets" => {
         for_each_element(c, |c| {
           if assets.len() >= limits.max_assets {
             return Err(Error::LimitExceeded(Limit::Assets));
           }
-          if let Some(asset) = parse_asset(c, limits, &mut total_layers)? {
+          if let Some(asset) = parse_asset(c, limits, &mut total_layers, &mut total_masks, &mut total_painted_shape_layers, &mut total_solid_layers)? {
             assets.push(asset);
           }
           Ok(())
         })?;
       }
-      b"fitz" => parse_fitz_entries(c, &mut fitz_entries)?,
-      _ => c.skip_value()?,
-    }
-    Ok(())
+      b"fitz" => {
+        if options.fitz_modifier.replacement_index().is_some() {
+          parse_fitz_entries(c, &mut fitz_entries, limits)?;
+        } else {
+          c.skip_value()?;
+        }
+      }
+      _ => { c.skip_value()? },
   })?;
   c.skip_ws();
   if c.peek().is_some() {
@@ -1547,6 +2100,7 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
   if !out_point.is_finite() || !in_point.is_finite() || out_point <= in_point {
     return Err(missing("out point must be greater than in point"));
   }
+  validate_precomp_expansion(&layers, &assets, limits)?;
 
   // Static detection piggybacks on parsing: every deferred cursor shares the
   // animated-property bit. Keep the final lifetime check flat and
@@ -1567,7 +2121,7 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
     apply_layer_replacements(&mut asset.layers, &options.layer_color_replacements);
   }
 
-  Ok(Composition {
+  let mut composition = Composition {
     width: width as u32,
     height: height as u32,
     frame_rate: frame_rate as f32,
@@ -1576,7 +2130,14 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
     static_content,
     layers,
     assets,
-  })
+    channel_order: options.channel_order,
+  };
+  // Last step, deliberately: color replacements above match and supply
+  // `0xAARRGGBB`, so the swap has to happen after they have been resolved.
+  if options.channel_order == crate::composition::options::ChannelOrder::Bgra {
+    crate::composition::swizzle::swap_red_blue(&mut composition);
+  }
+  Ok(composition)
 }
 
 #[cfg(test)]

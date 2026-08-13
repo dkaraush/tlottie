@@ -55,6 +55,19 @@ fn rejects_oversized_dimensions() {
 }
 
 #[test]
+fn rejects_too_many_solid_layers() {
+  let mut layers = String::new();
+  for i in 0..=Limits::default().max_solid_layers {
+    if i > 0 {
+      layers.push(',');
+    }
+    layers.push_str(&format!(r##"{{"ty":1,"ind":{i},"sw":64,"sh":64,"sc":"#ff0000","ip":0,"op":60,"st":0,"ks":{{}}}}"##));
+  }
+  let json = format!(r#"{{"fr":30,"ip":0,"op":60,"w":64,"h":64,"layers":[{layers}]}}"#);
+  assert!(matches!(parse(&json), Err(Error::LimitExceeded(Limit::SolidLayers))));
+}
+
+#[test]
 fn rejects_trailing_data() {
   let with_trailer = format!("{MINIMAL}x");
   assert!(matches!(
@@ -97,6 +110,24 @@ fn parses_shape_layer() {
   assert!(matches!(g.shapes.get(1), Some(Shape::Fill(_))));
   assert!(comp.is_static());
   assert_eq!(comp.frame_count(), 1);
+}
+
+#[test]
+fn primitive_direction_is_order_independent() {
+  let comp = parse(
+    r#"{"fr":30,"ip":0,"op":30,"w":100,"h":100,"layers":[
+              {"ty":4,"ind":1,"ip":0,"op":30,"st":0,"ks":{},
+               "shapes":[
+                  {"d":3,"ty":"el","p":{"a":0,"k":[50,50]},"s":{"a":0,"k":[10,10]}},
+                  {"ty":"fl","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"r":1}
+               ]}
+          ]}"#,
+  )
+  .unwrap();
+  let Some(Shape::Ellipse(ellipse)) = comp.layers[0].shapes.first() else {
+    panic!("expected ellipse");
+  };
+  assert!(ellipse.reversed);
 }
 
 #[test]

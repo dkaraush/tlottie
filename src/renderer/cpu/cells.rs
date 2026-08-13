@@ -125,14 +125,29 @@ impl CellRaster {
     let exr = rx >> PIX_B;
     let dx_t = i64::from(rx - lx); // > 0 (distinct columns)
     let dy_t = i64::from(ry - ly);
-    // y at the first right boundary, then exact incremental steps.
+    // y at the first right boundary, then exact incremental steps. Euclidean
+    // floor division by the positive divisor `dx_t`, computed as trunc `/`+`%`
+    // (one idiv pair per dividend) plus a negative-remainder fixup — bit-exact
+    // with `div_euclid`/`rem_euclid` (profiled: div_euclid is the sweep
+    // walk hotspot at 720px).
     let bx0 = (exl + 1) << PIX_B;
     let num0 = i64::from(bx0 - lx) * dy_t;
-    let mut ycur = ly + num0.div_euclid(dx_t) as i32;
-    let mut rem = num0.rem_euclid(dx_t);
+    let mut tq = num0 / dx_t;
+    let mut tr = num0 % dx_t;
+    if tr < 0 {
+      tq -= 1;
+      tr += dx_t;
+    }
+    let mut ycur = ly + tq as i32;
+    let mut rem = tr;
     let stepnum = i64::from(ONE) * dy_t;
-    let q = stepnum.div_euclid(dx_t) as i32;
-    let r = stepnum.rem_euclid(dx_t);
+    let mut q = stepnum / dx_t;
+    let mut r = stepnum % dx_t;
+    if r < 0 {
+      q -= 1;
+      r += dx_t;
+    }
+    let q = q as i32;
     // First column: enters at lx, exits at the boundary (fx_b = ONE).
     let fx_a = lx - (exl << PIX_B);
     let d0 = ycur - ly;
@@ -198,22 +213,45 @@ impl CellRaster {
       return;
     }
     // Split at each integer scanline from the ORIGINAL endpoints (exact
-    // i64 interpolation ⇒ reversal-stable split points).
+    // i64 interpolation ⇒ reversal-stable split points). The split x at row
+    // boundary `by` is `x0 + trun((by − y0)·dx/dy)`. `by` grows by
+    // exactly ONE per scanline, so the numerator grows by B = ONE·|dx| each
+    // step and the quotient can be maintained incrementally (one div+mod per
+    // segment instead of one per scanline — the per-boundary i64 division
+    // was a documented 720px hotspot). Truncation is reproduced exactly via a
+    // magnitude DDA with a sign factor, so split points are bit-identical.
     let dx_total = i64::from(x1 - x0);
-    let dy_total = i64::from(y1 - y0);
+    let dy_total = i64::from(y1 - y0); // > 0 after normalization
+    let (s, adx) = if dx_total < 0 { (-1i64, -dx_total) } else { (1i64, dx_total) };
+    debug_assert!(dy_total > 0);
+    let by0 = i64::from((ey0 + 1) << PIX_B);
+    let a0 = (by0 - i64::from(y0)) * adx;
+    let b = i64::from(ONE) * adx;
+    let d = dy_total;
+    let q = b / d;
+    let r = b % d;
+    let mut qmag = a0 / d;
+    let mut rem = a0 % d;
     let mut xa = x0;
     let mut ya = y0;
     let mut ey = ey0;
     while ey < ey1 {
       let by = (ey + 1) << PIX_B; // bottom boundary of row ey
-      let num = i64::from(by - y0) * dx_total;
-      let xb_at = x0 + (num / dy_total) as i32;
+      let xb_at = x0 + (s * qmag) as i32;
       if ey >= 0 && (ey as usize) < self.h {
         let base = ey << PIX_B;
         self.scanline(ey as usize, xa, ya - base, xb_at, by - base, dir);
       }
       xa = xb_at;
       ya = by;
+      // Advance the magnitude DDA: |num| grows by B = q·d + r per row.
+      rem += r;
+      if rem >= d {
+        rem -= d;
+        qmag += q + 1;
+      } else {
+        qmag += q;
+      }
       ey += 1;
     }
     if ey >= 0 && (ey as usize) < self.h && ya < y1 {

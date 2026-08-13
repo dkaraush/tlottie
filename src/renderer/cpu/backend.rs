@@ -180,7 +180,7 @@ impl CPURenderer {
         };
         let _source_dirty = self.surface_dirty.pop().unwrap_or_else(DirtyBox::empty);
         let source_rows = self.surface_rows.pop().unwrap_or_default();
-        apply_matte(&mut target, &source, kind, source_opacity);
+        apply_matte(&mut target, &source, kind, source_opacity, self.comp.channel_order);
         let width = self.width;
         composite_over_rows(self.active(), &target, width, &target_rows, target_dirty, opacity);
         if !target_dirty.is_empty() {
@@ -507,6 +507,10 @@ fn fill_gradient<const TRACK_ROWS: bool>(
   alpha_only: bool,
 ) {
   if !alpha_only {
+    if gradient.alpha < 255 {
+      canvas.fill_gradient_translated_alpha::<TRACK_ROWS>(cache, key, gradient.source_key, contours, translation, fill_rule(gradient.rule), &gradient.lut, map, gradient.alpha);
+      return;
+    }
     canvas.fill_gradient_translated::<TRACK_ROWS>(cache, key, gradient.source_key, contours, translation, fill_rule(gradient.rule), &gradient.lut, map);
     return;
   }
@@ -517,13 +521,22 @@ fn fill_gradient<const TRACK_ROWS: bool>(
       r: 0.0,
       g: 0.0,
       b: 0.0,
-      a: first_alpha as f32 / 255.0,
+      a: first_alpha as f32 / 255.0 * f32::from(gradient.alpha) / 255.0,
     };
     canvas.fill_translated::<TRACK_ROWS>(cache, key, contours, translation, fill_rule(gradient.rule), color, 1.0);
     return;
   }
 
   let mut alpha_lut = [0u32; crate::renderer::frame::GRADIENT_LUT_SIZE];
+  if gradient.alpha < 255 {
+    let k = u32::from(gradient.alpha);
+    for (out, &pixel) in alpha_lut.iter_mut().zip(gradient.lut.iter()) {
+      *out = ((pixel >> 24) * k / 255) << 24;
+    }
+    let plane_key = gradient.source_key ^ (1u128 << 127) ^ (u128::from(gradient.alpha) << 32);
+    canvas.fill_gradient_translated::<TRACK_ROWS>(cache, key, plane_key, contours, translation, fill_rule(gradient.rule), &alpha_lut, map);
+    return;
+  }
   for (out, &pixel) in alpha_lut.iter_mut().zip(gradient.lut.iter()) {
     *out = pixel & 0xff00_0000;
   }

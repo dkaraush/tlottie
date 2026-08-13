@@ -56,6 +56,7 @@ DEFAULT_OUT = ROOT / "target" / "benchmark"
 DEFAULT_SIZES = (64, 320, 720)
 DEFAULT_RENDERERS = ("tlottie", "rlottie", "rlottie_2019", "rlottie_2019_patched", "thorvg")
 RENDERERS = DEFAULT_RENDERERS + ("tlottie-vulkan",)
+TLOTTIE_VERSION_NAMES: tuple[str, ...] = ()
 RLOTTIE_RENDERERS = ("rlottie", "rlottie_2019", "rlottie_2019_patched")
 RENDERER_URLS = {
     "tlottie": "https://github.com/dkaraush/tlottie",
@@ -88,6 +89,31 @@ LIBS = {
     "thorvg": PROJECT_DIRS["thorvg"] / "build-release" / "src" / f"libthorvg-1{LIB_SUFFIX}",
     "tlottie-vulkan": ROOT / "target" / "release" / "tlottie-cli",
 }
+
+
+def add_tlottie_versions(versions: list[str]) -> tuple[str, ...]:
+    """Registers extra tlottie builds (from `--tlottie-version NAME=PATH`) as
+    renderers in `LIBS`/`RENDERERS`. Returns the added renderer names.
+
+    PATH may be a source tree (its `target/release/libtlottie.so` is used) or
+    a direct path to a `libtlottie.so`. `--skip-build` must be used: extra
+    builds are never compiled by this script, only validated for existence.
+    """
+    global RENDERERS, TLOTTIE_VERSION_NAMES
+    added: list[str] = []
+    for spec in versions:
+        name, _, path = spec.partition("=")
+        if not path:
+            raise SystemExit(f"--tlottie-version expects NAME=PATH, got: {spec!r}")
+        if not name or name in LIBS:
+            raise SystemExit(f"--tlottie-version name {name!r} is empty or already a renderer")
+        tree = Path(path)
+        lib = tree / "target" / "release" / f"libtlottie{LIB_SUFFIX}" if tree.is_dir() else tree
+        LIBS[name] = lib
+        RENDERERS = RENDERERS + (name,)
+        added.append(name)
+    TLOTTIE_VERSION_NAMES = tuple(added)
+    return tuple(added)
 
 ANDROID_DEFAULT_OUT = ROOT / "target" / "benchmark-android"
 ANDROID_DEFAULT_DEVICE_ROOT = "/data/local/tmp/tgs_dump"
@@ -425,11 +451,20 @@ if platform.system() == "Darwin":
 def process_memory_mb(pid: int) -> float:
     """Return the process memory metric used by the benchmark, in MiB.
 
+    Both backends report the memory attributable to one (renderer, canvas-size)
+    worker process so renderers compare apples-to-apples.
+
     macOS's resident size includes shared/mapped pages and is a misleading
     comparison between native libraries.  ``ri_phys_footprint`` is the kernel's
     accounting of the process's attributable physical memory and is the value
-    Activity Monitor uses for its Memory column.  Linux has no direct
-    equivalent available here, so retain current RSS there.
+    Activity Monitor uses for its Memory column.
+
+    Linux has no kernel ``footprint`` equivalent, so the fair counterpart is the
+    process's own resident high-water mark (``VmHWM`` in ``/proc/PID/status``),
+    which is the true peak working set of the isolated renderer process rather than a
+    single instantaneous ``VmRSS`` sample.  ``max`` over the sampled points then
+    equals the real peak (the watermark only ever grows), matching the macOS
+    attribution intent.
 
     The historical ``rss_mb`` helper and raw-output ``*_rss_*`` aliases are
     retained for compatibility with existing benchmark consumers.
@@ -441,7 +476,7 @@ def process_memory_mb(pid: int) -> float:
         return 0.0
     try:
         for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-            if line.startswith("VmRSS:"):
+            if line.startswith("VmHWM:"):
                 return float(line.split()[1]) / 1024.0
     except OSError:
         pass
@@ -1501,7 +1536,7 @@ def init_worker(
     _WORKER_ALPHA_ONLY = alpha_only
     for renderer in renderers:
         lib = Path(libs[renderer])
-        if renderer == "tlottie":
+        if renderer == "tlottie" or renderer in TLOTTIE_VERSION_NAMES:
             _WORKER_RENDERERS[renderer] = Tlottie(lib, curve_tolerance, alpha_only)
         elif renderer == "tlottie-vulkan":
             _WORKER_RENDERERS[renderer] = TlottieVulkan(lib, curve_tolerance, alpha_only)
@@ -1636,6 +1671,7 @@ def run_size_batch(
     curve_tolerance: float,
     alpha_only: bool,
     progress: ProgressDisplay | None = None,
+    label: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     sampler = EnergySampler()
     sampler.start()
@@ -1646,6 +1682,7 @@ def run_size_batch(
     progress_every = progress_interval(total)
     owns_progress = progress is None
     progress = progress or ProgressDisplay(f"measure {renderers[0]} {size}px", total)
+    measure_label = label or renderers[0]
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=jobs,
         initializer=init_worker,
@@ -1672,7 +1709,7 @@ def run_size_batch(
                 accuracy_rows.append(accuracy_row)
             if progress.interactive:
                 progress.advance(
-                    f"measure {renderers[0]} {size}px",
+                    f"measure {measure_label} {size}px",
                     display_file(files[done - 1], root),
                 )
             elif should_report_progress(done, total, progress_every):
@@ -2797,7 +2834,14 @@ def pivot_aggregate(rows: list[dict[str, Any]], key_cols: tuple[str, ...]) -> li
     return [by_key[k] for k in sorted(by_key)]
 
 
-def write_tgv(path: Path, rows: list[dict[str, Any]], renderers: tuple[str, ...], key_cols: tuple[str, ...]) -> None:
+def write_tgv(
+    path: Path,
+    rows: list[dict[str, Any]],
+    renderers: tuple[str, ...],
+    key_cols: tuple[str, ...],
+    include_memory: bool = True,
+    include_energy: bool = True,
+) -> None:
     cols = list(key_cols)
     comparison_renderer = tl_vs_rl19_renderer(renderers)
     comparison_col = tl_vs_rl19_label(comparison_renderer)
@@ -2813,7 +2857,11 @@ def write_tgv(path: Path, rows: list[dict[str, Any]], renderers: tuple[str, ...]
             ]
         else:
             cols += [f"{r}_first_frame_ms", f"{r}_frame_ms"]
-        cols += [f"{r}_memory_avg_mb", f"{r}_memory_max_mb", f"{r}_energy_j", f"{r}_error"]
+        if include_memory:
+            cols += [f"{r}_memory_avg_mb", f"{r}_memory_max_mb"]
+        if include_energy:
+            cols.append(f"{r}_energy_j")
+        cols.append(f"{r}_error")
     with path.open("w", encoding="utf-8") as f:
         f.write("\t".join(cols) + "\n")
         for row in rows:
@@ -2836,6 +2884,114 @@ def tl_vs_rl19_renderer(renderers: tuple[str, ...]) -> str | None:
     if "rlottie_2019_patched" in renderers:
         return "rlottie_2019_patched"
     return None
+
+
+def import_tgv_path(path: Path) -> Path:
+    """Resolve the machine-readable benchmark.tgv for an --import-results path.
+
+    Accepts a .tgv file directly or an .html report whose sibling benchmark.tgv
+    carries the same per-(pack,size) data.
+    """
+    if path.suffix.lower() == ".tgv":
+        return path
+    if path.suffix.lower() == ".html":
+        sibling = path.parent / "benchmark.tgv"
+        if sibling.exists():
+            return sibling
+        raise SystemExit(f"no sibling benchmark.tgv for {path}")
+    raise SystemExit(f"--import-results expects a .tgv or .html path: {path}")
+
+
+def _cell_float(value: str | None) -> float | None:
+    if value is None or value == "n/a" or value == "":
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def load_imported_tgv(path: Path) -> tuple[list[str], dict[tuple[str, int], dict[str, Any]]]:
+    """Read a benchmark.tgv produced by write_tgv.
+
+    Returns (column_names, {(pack, size): {col: raw string}}). Only the header
+    and the raw cell strings live here; numeric conversion happens on request so
+    the caller can decide which columns to reuse (e.g. ignoring memory whose
+    pooled-worker sampling is meaningless on this host).
+    """
+    cols: list[str] = []
+    rows: dict[tuple[str, int], dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as f:
+        header = f.readline().rstrip("\n").split("\t")
+        cols = header
+        for line in f:
+            if not line.strip():
+                continue
+            cells = line.rstrip("\n").split("\t")
+            row = dict(zip(header, cells))
+            pack = row.get("pack")
+            try:
+                size = int(row.get("size"))
+            except (TypeError, ValueError):
+                continue
+            if pack is None:
+                continue
+            rows[(pack, size)] = row
+    return cols, rows
+
+
+def imported_pack_rows(
+    cols: list[str],
+    rows: dict[tuple[str, int], dict[str, Any]],
+    renderers: tuple[str, ...],
+    imported: set[str],
+) -> list[dict[str, Any]]:
+    """Synthesize aggregate pack rows for imported renderers from a previous tgv.
+
+    These rows carry the same shape as aggregate_pack_rows output so
+    pivot_aggregate can merge them into the report next to freshly measured
+    renderers. Memory/energy are copied verbatim when present in the source
+    columns; otherwise they become None (rendered as n/a, never fabricated).
+    """
+    out: list[dict[str, Any]] = []
+    for (pack, size), row in rows.items():
+        for r in sorted(imported & set(renderers)):
+            frame_ms = _cell_float(row.get(f"{r}_frame_ms"))
+            err = (row.get(f"{r}_error") or "").strip()
+            ok = 1 if frame_ms is not None and not err else 0
+            out.append(
+                {
+                    "pack": pack,
+                    "size": size,
+                    "renderer": r,
+                    "files": 1 if ok else 0,
+                    "ok": ok,
+                    "first_frame_ms": _cell_float(row.get(f"{r}_first_frame_ms")) or 0,
+                    "frame_ms": frame_ms,
+                    "cpu_prepare_ms": _cell_float(row.get(f"{r}_cpu_prepare_ms")),
+                    "gpu_draw_ms": _cell_float(row.get(f"{r}_gpu_draw_ms")),
+                    "total_frame_ms": _cell_float(row.get(f"{r}_total_frame_ms")),
+                    "other_frames": 0,
+                    "measured_ms": 0.0,
+                    "memory_avg_mb": (
+                        _cell_float(row.get(f"{r}_memory_avg_mb"))
+                        if f"{r}_memory_avg_mb" in cols
+                        else None
+                    ),
+                    "memory_max_mb": (
+                        _cell_float(row.get(f"{r}_memory_max_mb"))
+                        if f"{r}_memory_max_mb" in cols
+                        else None
+                    ),
+                    "energy_j": (
+                        _cell_float(row.get(f"{r}_energy_j"))
+                        if f"{r}_energy_j" in cols
+                        else None
+                    ),
+                    "error": err,
+                }
+            )
+    return out
 
 
 def tl_vs_rl19_label(renderer: str | None) -> str:
@@ -2906,7 +3062,13 @@ def write_html(
     accuracy_diff_threshold: float,
     benchmark_command: str | None = None,
     machine_details: str | None = None,
+    include_memory: bool = True,
 ) -> None:
+    # Emit a J column only when some renderer actually reported energy values;
+    # otherwise the whole column would read n/a for every row.
+    include_energy = any(
+        row.get(f"{r}_energy_j") is not None for row in pack_rows for r in renderers
+    )
     benchmark_command = benchmark_command or "python3 tools/benchmark.py"
     machine_details = machine_details or current_machine_details()
     css = """
@@ -3039,7 +3201,16 @@ document.querySelectorAll('table').forEach((table) => {
         for size in sorted({r["size"] for r in pack_rows}):
             f.write(f"<h2>{size}px</h2>")
             rows = pivot_aggregate([r for r in pack_rows if r["size"] == size], ("pack", "size"))
-            write_grouped_table(f, rows, renderers, ("pack",), include_size=False, accuracy_by_pack=accuracy_by_pack)
+            write_grouped_table(
+                f,
+                rows,
+                renderers,
+                ("pack",),
+                include_size=False,
+                accuracy_by_pack=accuracy_by_pack,
+                include_memory=include_memory,
+                include_energy=include_energy,
+            )
         effect_file_rows = [
             r
             for r in file_rows
@@ -3049,7 +3220,16 @@ document.querySelectorAll('table').forEach((table) => {
             f.write("<h2>720px effects</h2>")
             effect_pack_rows = aggregate_pack_rows(effect_file_rows)
             rows = pivot_aggregate(effect_pack_rows, ("pack", "size"))
-            write_grouped_table(f, rows, renderers, ("pack",), include_size=False, accuracy_by_pack=accuracy_by_pack)
+            write_grouped_table(
+                f,
+                rows,
+                renderers,
+                ("pack",),
+                include_size=False,
+                accuracy_by_pack=accuracy_by_pack,
+                include_memory=include_memory,
+                include_energy=include_energy,
+            )
         f.write("</main>")
         f.write(f"<script>{sorting_js}</script>")
 
@@ -3061,6 +3241,8 @@ def write_grouped_table(
     labels: tuple[str, ...],
     include_size: bool,
     accuracy_by_pack: dict[str, dict[str, Any]] | None = None,
+    include_memory: bool = True,
+    include_energy: bool = True,
 ) -> None:
     comparison_renderer = tl_vs_rl19_renderer(renderers)
     include_comparison = comparison_renderer is not None
@@ -3076,24 +3258,28 @@ def write_grouped_table(
     for r in renderers:
         url = RENDERER_URLS.get(r)
         name = f"<a href='{esc(url)}'>{esc(r)}</a>" if url else esc(r)
-        columns = 5 if r == "tlottie-vulkan" else 4
+        columns = renderer_metric_cols(r, include_memory, include_energy)
         f.write(f"<th colspan='{columns}' class='renderer'>{name}</th>")
     f.write("</tr><tr>")
     for r in renderers:
         if r == "tlottie-vulkan":
-            f.write(
-                "<th class='metric' title='Average CPU frame preparation and command-recording time'>CPU, ms</th>"
-                "<th title='Average GPU rendering timestamp'>GPU, ms</th>"
-                "<th title='Average CPU preparation plus queue submit/fence wait'>total, ms</th>"
-                "<th>MiB (avg/max)</th>"
-                "<th class='metric-last'>J</th>"
-            )
+            base = [
+                "<th class='metric' title='Average CPU frame preparation and command-recording time'>CPU, ms</th>",
+                "<th title='Average GPU rendering timestamp'>GPU, ms</th>",
+                "<th title='Average CPU preparation plus queue submit/fence wait'>total, ms</th>",
+            ]
         else:
-            f.write(
-                "<th class='metric'>fms</th><th>ms</th>"
-                "<th>MiB (avg/max)</th>"
-                "<th class='metric-last'>J</th>"
-            )
+            base = [
+                "<th class='metric'>fms</th>",
+                "<th>ms</th>",
+            ]
+        if include_memory:
+            base.append("<th>MiB (avg/max)</th>")
+        if include_energy:
+            base.append("<th>J</th>")
+        # The last sub-header cell closes the renderer's group border.
+        base[-1] = base[-1].replace("<th", "<th class='metric-last'", 1)
+        f.write("\n".join(base))
     f.write("</tr>")
     for row in rows:
         f.write("<tr>")
@@ -3113,34 +3299,35 @@ def write_grouped_table(
         for r in renderers:
             err = row.get(f"{r}_error")
             if err:
-                columns = 5 if r == "tlottie-vulkan" else 4
+                columns = renderer_metric_cols(r, include_memory, include_energy)
                 f.write(f"<td colspan='{columns}' class='loser left'>{esc(err)}</td>")
                 continue
-            first_cls = metric_class(row, r, "first_frame_ms", renderers)
-            frame_cls = metric_class(row, r, "frame_ms", renderers)
-            mem_cls = metric_class(row, r, "memory_avg_mb", renderers)
-            energy_cls = metric_class(row, r, "energy_j", renderers)
+            cells = []
             if r == "tlottie-vulkan":
-                f.write(f"<td class='metric'>{num(row.get(f'{r}_cpu_prepare_ms'))}</td>")
-                f.write(f"<td>{num(row.get(f'{r}_gpu_draw_ms'))}</td>")
-                f.write(f"<td>{num(row.get(f'{r}_total_frame_ms'))}</td>")
-                f.write(
-                    f"<td class='{mem_cls}'>{num(row.get(f'{r}_memory_avg_mb'))} / "
+                cells.append(f"<td class='metric'>{num(row.get(f'{r}_cpu_prepare_ms'))}</td>")
+                cells.append(f"<td>{num(row.get(f'{r}_gpu_draw_ms'))}</td>")
+                cells.append(f"<td>{num(row.get(f'{r}_total_frame_ms'))}</td>")
+            else:
+                first_cls = metric_class(row, r, "first_frame_ms", renderers)
+                frame_cls = metric_class(row, r, "frame_ms", renderers)
+                cells.append(f"<td class='metric {first_cls}'>{num(row.get(f'{r}_first_frame_ms'))}</td>")
+                cells.append(f"<td class='{frame_cls}'>{num(row.get(f'{r}_frame_ms'))}</td>")
+            if include_memory:
+                cells.append(
+                    f"<td>{num(row.get(f'{r}_memory_avg_mb'))} / "
                     f"{num(row.get(f'{r}_memory_max_mb'))}</td>"
                 )
-                f.write(f"<td class='metric-last {energy_cls}'>{num(row.get(f'{r}_energy_j'))}</td>")
-                continue
-            f.write(
-                f"<td class='metric {first_cls}'>{num(row.get(f'{r}_first_frame_ms'))}</td>"
-            )
-            f.write(f"<td class='{frame_cls}'>{num(row.get(f'{r}_frame_ms'))}</td>")
-            f.write(
-                f"<td class='{mem_cls}'>{num(row.get(f'{r}_memory_avg_mb'))} / "
-                f"{num(row.get(f'{r}_memory_max_mb'))}</td>"
-            )
-            f.write(f"<td class='metric-last {energy_cls}'>{num(row.get(f'{r}_energy_j'))}</td>")
+            if include_energy:
+                cells.append(f"<td>{num(row.get(f'{r}_energy_j'))}</td>")
+            cells[-1] = cells[-1].replace("<td", "<td class='metric-last'", 1)
+            f.write("\n".join(cells))
         f.write("</tr>")
     f.write("</table></div>")
+
+
+def renderer_metric_cols(renderer: str, include_memory: bool, include_energy: bool) -> int:
+    base = 3 if renderer == "tlottie-vulkan" else 2
+    return base + int(include_memory) + int(include_energy)
 
 
 def pack_label(pack: str, accuracy: dict[str, Any] | None) -> str:
@@ -3230,9 +3417,14 @@ def benchmark_invocation(args: argparse.Namespace, accuracy_size: int) -> str:
     for option, enabled in (
         ("--no-accuracy", args.no_accuracy),
         ("--alpha-only", args.alpha_only),
+        ("--show-memory", args.show_memory),
     ):
         if enabled:
             command.append(option)
+    if args.import_results is not None:
+        command.extend(("--import-results", str(args.import_results)))
+        if args.import_renderers:
+            command.extend(("--import-renderers", args.import_renderers))
     return shlex.join(command)
 
 
@@ -3995,6 +4187,48 @@ def main(argv: list[str] | None = None) -> int:
             "or tlottie,rlottie,rlottie_2019,rlottie_2019_patched,thorvg on Android"
         ),
     )
+    ap.add_argument(
+        "--tlottie-version",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help=(
+            "add an extra tlottie build as its own renderer, measured interleaved "
+            "with the primary tlottie in the same run (for A/B of two versions). "
+            "PATH is either the source tree whose target/release/libtlottie.so to use, "
+            "or the .so directly. Repeatable; each NAME becomes a renderer referenceable "
+            "in --renderers (e.g. --tlottie-version=avx=/tmp/tl-avx)"
+        ),
+    )
+    ap.add_argument(
+        "--import-results",
+        type=Path,
+        help=(
+            "reuse timing columns for some renderers from a previous benchmark.tgv "
+            "instead of building and measuring them again. Pass the renderer names "
+            "that should be imported in --import-renderers; those renderers are kept "
+            "in the report (columns copied from the file) but not run in this session. "
+            "tlottie and tlottie-version sibling renderers can never be imported, and "
+            "accuracy still needs its reference renderers (rlottie, thorvg) available"
+        ),
+    )
+    ap.add_argument(
+        "--import-renderers",
+        default="",
+        help=(
+            "comma-separated renderers to import from --import-results (default: "
+            "every renderer in the previous file except tlottie, tlottie-vulkan and "
+            "tlottie-version siblings)"
+        ),
+    )
+    ap.add_argument(
+        "--show-memory",
+        action="store_true",
+        help=(
+            "show per-renderer MiB (avg/max) columns even on platforms (Linux) where "
+            "the pooled-worker RSS sampling is meaningless; off by default there"
+        ),
+    )
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--no-open", action="store_true", help="do not open benchmark.html")
     ap.add_argument("--device-root", help="Android fixture root (auto-detected by default)")
@@ -4017,6 +4251,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--sample is currently Android-only")
 
     args.renderers = args.renderers or ",".join(DEFAULT_RENDERERS)
+    tlottie_versions = add_tlottie_versions(args.tlottie_version)
     renderers = tuple(r.strip() for r in args.renderers.split(",") if r.strip())
     bad = [r for r in renderers if r not in RENDERERS]
     if bad:
@@ -4041,13 +4276,49 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_accuracy and args.save_diffs:
         raise SystemExit("--save-diffs requires accuracy; remove --no-accuracy")
     direct_vulkan_accuracy = "tlottie-vulkan" in renderers and set(renderers) <= {"tlottie", "tlottie-vulkan"}
-    required_renderers = set(renderers)
+    imported: set[str] = set()
+    imported_rows: list[dict[str, Any]] = []
+    if args.import_results is not None:
+        import_src = import_tgv_path(args.import_results)
+        src_cols, src_rows = load_imported_tgv(import_src)
+        if args.import_renderers:
+            imported = set(r.strip() for r in args.import_renderers.split(",") if r.strip())
+        else:
+            imported = {
+                r
+                for r in renderers
+                if r not in ("tlottie", "tlottie-vulkan") and r not in TLOTTIE_VERSION_NAMES
+                and (f"{r}_frame_ms" in src_cols or f"{r}_total_frame_ms" in src_cols)
+            }
+        bad_import = [r for r in imported if r not in RENDERERS]
+        if bad_import:
+            raise SystemExit(f"unknown imported renderers: {', '.join(bad_import)}")
+        bad_import = [r for r in imported if r in ("tlottie", "tlottie-vulkan") or r in TLOTTIE_VERSION_NAMES]
+        if bad_import:
+            raise SystemExit(
+                f"cannot import tlottie/tlottie-version renderers: {', '.join(bad_import)}"
+            )
+        missing_import = [
+            r for r in imported
+            if f"{r}_frame_ms" not in src_cols and f"{r}_total_frame_ms" not in src_cols
+        ]
+        if missing_import:
+            raise SystemExit(
+                f"{import_src} has no timing columns for: {', '.join(missing_import)}"
+            )
+        imported_rows = imported_pack_rows(src_cols, src_rows, renderers, imported)
+        print(
+            f"== importing timing from {import_src}: {', '.join(sorted(imported)) or '(none)'}",
+            flush=True,
+        )
+    measured_renderers = tuple(r for r in renderers if r not in imported)
+    required_renderers = set(measured_renderers)
     if not args.no_accuracy:
         required_renderers.add("tlottie")
         if not direct_vulkan_accuracy:
             required_renderers.update(("rlottie", "thorvg"))
     ensure_builds(args.skip_build, required_renderers)
-    for r in renderers:
+    for r in required_renderers:
         if not LIBS[r].exists():
             raise SystemExit(f"missing {r} library: {LIBS[r]}")
 
@@ -4064,6 +4335,18 @@ def main(argv: list[str] | None = None) -> int:
         )
     if not files:
         raise SystemExit(f"no .json files found under {args.input}")
+    if imported_rows:
+        # Keep imported results only for (pack, size) cells this session actually
+        # measures, so a --packs/--limit selection never leaks stale rows from the
+        # source file into the report.
+        seen_packs = {pack_of(args.input, f) for f in files}
+        imported_rows = [
+            r for r in imported_rows if r["pack"] in seen_packs and r["size"] in sizes
+        ]
+        print(
+            f"   imported rows kept for {len(imported_rows)} (pack,size) cells",
+            flush=True,
+        )
     args.out.mkdir(parents=True, exist_ok=True)
     mode = " Alpha8" if args.alpha_only else ""
     print(f"== tlottie{mode} curve tolerance {args.curve_tolerance:g}px", flush=True)
@@ -4088,21 +4371,33 @@ def main(argv: list[str] | None = None) -> int:
 
     energy_available = EnergySampler().available() or task_energy_nj() is not None
     if not energy_available:
-        print("== energy counters unavailable; J columns will be n/a", flush=True)
-    phase_count = len(sizes) * len(renderers) + (0 if args.no_accuracy else 1)
+        print("== energy counters unavailable; J column will be omitted", flush=True)
+    include_memory = args.show_memory or platform.system() != "Linux"
+    phase_count = len(sizes) * len(measured_renderers) + (0 if args.no_accuracy else 1)
     overall_progress = ProgressDisplay("benchmark", len(files) * phase_count)
     for size in sizes:
         if not overall_progress.interactive:
             print(
                 f"== {size}px: {len(files)} files, {args.jobs} workers, "
-                f"{args.reps} reps, isolated renderers={','.join(renderers)}",
+                f"{args.reps} reps, isolated renderers={','.join(measured_renderers)}",
                 flush=True,
             )
-        for renderer in renderers:
+        # A tlottie A/B (primary + --tlottie-version siblings) is measured in a
+        # single batch so all of them render the same files back-to-back in the
+        # same workers — interleaved per file per rep, the way tlottie is
+        # compared against rlottie. Non-tlottie renderers keep one batch each.
+        tlottie_family = ["tlottie"] if "tlottie" in measured_renderers else []
+        tlottie_family += [r for r in measured_renderers if r in TLOTTIE_VERSION_NAMES]
+        batches = [tuple(tlottie_family)] if tlottie_family else []
+        batches += [
+            (r,) for r in measured_renderers if r != "tlottie" and r not in TLOTTIE_VERSION_NAMES
+        ]
+        for batch in batches:
+            label = ",".join(batch)
             if not overall_progress.interactive:
-                print(f"   renderer={renderer}", flush=True)
+                print(f"   renderer={label}", flush=True)
             size_rows, _ = run_size_batch(
-                (renderer,),
+                batch,
                 size,
                 files,
                 args.input,
@@ -4116,6 +4411,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.curve_tolerance,
                 args.alpha_only,
                 overall_progress,
+                label=label,
             )
             all_rows.extend(size_rows)
 
@@ -4162,10 +4458,22 @@ def main(argv: list[str] | None = None) -> int:
 
     file_rows = aggregate_file_rows(all_rows)
     pack_rows = aggregate_pack_rows(file_rows)
+    if imported_rows:
+        pack_rows = pack_rows + imported_rows
     pack_pivot = pivot_aggregate(pack_rows, ("pack", "size"))
     tgv = args.out / "benchmark.tgv"
     html_path = args.out / "benchmark.html"
-    write_tgv(tgv, pack_pivot, renderers, ("pack", "size"))
+    energy_present = any(
+        row.get(f"{r}_energy_j") is not None for row in pack_pivot for r in renderers
+    )
+    write_tgv(
+        tgv,
+        pack_pivot,
+        renderers,
+        ("pack", "size"),
+        include_memory=include_memory,
+        include_energy=energy_present,
+    )
     write_html(
         html_path,
         pack_rows,
@@ -4179,6 +4487,7 @@ def main(argv: list[str] | None = None) -> int:
         args.accuracy_diff_threshold,
         benchmark_invocation(args, accuracy_size),
         current_machine_details(),
+        include_memory=include_memory,
     )
     raw = args.out / "benchmark.raw.json"
     accuracy_raw = args.out / "benchmark-accuracy.raw.json"

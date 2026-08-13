@@ -21,6 +21,30 @@
 
 /// Minimum span length for the vector path.
 const SIMD_MIN_SPAN: usize = 16;
+
+/// Cached (once per process) runtime AVX2 availability. CPUs without AVX2
+/// fall back to the SSE2 kernels; every x86_64 core has at least SSE2.
+#[cfg(target_arch = "x86_64")]
+fn use_avx2() -> bool {
+  static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *CACHE.get_or_init(|| std::is_x86_feature_detected!("avx2"))
+}
+
+/// Cached (once per process) runtime AVX-512 availability. Must match the full
+/// `#[target_feature(enable = ...)]` set the AVX-512 kernels declare — `avx2`,
+/// `avx512f`, `avx512bw`, `avx512dq`, `avx512vl` — so every dispatched
+/// function is safe on the running CPU; otherwise the AVX2 kernels run.
+#[cfg(target_arch = "x86_64")]
+fn use_avx512() -> bool {
+  static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *CACHE.get_or_init(|| {
+    std::is_x86_feature_detected!("avx2")
+      && std::is_x86_feature_detected!("avx512f")
+      && std::is_x86_feature_detected!("avx512bw")
+      && std::is_x86_feature_detected!("avx512dq")
+      && std::is_x86_feature_detected!("avx512vl")
+  })
+}
 /// Coverage-modulated solid source-over: for each pixel,
 /// `ca = (cov*sa+127)/255`, source channels scaled by `ca`, then
 /// premultiplied source-over into `dst`. `sr/sg/sb/sa` are 0..=255.
@@ -44,6 +68,33 @@ pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb:
       unsafe {
         neon::fill_span_opaque_neon(dst_v, cov_v, color, sr, sg, sb)
       };
+      fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
+      return;
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    if large_canvas && dst.len() >= SIMD_MIN_SPAN && use_avx2() {
+      if use_avx512() {
+        let n = dst.len().min(cov.len());
+        let full = n - n % 16;
+        let (dst_v, dst_tail) = dst.split_at_mut(full);
+        let (cov_v, cov_tail) = cov.split_at(full);
+        // SAFETY: `use_avx512()` gates on avx2/avx512f/avx512bw/avx512dq/avx512vl.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx512::fill_span_opaque_avx512(dst_v, cov_v, color)
+        }
+        fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
+        return;
+      }
+      let n = dst.len().min(cov.len());
+      let full = n - n % 8;
+      let (dst_v, dst_tail) = dst.split_at_mut(full);
+      let (cov_v, cov_tail) = cov.split_at(full);
+      // SAFETY: `use_avx2()` gates on `is_x86_feature_detected!("avx2")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx2::fill_span_opaque_avx2(dst_v, cov_v, color)
+      }
       fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
       return;
     }
@@ -94,6 +145,39 @@ pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb:
       let (dst_v, dst_tail) = dst.split_at_mut(full);
       let (cov_v, cov_tail) = cov.split_at(full.min(cov.len()));
       wasm128::fill_span_solid_wasm(dst_v, cov_v, sr, sg, sb, sa);
+      fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
+      return;
+    }
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN {
+      let n = dst.len().min(cov.len());
+      let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+      let full = n - n % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let (dst_v, dst_tail) = dst.split_at_mut(full);
+      let (cov_v, cov_tail) = cov.split_at(full.min(cov.len()));
+      if use_avx512 {
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx512::fill_span_solid_avx512(dst_v, cov_v, sr, sg, sb, sa)
+        };
+      } else if use_avx2 {
+        // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx2::fill_span_solid_avx2(dst_v, cov_v, sr, sg, sb, sa)
+        };
+      } else {
+        // SAFETY: SSE2 is part of the x86_64 baseline and the cfg above
+        // additionally requires it to be statically enabled.
+        #[allow(unsafe_code)]
+        unsafe {
+          sse2::fill_span_solid_sse2(dst_v, cov_v, sr, sg, sb, sa)
+        };
+      }
       fill_span_solid_scalar(dst_tail, cov_tail, sr, sg, sb, sa);
       return;
     }
@@ -192,6 +276,36 @@ pub(crate) fn fill_span_uniform(dst: &mut [u32], cov: u8, sr: u32, sg: u32, sb: 
       return;
     }
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN {
+      let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+      let full = dst.len() - dst.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let (dst_v, dst_tail) = dst.split_at_mut(full);
+      if use_avx512 {
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx512::fill_span_uniform_avx512(dst_v, ca, s_r, s_g, s_b)
+        };
+      } else if use_avx2 {
+        // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx2::fill_span_uniform_avx2(dst_v, ca, s_r, s_g, s_b)
+        };
+      } else {
+        // SAFETY: SSE2 is part of the x86_64 baseline.
+        #[allow(unsafe_code)]
+        unsafe {
+          sse2::fill_span_uniform_sse2(dst_v, ca, s_r, s_g, s_b)
+        };
+      }
+      fill_span_uniform_scalar(dst_tail, ca, s_r, s_g, s_b);
+      return;
+    }
+  }
   fill_span_uniform_scalar(dst, ca, s_r, s_g, s_b);
 }
 
@@ -251,6 +365,36 @@ pub(crate) fn linear_lut_fill(out: &mut [u32], lut: &[u32], row_base: f32, dt: f
       return;
     }
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if out.len() >= SIMD_MIN_SPAN {
+      let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+      let full = out.len() - out.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let (head, tail) = out.split_at_mut(full);
+      if use_avx512 {
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx512::linear_lut_fill_avx512(head, lut, row_base, dt, x_start, scale)
+        };
+      } else if use_avx2 {
+        // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx2::linear_lut_fill_avx2(head, lut, row_base, dt, x_start, scale)
+        };
+      } else {
+        // SAFETY: SSE2 is part of the x86_64 baseline.
+        #[allow(unsafe_code)]
+        unsafe {
+          sse2::linear_lut_fill_sse2(head, lut, row_base, dt, x_start, scale)
+        };
+      }
+      linear_lut_fill_scalar(tail, lut, row_base, dt, x_start + full as f32, scale);
+      return;
+    }
+  }
   linear_lut_fill_scalar(out, lut, row_base, dt, x_start, scale);
 }
 
@@ -306,6 +450,36 @@ pub(crate) fn radial_lut_fill(out: &mut [u32], lut: &[u32], dd0x: f32, dd0y: f32
       return;
     }
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if out.len() >= SIMD_MIN_SPAN {
+      let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+      let full = out.len() - out.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let (head, tail) = out.split_at_mut(full);
+      if use_avx512 {
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx512::radial_lut_fill_avx512(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale)
+        };
+      } else if use_avx2 {
+        // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx2::radial_lut_fill_avx2(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale)
+        };
+      } else {
+        // SAFETY: SSE2 is part of the x86_64 baseline.
+        #[allow(unsafe_code)]
+        unsafe {
+          sse2::radial_lut_fill_sse2(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale)
+        };
+      }
+      radial_lut_fill_scalar(tail, lut, dd0x, dd0y, da, db, inv_r, x_start + full as f32, scale);
+      return;
+    }
+  }
   radial_lut_fill_scalar(out, lut, dd0x, dd0y, da, db, inv_r, x_start, scale);
 }
 
@@ -355,6 +529,36 @@ pub(crate) fn focal_lut_fill(out: &mut [u32], lut: &[u32], g0x: f32, g0y: f32, s
       let full = out.len() - out.len() % 4;
       let (head, tail) = out.split_at_mut(full);
       wasm128::focal_lut_fill_wasm(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale);
+      focal_lut_fill_scalar(tail, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start + full as f32, scale);
+      return;
+    }
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if out.len() >= SIMD_MIN_SPAN {
+      let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+      let full = out.len() - out.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let (head, tail) = out.split_at_mut(full);
+      if use_avx512 {
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx512::focal_lut_fill_avx512(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale)
+        };
+      } else if use_avx2 {
+        // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx2::focal_lut_fill_avx2(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale)
+        };
+      } else {
+        // SAFETY: SSE2 is part of the x86_64 baseline.
+        #[allow(unsafe_code)]
+        unsafe {
+          sse2::focal_lut_fill_sse2(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale)
+        };
+      }
       focal_lut_fill_scalar(tail, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start + full as f32, scale);
       return;
     }
@@ -433,6 +637,38 @@ pub(crate) fn composite_over_span(dst: &mut [u32], src: &[u32], k: u32) {
       let (dst_v, dst_tail) = dst.split_at_mut(full);
       let (src_v, src_tail) = src.split_at(full);
       wasm128::composite_over_wasm(dst_v, src_v, k);
+      composite_over_scalar(dst_tail, src_tail, k);
+      return;
+    }
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN {
+      let n = dst.len().min(src.len());
+      let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+      let full = n - n % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let (dst_v, dst_tail) = dst.split_at_mut(full);
+      let (src_v, src_tail) = src.split_at(full);
+      if use_avx512 {
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx512::composite_over_avx512(dst_v, src_v, k)
+        };
+      } else if use_avx2 {
+        // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx2::composite_over_avx2(dst_v, src_v, k)
+        };
+      } else {
+        // SAFETY: SSE2 is part of the x86_64 baseline.
+        #[allow(unsafe_code)]
+        unsafe {
+          sse2::composite_over_sse2(dst_v, src_v, k)
+        };
+      }
       composite_over_scalar(dst_tail, src_tail, k);
       return;
     }
@@ -517,6 +753,36 @@ pub(crate) fn linear_lut_over(dst: &mut [u32], lut: &[u32], row_base: f32, dt: f
       return;
     }
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN {
+      let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+      let full = dst.len() - dst.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let (head, tail) = dst.split_at_mut(full);
+      if use_avx512 {
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx512::linear_lut_over_avx512(head, lut, row_base, dt, x_start, scale)
+        };
+      } else if use_avx2 {
+        // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx2::linear_lut_over_avx2(head, lut, row_base, dt, x_start, scale)
+        };
+      } else {
+        // SAFETY: SSE2 is part of the x86_64 baseline.
+        #[allow(unsafe_code)]
+        unsafe {
+          sse2::linear_lut_over_sse2(head, lut, row_base, dt, x_start, scale)
+        };
+      }
+      linear_lut_over_scalar(tail, lut, row_base, dt, x_start + full as f32, scale);
+      return;
+    }
+  }
   linear_lut_over_scalar(dst, lut, row_base, dt, x_start, scale);
 }
 
@@ -558,6 +824,36 @@ pub(crate) fn radial_lut_over(dst: &mut [u32], lut: &[u32], dd0x: f32, dd0y: f32
       let full = dst.len() - dst.len() % 4;
       let (head, tail) = dst.split_at_mut(full);
       wasm128::radial_lut_over_wasm(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale);
+      radial_lut_over_scalar(tail, lut, dd0x, dd0y, da, db, inv_r, x_start + full as f32, scale);
+      return;
+    }
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN {
+      let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+      let full = dst.len() - dst.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let (head, tail) = dst.split_at_mut(full);
+      if use_avx512 {
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx512::radial_lut_over_avx512(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale)
+        };
+      } else if use_avx2 {
+        // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx2::radial_lut_over_avx2(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale)
+        };
+      } else {
+        // SAFETY: SSE2 is part of the x86_64 baseline.
+        #[allow(unsafe_code)]
+        unsafe {
+          sse2::radial_lut_over_sse2(head, lut, dd0x, dd0y, da, db, inv_r, x_start, scale)
+        };
+      }
       radial_lut_over_scalar(tail, lut, dd0x, dd0y, da, db, inv_r, x_start + full as f32, scale);
       return;
     }
@@ -607,6 +903,36 @@ pub(crate) fn focal_lut_over(dst: &mut [u32], lut: &[u32], g0x: f32, g0y: f32, s
       let full = dst.len() - dst.len() % 4;
       let (head, tail) = dst.split_at_mut(full);
       wasm128::focal_lut_over_wasm(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale);
+      focal_lut_over_scalar(tail, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start + full as f32, scale);
+      return;
+    }
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  {
+    if dst.len() >= SIMD_MIN_SPAN {
+      let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+      let full = dst.len() - dst.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let (head, tail) = dst.split_at_mut(full);
+      if use_avx512 {
+        // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx512::focal_lut_over_avx512(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale)
+        };
+      } else if use_avx2 {
+        // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+        #[allow(unsafe_code)]
+        unsafe {
+          avx2::focal_lut_over_avx2(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale)
+        };
+      } else {
+        // SAFETY: SSE2 is part of the x86_64 baseline.
+        #[allow(unsafe_code)]
+        unsafe {
+          sse2::focal_lut_over_sse2(head, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start, scale)
+        };
+      }
       focal_lut_over_scalar(tail, lut, g0x, g0y, sa, sb, dx, dy, a, inv2a, r, x_start + full as f32, scale);
       return;
     }
@@ -668,6 +994,34 @@ pub(crate) fn alpha_blend_solid(dst: &mut [u8], coverage: &[u8], alpha: u8) {
     alpha_blend_solid_scalar(tail, &coverage[full..n], alpha);
     return;
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if n >= SIMD_MIN_SPAN {
+    let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+    let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
+    let (head, tail) = dst[..n].split_at_mut(full);
+    if use_avx512 {
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx512::alpha_blend_solid_avx512(head, &coverage[..full], alpha)
+      };
+    } else if use_avx2 {
+      // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx2::alpha_blend_solid_avx2(head, &coverage[..full], alpha)
+      };
+    } else {
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::alpha_blend_solid_sse2(head, &coverage[..full], alpha)
+      };
+    }
+    alpha_blend_solid_scalar(tail, &coverage[full..n], alpha);
+    return;
+  }
   alpha_blend_solid_scalar(&mut dst[..n], &coverage[..n], alpha);
 }
 
@@ -696,6 +1050,34 @@ pub(crate) fn alpha_blend_product(dst: &mut [u8], lhs: &[u8], rhs: &[u8]) {
     let full = n - n % 16;
     let (head, tail) = dst[..n].split_at_mut(full);
     wasm128::alpha_blend_product_wasm(head, &lhs[..full], &rhs[..full]);
+    alpha_blend_product_scalar(tail, &lhs[full..n], &rhs[full..n]);
+    return;
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if n >= SIMD_MIN_SPAN {
+    let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+    let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
+    let (head, tail) = dst[..n].split_at_mut(full);
+    if use_avx512 {
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx512::alpha_blend_product_avx512(head, &lhs[..full], &rhs[..full])
+      };
+    } else if use_avx2 {
+      // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx2::alpha_blend_product_avx2(head, &lhs[..full], &rhs[..full])
+      };
+    } else {
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::alpha_blend_product_sse2(head, &lhs[..full], &rhs[..full])
+      };
+    }
     alpha_blend_product_scalar(tail, &lhs[full..n], &rhs[full..n]);
     return;
   }
@@ -737,6 +1119,34 @@ pub(crate) fn alpha_blend_uniform(dst: &mut [u8], coverage: u8, alpha: u8) {
     alpha_blend_uniform_scalar(tail, source);
     return;
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if dst.len() >= SIMD_MIN_SPAN {
+    let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+    let full = dst.len() - dst.len() % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
+    let (head, tail) = dst.split_at_mut(full);
+    if use_avx512 {
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx512::alpha_blend_uniform_avx512(head, source as u8)
+      };
+    } else if use_avx2 {
+      // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx2::alpha_blend_uniform_avx2(head, source as u8)
+      };
+    } else {
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::alpha_blend_uniform_sse2(head, source as u8)
+      };
+    }
+    alpha_blend_uniform_scalar(tail, source);
+    return;
+  }
   alpha_blend_uniform_scalar(dst, source);
 }
 
@@ -767,6 +1177,34 @@ pub(crate) fn alpha_composite_over(dst: &mut [u8], src: &[u8], opacity: u8) {
     let full = n - n % 16;
     let (head, tail) = dst[..n].split_at_mut(full);
     wasm128::alpha_composite_over_wasm(head, &src[..full], opacity);
+    alpha_composite_over_scalar(tail, &src[full..n], opacity);
+    return;
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if n >= SIMD_MIN_SPAN {
+    let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+    let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
+    let (head, tail) = dst[..n].split_at_mut(full);
+    if use_avx512 {
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx512::alpha_composite_over_avx512(head, &src[..full], opacity)
+      };
+    } else if use_avx2 {
+      // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx2::alpha_composite_over_avx2(head, &src[..full], opacity)
+      };
+    } else {
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::alpha_composite_over_sse2(head, &src[..full], opacity)
+      };
+    }
     alpha_composite_over_scalar(tail, &src[full..n], opacity);
     return;
   }
@@ -801,6 +1239,34 @@ pub(crate) fn alpha_multiply(dst: &mut [u8], factors: &[u8]) {
     alpha_multiply_scalar(tail, &factors[full..n]);
     return;
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if n >= SIMD_MIN_SPAN {
+    let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+    let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
+    let (head, tail) = dst[..n].split_at_mut(full);
+    if use_avx512 {
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx512::alpha_multiply_avx512(head, &factors[..full])
+      };
+    } else if use_avx2 {
+      // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx2::alpha_multiply_avx2(head, &factors[..full])
+      };
+    } else {
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::alpha_multiply_sse2(head, &factors[..full])
+      };
+    }
+    alpha_multiply_scalar(tail, &factors[full..n]);
+    return;
+  }
   alpha_multiply_scalar(&mut dst[..n], &factors[..n]);
 }
 
@@ -828,6 +1294,34 @@ pub(crate) fn alpha_matte(dst: &mut [u8], src: &[u8], opacity: u8, inverted: boo
     let full = n - n % 16;
     let (head, tail) = dst[..n].split_at_mut(full);
     wasm128::alpha_matte_wasm(head, &src[..full], opacity, inverted);
+    alpha_matte_scalar(tail, &src[full..n], opacity, inverted);
+    return;
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if n >= SIMD_MIN_SPAN {
+    let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+    let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
+    let (head, tail) = dst[..n].split_at_mut(full);
+    if use_avx512 {
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx512::alpha_matte_avx512(head, &src[..full], opacity, inverted)
+      };
+    } else if use_avx2 {
+      // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx2::alpha_matte_avx2(head, &src[..full], opacity, inverted)
+      };
+    } else {
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::alpha_matte_sse2(head, &src[..full], opacity, inverted)
+      };
+    }
     alpha_matte_scalar(tail, &src[full..n], opacity, inverted);
     return;
   }
@@ -863,6 +1357,34 @@ pub(crate) fn alpha_mask_combine(dst: &mut [u8], src: &[u8], mode: u8, inverted:
     alpha_mask_combine_scalar(tail, &src[full..n], mode, inverted, opacity);
     return;
   }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if n >= SIMD_MIN_SPAN {
+    let use_avx2 = use_avx2();
+      let use_avx512 = use_avx512();
+    let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
+    let (head, tail) = dst[..n].split_at_mut(full);
+    if use_avx512 {
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx512::alpha_mask_combine_avx512(head, &src[..full], mode, inverted, opacity)
+      };
+    } else if use_avx2 {
+      // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx2::alpha_mask_combine_avx2(head, &src[..full], mode, inverted, opacity)
+      };
+    } else {
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::alpha_mask_combine_sse2(head, &src[..full], mode, inverted, opacity)
+      };
+    }
+    alpha_mask_combine_scalar(tail, &src[full..n], mode, inverted, opacity);
+    return;
+  }
   alpha_mask_combine_scalar(&mut dst[..n], &src[..n], mode, inverted, opacity);
 }
 
@@ -880,6 +1402,80 @@ fn alpha_mask_combine_scalar(dst: &mut [u8], src: &[u8], mode: u8, inverted: boo
   }
 }
 
+/// Alpha matting of a `u32` RGBA surface: every channel of `dst` is scaled by
+/// `(alpha * opacity + 127) / 255` (or its inverse when `inverted`), where
+/// `alpha` is the source pixel's alpha. Matches `executor::apply_matte` kinds
+/// 1/2 exactly: the scalar's `factor == 255` (no-op) and `factor == 0`
+/// (zero) short-circuits are reproduced by the general `(ch * factor + 127) / 255`
+/// rounding, so the SIMD path runs the general formula with no branches and stays
+/// bit-for-bit identical. Channel-order independent (all channels share one factor).
+pub(crate) fn apply_matte_alpha(dst: &mut [u32], src: &[u32], source_opacity: u8, inverted: bool) {
+  let n = dst.len().min(src.len());
+  #[cfg(target_arch = "aarch64")]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 8;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    // SAFETY: NEON is mandatory on aarch64; the kernel processes whole 8-pixel chunks.
+    #[allow(unsafe_code)]
+    unsafe {
+      neon::apply_matte_alpha_neon(head, &src[..full], source_opacity, inverted)
+    };
+    apply_matte_alpha_scalar(tail, &src[full..n], source_opacity, inverted);
+    return;
+  }
+  #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+  if n >= SIMD_MIN_SPAN {
+    let full = n - n % 4;
+    let (head, tail) = dst[..n].split_at_mut(full);
+    wasm128::apply_matte_alpha_wasm(head, &src[..full], source_opacity, inverted);
+    apply_matte_alpha_scalar(tail, &src[full..n], source_opacity, inverted);
+    return;
+  }
+  #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+  if n >= SIMD_MIN_SPAN {
+    let use_avx2 = use_avx2();
+    let use_avx512 = use_avx512();
+    let full = n - n % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+    let (head, tail) = dst[..n].split_at_mut(full);
+    if use_avx512 {
+      // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx512::apply_matte_alpha_avx512(head, &src[..full], source_opacity, inverted)
+      };
+    } else if use_avx2 {
+      // SAFETY: `use_avx2` gates on `is_x86_feature_detected!("avx2")`.
+      #[allow(unsafe_code)]
+      unsafe {
+        avx2::apply_matte_alpha_avx2(head, &src[..full], source_opacity, inverted)
+      };
+    } else {
+      // SAFETY: SSE2 is part of the x86_64 baseline.
+      #[allow(unsafe_code)]
+      unsafe {
+        sse2::apply_matte_alpha_sse2(head, &src[..full], source_opacity, inverted)
+      };
+    }
+    apply_matte_alpha_scalar(tail, &src[full..n], source_opacity, inverted);
+    return;
+  }
+  apply_matte_alpha_scalar(&mut dst[..n], &src[..n], source_opacity, inverted);
+}
+
+fn apply_matte_alpha_scalar(dst: &mut [u32], src: &[u32], source_opacity: u8, inverted: bool) {
+  for (d, &s) in dst.iter_mut().zip(src) {
+    let alpha = (s >> 24) & 0xff;
+    let scaled = (alpha * u32::from(source_opacity) + 127) / 255;
+    let factor = if inverted { 255 - scaled } else { scaled };
+    let p = *d;
+    let a = (((p >> 24) & 0xff) * factor + 127) / 255;
+    let r = (((p >> 16) & 0xff) * factor + 127) / 255;
+    let g = (((p >> 8) & 0xff) * factor + 127) / 255;
+    let b = ((p & 0xff) * factor + 127) / 255;
+    *d = (a << 24) | (r << 16) | (g << 8) | b;
+  }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[path = "simd/neon.rs"]
 mod neon;
@@ -887,6 +1483,18 @@ mod neon;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[path = "simd/wasm.rs"]
 mod wasm128;
+
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[path = "simd/sse2.rs"]
+mod sse2;
+
+#[cfg(target_arch = "x86_64")]
+#[path = "simd/avx2.rs"]
+mod avx2;
+
+#[cfg(target_arch = "x86_64")]
+#[path = "simd/avx512.rs"]
+mod avx512;
 
 #[cfg(test)]
 #[path = "tests/simd.rs"]

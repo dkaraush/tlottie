@@ -6,3 +6,4 @@ pub(crate) mod model;
 pub(crate) mod options;
 pub(crate) mod parse;
 pub(crate) mod property;
+pub(crate) mod swizzle;

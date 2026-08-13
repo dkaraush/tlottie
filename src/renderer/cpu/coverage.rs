@@ -245,6 +245,14 @@ pub(crate) struct CovCache {
   pub(super) young: CoverageMap,
   pub(super) old: CoverageMap,
   pub(super) young_bytes: usize,
+  /// Dedicated byte pool for gradient SOURCE planes (≥720px planes are >1MB
+  /// and would otherwise blow the shared cov budget / COV_ENTRY_MAX and evict
+  /// useful coverage entries — measured: a blanket 2MB COV_ENTRY_MAX cut
+  /// LedScreenEmoji@720 −16.5% and GlowingFont −21% but regressed
+  /// prtyparrot@320 +7.5% via small-entry eviction). Src entries live in
+  /// the same two maps but are counted here and capped by [`SRC_BUDGET`], so
+  /// caching a big gradient plane never evicts coverage entries.
+  pub(super) src_bytes: usize,
   /// Freeze policy: drop-rotation is the wrong eviction for periodic
   /// content whose loop working set exceeds the budget — every entry is
   /// evicted right before its once-per-loop reuse (sequential-scan
@@ -297,6 +305,12 @@ pub(super) const COV_CACHE_BUDGET: usize = 3 << 20;
 /// source planes (measured: the 64KB cap left TableFontEmoji@320 recomputing
 /// its gradients every frame while @64 flew).
 pub(super) const COV_ENTRY_MAX: usize = 256 << 10;
+/// Big gradient source planes are allowed up to this size (a 720×720 src
+/// plane is 2MB) but live in the dedicated [`CovCache::src_bytes`] pool, so
+/// they never count toward or evict the coverage budget.
+pub(super) const SRC_ENTRY_MAX: usize = 4 << 20;
+/// Dedicated byte budget for cached gradient source planes.
+pub(super) const SRC_BUDGET: usize = 8 << 20;
 
 /// Two independent FNV/Murmur-style 64-bit streams -> 128-bit content key.
 pub(super) struct Hasher128 {
@@ -442,7 +456,11 @@ impl CovCache {
       return;
     }
     let budget = if self.budget == 0 { COV_CACHE_BUDGET } else { self.budget };
-    if self.young_bytes > budget / 2 {
+    // Src planes have a dedicated budget (see SRC_BUDGET). Both young
+    // bytes and src bytes share the same rotation, so a gradient-heavy pack
+    // ages its plane generations instead of either (a) pooling bytes forever
+    // or (b) trashing on an overflow flush.
+    if self.young_bytes > budget / 2 || self.src_bytes > SRC_BUDGET / 2 {
       self.rotations += 1;
       if self.rotations >= FREEZE_ROTATIONS {
         // Young + old together hold ~budget of the most recent
@@ -462,6 +480,7 @@ impl CovCache {
           self.young = CoverageMap::with_capacity_and_hasher(self.old.capacity(), core::hash::BuildHasherDefault::default());
         }
         self.young_bytes = 0;
+        self.src_bytes = 0;
       }
     }
   }
@@ -489,6 +508,7 @@ impl CovCache {
           self.young.clear();
           self.old.clear();
           self.young_bytes = 0;
+          self.src_bytes = 0;
           self.frozen = false;
           self.hits = 0;
           self.inserts = 0;
@@ -530,6 +550,28 @@ impl CovCache {
     // −4..−9%. At 320/720 wall is flat-to-better (TableFontEmoji@320
     // −7%) with RSS −1..−5%, so the trade only pays above fleet scale.
     let sz = Self::size_of(&entry);
+    if matches!(entry.data, PlaneData::Src(_)) {
+      // Gradient source planes live in a dedicated pool (see `src_bytes`);
+      // they never count toward the coverage budget, and they age out through
+      // the same young/old rotation (triggered by their own pressure) instead
+      // of pooling until an overflow flush — a hard flush made big-720 packs
+      // re-capture every frame (deadline: GlowingFont@720 regressed to
+      // -0.08% from -21% under the blanket raise).
+      if sz > SRC_ENTRY_MAX {
+        return;
+      }
+      if self.shrink_entries {
+        entry.rows.shrink_to_fit();
+        if let PlaneData::Src(v) = &mut entry.data {
+          v.shrink_to_fit();
+        }
+      }
+      self.inserts = self.inserts.saturating_add(1);
+      self.src_bytes += sz;
+      self.rotate_if_needed();
+      self.young.insert(key, entry);
+      return;
+    }
     if sz > COV_ENTRY_MAX {
       return;
     }

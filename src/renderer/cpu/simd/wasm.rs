@@ -12,7 +12,7 @@
 //! <= 65407.
 
 use core::arch::wasm32::{
-  f32x4, f32x4_abs, f32x4_add, f32x4_ge, f32x4_lt, f32x4_max, f32x4_min, f32x4_mul, f32x4_neg, f32x4_splat, f32x4_sqrt, f32x4_sub, u16x8, u16x8_add, u16x8_extend_high_u8x16, u16x8_extend_low_u8x16,
+  f32x4, f32x4_abs, f32x4_add, f32x4_ge, f32x4_lt, f32x4_max, f32x4_min, f32x4_mul, f32x4_neg, f32x4_splat, f32x4_sqrt, f32x4_sub, i16x8_all_true, u16x8, u16x8_add, u16x8_eq, u16x8_extend_high_u8x16, u16x8_extend_low_u8x16,
   u16x8_max, u16x8_min, u16x8_mul, u16x8_shr, u16x8_splat, u16x8_sub, u32x4_all_true, u32x4_eq, u32x4_extract_lane, u32x4_splat, u32x4_trunc_sat_f32x4, u8x16, u8x16_narrow_i16x8, u8x16_swizzle, v128,
   v128_and, v128_bitselect, v128_load, v128_store,
 };
@@ -194,6 +194,39 @@ pub(super) fn fill_span_uniform_wasm(dst: &mut [u32], ca: u32, s_r: u32, s_g: u3
     let d = unsafe { v128_load(dpx.as_ptr().cast::<v128>()) };
     let o_lo = over(u16x8_extend_low_u8x16(d), s, inv);
     let o_hi = over(u16x8_extend_high_u8x16(d), s, inv);
+    let out = u8x16_narrow_i16x8(o_lo, o_hi);
+    // SAFETY: same 16-byte span as the load above.
+    #[allow(unsafe_code)]
+    unsafe {
+      v128_store(dpx.as_mut_ptr().cast::<v128>(), out)
+    };
+  }
+}
+
+pub(super) fn apply_matte_alpha_wasm(dst: &mut [u32], src: &[u32], source_opacity: u8, inverted: bool) {
+  let arep_pat = u8x16(3, 3, 3, 3, 7, 7, 7, 7, 11, 11, 11, 11, 15, 15, 15, 15);
+  let opacity = u16x8_splat(u16::from(source_opacity));
+  let full = u16x8_splat(255);
+  for (dpx, spx) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+    // SAFETY: chunks_exact guarantees exactly 4 u32 (16 bytes) at
+    // both pointers; v128 loads/stores allow unaligned.
+    #[allow(unsafe_code)]
+    let s = unsafe { v128_load(spx.as_ptr().cast::<v128>()) };
+    let arep = u8x16_swizzle(s, arep_pat);
+    let mut fl = div255_round(u16x8_mul(u16x8_extend_low_u8x16(arep), opacity));
+    let mut fh = div255_round(u16x8_mul(u16x8_extend_high_u8x16(arep), opacity));
+    if inverted {
+      fl = u16x8_sub(full, fl);
+      fh = u16x8_sub(full, fh);
+    }
+    if i16x8_all_true(u16x8_eq(fl, full)) && i16x8_all_true(u16x8_eq(fh, full)) {
+      continue;
+    }
+    // SAFETY: same 16-byte span as the source load above.
+    #[allow(unsafe_code)]
+    let d = unsafe { v128_load(dpx.as_ptr().cast::<v128>()) };
+    let o_lo = div255_round(u16x8_mul(u16x8_extend_low_u8x16(d), fl));
+    let o_hi = div255_round(u16x8_mul(u16x8_extend_high_u8x16(d), fh));
     let out = u8x16_narrow_i16x8(o_lo, o_hi);
     // SAFETY: same 16-byte span as the load above.
     #[allow(unsafe_code)]

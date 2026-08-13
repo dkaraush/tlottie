@@ -151,7 +151,7 @@ fn static_job_cache_invalidates_on_render_context_change() {
 }
 
 #[test]
-fn static_jobs_replay_fractional_translation_exactly() {
+fn translating_static_layer_matches_a_fresh_walker() {
   let json = br#"{"fr":30,"ip":0,"op":20,"w":100,"h":100,"layers":[
     {"ty":4,"ind":1,"ip":0,"op":20,"st":0,
      "ks":{"o":{"a":0,"k":100},"p":{"a":1,"k":[{"t":0,"s":[20,30],"e":[60,55]},{"t":10,"s":[60,55]}]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0}},
@@ -161,9 +161,11 @@ fn static_jobs_replay_fractional_translation_exactly() {
        {"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0},"o":{"a":0,"k":100}}
      ]}]}
   ]}"#;
+  // A reused walker must render every frame exactly as a fresh one would.
+  // The static-job cache is an optimisation, never a change in output.
   let comp = Composition::parse(json, &Limits::default()).unwrap();
   let mut cached = FrameWalker::default();
-  for frame in [0.0, 1.0, 2.5] {
+  for frame in [0.0, 1.0, 2.5, 3.0, 4.0, 7.5, 10.0, 12.0] {
     let mut actual = Trace::default();
     cached.render(&comp, frame, 100, 100, crate::RenderOptions::default(), &mut actual).unwrap();
 
@@ -171,5 +173,9 @@ fn static_jobs_replay_fractional_translation_exactly() {
     FrameWalker::default().render(&comp, frame, 100, 100, crate::RenderOptions::default(), &mut expected).unwrap();
     assert_eq!(actual, expected, "frame {frame}");
   }
-  assert_eq!(cached.static_jobs.hits, 1);
+  // Deliberately no hit-count assertion: a layer that only translates used
+  // to be captured at a canonical origin so the translation became a replay
+  // parameter, which is what this asserted. That capture had to run
+  // unbounded, and the unclipped geometry it produced dropped scanlines on
+  // the recording frame. The equivalence above is the property that matters.
 }

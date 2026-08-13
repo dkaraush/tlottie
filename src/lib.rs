@@ -60,7 +60,7 @@ pub mod internal {
   pub use crate::renderer::frame::*;
 }
 
-pub use composition::options::{FitzModifier, LayerColorReplacement, ParseOptions, SourceColorReplacement};
+pub use composition::options::{ChannelOrder, FitzModifier, LayerColorReplacement, ParseOptions, SourceColorReplacement};
 pub use error::{Error, JsonErrorKind, Limit, Result};
 pub use limits::Limits;
 pub use model::Composition;
@@ -87,7 +87,6 @@ impl Composition {
 #[cfg(feature = "cpu")]
 pub use renderer::cpu::CPURenderer;
 
-/// Backward-compatible name for [`CPURenderer`].
-#[deprecated(note = "renamed to CPURenderer")]
-#[cfg(feature = "cpu")]
-pub type Animation = CPURenderer;
+#[cfg(test)]
+#[path = "tests/dos.rs"]
+mod dos;

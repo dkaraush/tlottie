@@ -267,7 +267,7 @@ impl Canvas<'_> {
         // gradient_row_capture (src plane materialized to DRAM) for
         // every cov hit throws the bytes away. The fused gradient_row
         // is bit-identical and round-trip-free.
-        let capture = capture_enabled && px_total * 4 + spans.len() * 12 + 64 <= COV_ENTRY_MAX;
+        let capture = capture_enabled && px_total * 4 + spans.len() * 12 + 64 <= SRC_ENTRY_MAX;
         for &s in spans {
           let (y, x0, len, cov) = unpack_span(s);
           let lo = y.saturating_mul(w).saturating_add(x0);
@@ -316,7 +316,7 @@ impl Canvas<'_> {
         // Oversized planes (720px gradients) previously re-captured every
         // frame just to be rejected by insert — measured at 49% of the
         // worst effects file.
-        let capture = capture_enabled && data.len() * 4 + e.rows.len() * 12 + 64 <= COV_ENTRY_MAX;
+        let capture = capture_enabled && data.len() * 4 + e.rows.len() * 12 + 64 <= SRC_ENTRY_MAX;
         let mut off = 0usize;
         for &(y, x0, len) in &e.rows {
           let (y, x0, len) = (y as usize, x0 as usize, len as usize);
@@ -456,6 +456,230 @@ impl Canvas<'_> {
       cache.insert(key, entry);
     }
   }
+
+  pub(crate) fn fill_gradient_translated_alpha<const TRACK_ROWS: bool>(
+    &mut self,
+    cache: &mut CovCache,
+    key: u128,
+    src_key: u128,
+    contours: &[Contour],
+    translation: crate::renderer::frame::Point,
+    rule: FillRule,
+    lut: &[u32; GRADIENT_LUT_SIZE],
+    map: &GradientMap,
+    alpha: u8,
+  ) {
+    let k = u32::from(alpha);
+    if k == 255 {
+      self.fill_gradient_translated::<TRACK_ROWS>(cache, key, src_key, contours, translation, rule, lut, map);
+      return;
+    }
+    let w = self.w;
+    let antialias = self.antialias;
+    // Fastest: the frozen source plane is already cached - replay as a pure
+    // composite over the covered pixels.
+    if let Some(e) = cache.get(src_key) {
+      let PlaneData::Src(data) = &e.data else {
+        return;
+      };
+      let mut off = 0usize;
+      for &(y, x0, len) in &e.rows {
+        let (y, x0, len) = (y as usize, x0 as usize, len as usize);
+        let lo = y.saturating_mul(w).saturating_add(x0);
+        let hi = lo.saturating_add(len);
+        let (Some(dst_row), Some(src_row)) = (self.pixels.get_mut(lo..hi), data.get(off..off + len)) else {
+          break;
+        };
+        self.dirty.mark_row(y, x0, x0 + len);
+        if TRACK_ROWS {
+          mark_row_bounds(&mut self.dirty_rows, y, x0, x0 + len);
+        }
+        crate::simd::composite_over_span(dst_row, src_row, k);
+        off += len;
+      }
+      return;
+    }
+    let capture_enabled = cache.capture_enabled();
+    let mut row_scratch: Vec<u32> = Vec::new();
+    let mut src_rows: Vec<(u32, u32, u32)> = Vec::new();
+    let mut src_data: Vec<u32> = Vec::new();
+    let pixels = &mut *self.pixels;
+    let dirty = &mut self.dirty;
+    let dirty_rows = &mut self.dirty_rows;
+    // Synthesize the source for coverage row `cr` and composite with `k`. When
+    // `capture`, append the source to the source plane for later pure-composite
+    // replay; otherwise reuse `row_scratch`.
+    let mut emit_row = |dst_row: &mut [u32], cr: &[u8], y: usize, x0: usize, capture: bool| {
+      if capture {
+        let base = src_data.len();
+        src_data.resize(base + cr.len(), 0);
+        gradient_srcs(&mut src_data[base..base + cr.len()], cr, y, x0, lut, map);
+        dirty.mark_row(y, x0, x0 + cr.len());
+        if TRACK_ROWS {
+          mark_row_bounds(dirty_rows, y, x0, x0 + cr.len());
+        }
+        crate::simd::composite_over_span(dst_row, &src_data[base..base + cr.len()], k);
+      } else {
+        row_scratch.resize(cr.len(), 0);
+        gradient_srcs(&mut row_scratch[..cr.len()], cr, y, x0, lut, map);
+        dirty.mark_row(y, x0, x0 + cr.len());
+        if TRACK_ROWS {
+          mark_row_bounds(dirty_rows, y, x0, x0 + cr.len());
+        }
+        crate::simd::composite_over_span(dst_row, &row_scratch[..cr.len()], k);
+      }
+    };
+    // Coverage hit: reuse cached coverage, capture the source plane when
+    // admissible so later frames replay as a pure composite.
+    if let Some(e) = cache.get(key) {
+      let mut had = false;
+      match &e.data {
+        PlaneData::Cov(data) => {
+          let caps = capture_enabled && data.len() * 4 + e.rows.len() * 12 + 64 <= SRC_ENTRY_MAX;
+          let mut off = 0usize;
+          for &(y, x0, len) in &e.rows {
+            let (y, x0, len) = (y as usize, x0 as usize, len as usize);
+            let lo = y.saturating_mul(w).saturating_add(x0);
+            let hi = lo.saturating_add(len);
+            let (Some(dst_row), Some(cov_row)) = (pixels.get_mut(lo..hi), data.get(off..off + len)) else {
+              break;
+            };
+            had = true;
+            if caps {
+              src_rows.push((y as u32, x0 as u32, len as u32));
+              emit_row(dst_row, cov_row, y, x0, true);
+            } else {
+              emit_row(dst_row, cov_row, y, x0, false);
+            }
+            off += len;
+          }
+        }
+        PlaneData::Spans(spans) => {
+          let px_total: usize = spans.iter().map(|&s| unpack_span(s).2).sum();
+          let caps = capture_enabled && px_total * 4 + spans.len() * 12 + 64 <= SRC_ENTRY_MAX;
+          for &s in spans {
+            let (y, x0, len, cov) = unpack_span(s);
+            let lo = y.saturating_mul(w).saturating_add(x0);
+            let Some(dst_row) = pixels.get_mut(lo..lo.saturating_add(len)) else {
+              break;
+            };
+            had = true;
+            let cr: &[u8] = if cov == 255 && self.row_ones.len() < len {
+              self.row_ones.resize(len, 255);
+              self.row_ones.get(..len).unwrap_or(&[])
+            } else if cov != 255 {
+              self.row_cov.clear();
+              self.row_cov.resize(len, cov);
+              &self.row_cov
+            } else {
+              &self.row_ones[..len.min(self.row_ones.len())]
+            };
+            if caps {
+              src_rows.push((y as u32, x0 as u32, len as u32));
+              emit_row(dst_row, cr, y, x0, true);
+            } else {
+              emit_row(dst_row, cr, y, x0, false);
+            }
+          }
+        }
+        PlaneData::Src(_) => {}
+      }
+      if had && !src_rows.is_empty() {
+        cache.insert(src_key, CovEntry {
+          rows: src_rows,
+          data: PlaneData::Src(src_data),
+        });
+      }
+      return;
+    }
+    if contours.is_empty() {
+      return;
+    }
+    let capture = capture_enabled;
+    if mode_s_wins(contours, w * self.h) {
+      // Mode S: spans feed the same source math through a synthesized row.
+      let cells = self.cells.as_mut().expect("fresh gradient requires cell rasterizer");
+      cells.reset();
+      cells.fill_contours_translated(contours, translation.x, translation.y);
+      let mut spans: Vec<u64> = core::mem::take(&mut self.span_buf);
+      spans.clear();
+      let mut px_total = 0usize;
+      let mut overflow = false;
+      cells.sweep_spans(rule, antialias, |y, x0, len, cov| {
+        let lo = y.saturating_mul(w).saturating_add(x0);
+        let Some(dst_row) = pixels.get_mut(lo..lo.saturating_add(len)) else {
+          return;
+        };
+        if capture {
+          if spans.len() < SPAN_CAPTURE_MAX {
+            spans.push(pack_span(y, x0, len, cov));
+            px_total += len;
+          } else {
+            overflow = true;
+          }
+        }
+        let cr: &[u8] = if cov == 255 {
+          if self.row_ones.len() < len {
+            self.row_ones.resize(len, 255);
+          }
+          &self.row_ones[..len.min(self.row_ones.len())]
+        } else {
+          self.row_cov.clear();
+          self.row_cov.resize(len, cov);
+          &self.row_cov
+        };
+        emit_row(dst_row, cr, y, x0, false);
+      });
+      if capture && !overflow && px_total * 4 + spans.len() * 12 + 64 <= COV_ENTRY_MAX {
+        let entry = if spans_fragmented(&spans, px_total) {
+          let e = spans_to_cov_entry(&spans);
+          self.span_buf = spans; // recycle
+          e
+        } else {
+          CovEntry {
+            rows: Vec::new(),
+            data: PlaneData::Spans(spans),
+          }
+        };
+        cache.insert(key, entry);
+      } else {
+        self.span_buf = spans; // recycle
+      }
+      return;
+    }
+    let raster = self.raster.as_mut().expect("fresh gradient requires dense rasterizer");
+    raster.reset();
+    raster.fill_contours_translated(contours, translation.x, translation.y);
+    let mut entry = if capture && w.saturating_mul(self.h) <= 160 * 160 {
+      let (row_cap, data_cap) = raster.capture_capacities();
+      CovEntry {
+        rows: Vec::with_capacity(row_cap),
+        data: PlaneData::Cov(Vec::with_capacity(data_cap)),
+      }
+    } else {
+      CovEntry::default()
+    };
+    // Fresh rasterization captures only the COVERAGE; the source plane is
+    // captured on the first cov hit later (same policy as the legacy path).
+    raster.sweep(rule, antialias, |y, x0, cov_row| {
+      let lo = y.saturating_mul(w).saturating_add(x0);
+      let hi = lo.saturating_add(cov_row.len());
+      let Some(dst_row) = pixels.get_mut(lo..hi) else {
+        return;
+      };
+      if capture {
+        entry.rows.push((y as u32, x0 as u32, cov_row.len() as u32));
+        if let PlaneData::Cov(d) = &mut entry.data {
+          d.extend_from_slice(cov_row);
+        }
+      }
+      emit_row(dst_row, cov_row, y, x0, false);
+    });
+    if capture {
+      cache.insert(key, entry);
+    }
+  }
+
 }
 
 /// gradient_row variant that also CAPTURES the premultiplied,

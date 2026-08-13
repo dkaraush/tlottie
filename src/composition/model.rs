@@ -41,6 +41,9 @@ pub struct Composition {
   pub(crate) layers: Vec<Layer>,
   /// Precomp assets, looked up by `Layer::ref_id`.
   pub(crate) assets: Vec<Asset>,
+  /// Byte order the model's colors are stored in. Everything except the luma
+  /// matte is channel-order agnostic, so this is only consulted there.
+  pub(crate) channel_order: crate::composition::options::ChannelOrder,
 }
 
 impl Composition {
@@ -165,6 +168,11 @@ impl Transform {
   /// True when every track (including opacity) is a constant.
   pub fn is_static(&self) -> bool {
     self.anchor.is_static() && self.position.is_static() && self.scale.is_static() && self.rotation.is_static() && self.opacity.is_static() && self.skew.is_static() && self.skew_axis.is_static()
+  }
+
+  /// True when every geometry track is a constant; opacity may still animate.
+  pub fn geometry_static(&self) -> bool {
+    self.anchor.is_static() && self.position.is_static() && self.scale.is_static() && self.rotation.is_static() && self.skew.is_static() && self.skew_axis.is_static()
   }
 
   pub fn identity() -> Self {

@@ -3,8 +3,8 @@
 //! stays <= 65407.
 
 use core::arch::aarch64::{
-  uint16x8_t, uint32x4_t, uint8x16_t, uint8x8x4_t, vabsq_f32, vaddq_f32, vaddq_u16, vandq_u32, vbslq_u32, vcgeq_f32, vcltq_f32, vcombine_u8, vcvtq_u32_f32, vdupq_n_f32, vdupq_n_u16, vdupq_n_u32,
-  vget_high_u8, vget_low_u8, vgetq_lane_u32, vld1_u8, vld1q_f32, vld1q_u8, vld4_u8, vmaxq_f32, vmaxq_u16, vminq_f32, vminq_u16, vminv_u8, vmovl_u8, vmovn_u16, vmulq_f32, vmulq_u16, vnegq_f32,
+  uint16x8_t, uint32x4_t, uint8x16_t, uint8x8x4_t, vabsq_f32, vaddq_f32, vaddq_u16, vandq_u32, vbslq_u32, vceqq_u16, vcgeq_f32, vcltq_f32, vcombine_u8, vcvtq_u32_f32, vdupq_n_f32, vdupq_n_u16, vdupq_n_u32,
+  vget_high_u8, vget_low_u8, vgetq_lane_u32, vld1_u8, vld1q_f32, vld1q_u8, vld4_u8, vmaxq_f32, vmaxq_u16, vminq_f32, vminq_u16, vminvq_u16, vminv_u8, vmovl_u8, vmovn_u16, vmulq_f32, vmulq_u16, vnegq_f32,
   vshrq_n_u16, vsqrtq_f32, vst1q_u32, vst1q_u8, vst4_u8, vsubq_f32, vsubq_u16,
 };
 
@@ -411,6 +411,39 @@ pub(super) fn composite_over_neon(dst: &mut [u32], src: &[u32], k: u32) {
       vmovn_u16(over(vmovl_u8(d4.1), s_g, inv)),
       vmovn_u16(over(vmovl_u8(d4.2), s_r, inv)),
       vmovn_u16(over(vmovl_u8(d4.3), s_a, inv)),
+    );
+    // SAFETY: same 32-byte span as the load above.
+    #[allow(unsafe_code)]
+    unsafe {
+      vst4_u8(dpx.as_mut_ptr().cast::<u8>(), out)
+    };
+  }
+}
+
+#[target_feature(enable = "neon")]
+pub(super) fn apply_matte_alpha_neon(dst: &mut [u32], src: &[u32], source_opacity: u8, inverted: bool) {
+  let opacity = vdupq_n_u16(u16::from(source_opacity));
+  let full = vdupq_n_u16(255);
+  for (dpx, spx) in dst.chunks_exact_mut(8).zip(src.chunks_exact(8)) {
+    // SAFETY: chunks_exact guarantees exactly 8 u32 (32 bytes) at
+    // both pointers.
+    #[allow(unsafe_code)]
+    let s4 = unsafe { vld4_u8(spx.as_ptr().cast::<u8>()) };
+    let mut f = div255_round(vmulq_u16(vmovl_u8(s4.3), opacity));
+    if inverted {
+      f = vsubq_u16(full, f);
+    }
+    if vminvq_u16(vceqq_u16(f, full)) == 0xFFFF {
+      continue;
+    }
+    // SAFETY: chunks_exact guarantees exactly 8 u32 (32 bytes) at the pointer.
+    #[allow(unsafe_code)]
+    let d4 = unsafe { vld4_u8(dpx.as_ptr().cast::<u8>()) };
+    let out = uint8x8x4_t(
+      vmovn_u16(div255_round(vmulq_u16(vmovl_u8(d4.0), f))),
+      vmovn_u16(div255_round(vmulq_u16(vmovl_u8(d4.1), f))),
+      vmovn_u16(div255_round(vmulq_u16(vmovl_u8(d4.2), f))),
+      vmovn_u16(div255_round(vmulq_u16(vmovl_u8(d4.3), f))),
     );
     // SAFETY: same 32-byte span as the load above.
     #[allow(unsafe_code)]
