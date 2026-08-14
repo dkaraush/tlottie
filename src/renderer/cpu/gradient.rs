@@ -1,7 +1,6 @@
 //! Gradient lookup tables, coordinate maps, and compositing kernels.
 
 use super::*;
-use alloc::vec::Vec;
 
 /// Builds a premultiplied RGBA8 lookup table from independently interpolated
 /// Lottie color and opacity stops.

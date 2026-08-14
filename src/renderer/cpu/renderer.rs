@@ -1,7 +1,6 @@
 //! Public CPU renderer entry points.
 
 use crate::{Composition, Result};
-use alloc::vec::Vec;
 
 use super::executor::RenderScratch;
 
@@ -14,7 +13,7 @@ const STATIC_BITMAP_CACHE_BYTES: usize = 4 * 1024 * 1024;
 /// reusable raster buffers, mask planes, and gradient tables needed between
 /// frames. Rendering is synchronous and single-threaded by design.
 pub struct CPURenderer {
-  pub(super) comp: alloc::sync::Arc<Composition>,
+  pub(super) comp: std::sync::Arc<Composition>,
   pub(super) walker: crate::renderer::frame::FrameWalker,
   pub(super) state: RenderScratch,
   pub(super) bitmap: Option<core::ptr::NonNull<[u32]>>,
@@ -46,7 +45,7 @@ impl CPURenderer {
   /// Creates a CPU renderer owning its composition.
   pub fn new(comp: Composition) -> Self {
     Self {
-      comp: alloc::sync::Arc::new(comp),
+      comp: std::sync::Arc::new(comp),
       walker: Default::default(),
       state: RenderScratch::default(),
       bitmap: None,
@@ -66,7 +65,7 @@ impl CPURenderer {
   }
 
   /// Creates a CPU renderer over a shared composition.
-  pub fn from_shared(comp: alloc::sync::Arc<Composition>) -> Self {
+  pub fn from_shared(comp: std::sync::Arc<Composition>) -> Self {
     Self {
       comp,
       walker: Default::default(),
@@ -108,7 +107,7 @@ impl CPURenderer {
         }
       }
     }
-    let composition = alloc::sync::Arc::clone(&self.comp);
+    let composition = std::sync::Arc::clone(&self.comp);
     let mut walker = core::mem::take(&mut self.walker);
     let result = self.with_bitmap(pixels, width, height, options, |renderer| walker.render(&composition, frame, width, height, options, renderer));
     self.walker = walker;
@@ -173,7 +172,7 @@ impl CPURenderer {
     options.alpha_only = true;
     self.state.cov_cache.set_budget_for_canvas(width as usize, height as usize);
     self.state.cov_cache.frame_tick();
-    let composition = alloc::sync::Arc::clone(&self.comp);
+    let composition = std::sync::Arc::clone(&self.comp);
     let mut walker = core::mem::take(&mut self.walker);
     let mut backend = super::alpha_backend::Alpha8Renderer::new(target, width as usize, height as usize, options.antialias, options.clear, &mut self.state);
     let result = walker.render(&composition, frame, width, height, options, &mut backend);

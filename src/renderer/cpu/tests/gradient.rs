@@ -1,5 +1,4 @@
 use super::*;
-use alloc::vec;
 
 #[test]
 fn opacity_stops_do_not_shift_color_interpolation() {

@@ -12,9 +12,6 @@ use super::*;
 use crate::math::Vec2;
 use crate::model::{Composition, Mask, PathData, Transform};
 use crate::property::Property;
-use alloc::string::String;
-use alloc::vec;
-use alloc::vec::Vec;
 
 fn full_box(w: usize, h: usize) -> DirtyBox {
   DirtyBox { x0: 0, y0: 0, x1: w - 1, y1: h - 1 }

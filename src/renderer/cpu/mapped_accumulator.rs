@@ -1,7 +1,5 @@
 #![allow(unsafe_code)]
 
-use alloc::vec;
-use alloc::vec::Vec;
 use core::ops::Range;
 
 const MAP_THRESHOLD: usize = 1 << 20;

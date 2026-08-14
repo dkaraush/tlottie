@@ -8,12 +8,10 @@
 //! - values we don't care about are *skipped*, not validated in depth —
 //!   full validation happens where a subtree is actually parsed.
 
-use crate::compat::HashMap;
 use crate::error::{Error, JsonErrorKind, Limit, Result};
-use alloc::format;
-use alloc::rc::Rc;
-use alloc::string::String;
-use core::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 
 pub(crate) struct Cursor<'a> {
   bytes: &'a [u8],

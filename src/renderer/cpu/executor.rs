@@ -3,8 +3,6 @@
 
 use super::mapped_surface::Surface;
 use crate::cells::CellRaster;
-#[cfg(not(feature = "std"))]
-use crate::compat::FloatExt as _;
 #[cfg(test)]
 use crate::error::Error;
 use crate::error::Result;
@@ -24,7 +22,6 @@ use crate::model::{Composition, DashElement, FillRule, FloatList, GradientKind, 
 use crate::raster::Rasterizer;
 use crate::renderer::frame::renderer::GRADIENT_LUT_SIZE;
 use crate::stroke::{stroke_polyline, StrokeSegment};
-use alloc::vec::Vec;
 
 /// Maximum group recursion while rendering (matches parse-side bound).
 const MAX_RENDER_DEPTH: usize = 40;
@@ -53,7 +50,7 @@ pub(crate) struct RenderScratch {
   /// from the stop list is pure, and stop values repeat across frames
   /// (static gradients: every frame; animated: on hold segments and loop
   /// repeats). Keyed by the exact input bits — no collision risk.
-  lut_cache: crate::compat::HashMap<Vec<u32>, alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>>,
+  lut_cache: std::collections::HashMap<Vec<u32>, std::sync::Arc<[u32; GRADIENT_LUT_SIZE]>>,
   lut_key: Vec<u32>,
   /// Recycled contour point buffers: stroke pieces + fill snapshots draw
   /// from here and return after their paint executes (measured: 2,683
@@ -69,12 +66,12 @@ pub(crate) struct RenderScratch {
   /// Memoized per-layer staticness (keyed by the Layer's stable address
   /// inside the Arc'd Composition).
   #[cfg(test)]
-  static_flags: crate::compat::HashMap<usize, bool>,
+  static_flags: std::collections::HashMap<usize, bool>,
   /// Static-layer job lists: replay the exact fill calls (by coverage
   /// key) without walking/evaluating/flattening the shape tree at all —
   /// the per-frame cost rlottie avoids via its own static detection.
   #[cfg(test)]
-  jobs_cache: crate::compat::HashMap<u128, Vec<ReplayJob>>,
+  jobs_cache: std::collections::HashMap<u128, Vec<ReplayJob>>,
   /// Two-touch admission for jobs_cache: a replay key must be seen twice
   /// before recording (a static layer under an ANIMATED parent produces a
   /// fresh key every frame and must not flood the cache).
@@ -113,7 +110,7 @@ enum ReplayJob {
     key: u128,
     src_key: u128,
     rule: FillRule,
-    lut: alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
+    lut: std::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
     map: GradientMap,
   },
 }
@@ -258,7 +255,7 @@ impl RenderScratch {
 
   /// Returns the LUT plus a 64-bit id of its exact inputs (used in the
   /// gradient source-plane cache key).
-  fn lut_for(&mut self, stops: &crate::model::FloatList, color_count: usize, opacity: f32) -> (alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>, u64) {
+  fn lut_for(&mut self, stops: &crate::model::FloatList, color_count: usize, opacity: f32) -> (std::sync::Arc<[u32; GRADIENT_LUT_SIZE]>, u64) {
     self.lut_key.clear();
     self.lut_key.reserve(stops.0.len() + 2);
     self.lut_key.push(color_count as u32);
@@ -274,7 +271,7 @@ impl RenderScratch {
     if let Some(lut) = self.lut_cache.get(self.lut_key.as_slice()) {
       return (lut.clone(), id);
     }
-    let lut: alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]> = alloc::sync::Arc::new(build_gradient_lut(stops, color_count, opacity));
+    let lut: std::sync::Arc<[u32; GRADIENT_LUT_SIZE]> = std::sync::Arc::new(build_gradient_lut(stops, color_count, opacity));
     if self.lut_cache.len() >= LUT_CACHE_CAP {
       self.lut_cache.clear();
     }

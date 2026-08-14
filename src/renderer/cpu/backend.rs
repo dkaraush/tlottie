@@ -4,7 +4,6 @@
 
 use crate::model::FillRule;
 use crate::renderer::frame::{Composite, FrameRenderer, Geometry, GradientKind, GradientPaint, Paint, Rule};
-use alloc::vec::Vec;
 
 use super::executor::{apply_matte, mode_s_wins, modulate, Canvas, CovCache, DirtyBox, GradientMap, GradientMapKind, RowBounds};
 use super::CPURenderer;

@@ -8,8 +8,6 @@
 //! Unsupported shape/layer types are skipped silently for now; the
 //! supported-feature report lands with a later phase.
 
-#[cfg(not(feature = "std"))]
-use crate::compat::FloatExt as _;
 use crate::composition::options::{LayerColorReplacement, ParseOptions, SourceColorReplacement};
 use crate::error::{Error, JsonErrorKind, Limit, Result};
 use crate::json::Cursor;
@@ -21,10 +19,6 @@ use crate::model::{
 };
 use crate::property::{Easing, Keyframe, Lerp, Property, Timeline};
 use crate::stroke::{Cap, Join};
-use alloc::vec;
-use alloc::boxed::Box;
-use alloc::string::String;
-use alloc::vec::Vec;
 
 /// Maximum nesting of `gr` shape groups (separate from raw JSON depth).
 const MAX_GROUP_DEPTH: usize = 32;
@@ -1743,7 +1737,7 @@ fn focal_radial_gradients_in_shape(shape: &Shape) -> usize {
 }
 
 fn validate_precomp_expansion(layers: &[Layer], assets: &[Asset], limits: &Limits) -> Result<()> {
-  let mut asset_by_id = crate::compat::HashMap::new();
+  let mut asset_by_id = std::collections::HashMap::new();
   for (index, asset) in assets.iter().enumerate() {
     asset_by_id.entry(asset.id.as_str()).or_insert(index);
   }
@@ -1756,7 +1750,7 @@ fn validate_precomp_expansion(layers: &[Layer], assets: &[Asset], limits: &Limit
 fn layer_list_expansion<'a>(
   layers: &[Layer],
   assets: &'a [Asset],
-  asset_by_id: &crate::compat::HashMap<&'a str, usize>,
+  asset_by_id: &std::collections::HashMap<&'a str, usize>,
   memo: &mut [Option<ExpansionCost>],
   visiting: &mut [bool],
   limits: &Limits,
@@ -1777,7 +1771,7 @@ fn layer_list_expansion<'a>(
 fn asset_expansion<'a>(
   asset_index: usize,
   assets: &'a [Asset],
-  asset_by_id: &crate::compat::HashMap<&'a str, usize>,
+  asset_by_id: &std::collections::HashMap<&'a str, usize>,
   memo: &mut [Option<ExpansionCost>],
   visiting: &mut [bool],
   limits: &Limits,

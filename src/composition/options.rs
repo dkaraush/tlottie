@@ -63,9 +63,6 @@ pub struct SourceColorReplacement {
   pub target_color: u32,
 }
 
-use alloc::string::String;
-use alloc::vec::Vec;
-
 /// Byte order of the premultiplied pixels a renderer writes.
 ///
 /// The blend pipeline itself is channel-order agnostic — every stage reads a

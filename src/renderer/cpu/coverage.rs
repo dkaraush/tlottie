@@ -1,5 +1,4 @@
 use super::*;
-use alloc::vec::Vec;
 
 /// Paint bbox extent (px, max dimension) ABOVE which the sparse cell/span
 /// engine rasterizes instead of the dense accumulator. The threshold is
@@ -185,7 +184,7 @@ pub(crate) struct CovEntry {
 /// geometries per loop and full keys would dwarf the coverage payload).
 /// Eviction: whole-cache clear on budget overflow — periodic animations
 /// refill within one loop, and the budget bounds per-instance memory.
-pub(super) type CoverageMap = crate::compat::HashMap<u128, CovEntry, core::hash::BuildHasherDefault<CoverageKeyHasher>>;
+pub(super) type CoverageMap = std::collections::HashMap<u128, CovEntry, core::hash::BuildHasherDefault<CoverageKeyHasher>>;
 
 /// Coverage keys are already two independently mixed 64-bit content hashes.
 /// Running SipHash over them at every lookup is redundant and shows up on
@@ -394,22 +393,15 @@ impl CovCache {
 
   pub(crate) fn set_budget_for_canvas(&mut self, w: usize, h: usize) {
     // Development hook for overriding the three size-class cache budgets.
-    // Reading the environment is the one thing this crate does that core
-    // cannot, so no_std builds simply take the compiled-in budgets.
-    #[cfg(feature = "std")]
-    let ov = {
-      static OVERRIDE: std::sync::OnceLock<Option<[usize; 3]>> = std::sync::OnceLock::new();
-      OVERRIDE.get_or_init(|| {
-        let v = std::env::var("TLOTTIE_COV_BUDGET_KB").ok()?;
-        let mut it = v.split(',').map(|s| s.trim().parse::<usize>());
-        match (it.next(), it.next(), it.next()) {
-          (Some(Ok(a)), Some(Ok(b)), Some(Ok(c))) => Some([a << 10, b << 10, c << 10]),
-          _ => None,
-        }
-      })
-    };
-    #[cfg(not(feature = "std"))]
-    let ov = &None::<[usize; 3]>;
+    static OVERRIDE: std::sync::OnceLock<Option<[usize; 3]>> = std::sync::OnceLock::new();
+    let ov = OVERRIDE.get_or_init(|| {
+      let v = std::env::var("TLOTTIE_COV_BUDGET_KB").ok()?;
+      let mut it = v.split(',').map(|s| s.trim().parse::<usize>());
+      match (it.next(), it.next(), it.next()) {
+        (Some(Ok(a)), Some(Ok(b)), Some(Ok(c))) => Some([a << 10, b << 10, c << 10]),
+        _ => None,
+      }
+    });
     let px = w.saturating_mul(h);
     self.shrink_entries = px > 160 * 160;
     if let Some([a, b, c]) = ov {

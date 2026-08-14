@@ -131,9 +131,6 @@ impl fmt::Display for Error {
   }
 }
 
-// core has no Error trait, so this is the one API difference between the two
-// configurations. Display, Debug and the enum itself are unchanged.
-#[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
 /// Convenience alias: `tlottie::Result<T>` = `Result<T, tlottie::Error>`.

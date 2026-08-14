@@ -1,8 +1,6 @@
 use super::*;
 use crate::math::Vec2;
 use crate::raster::Rasterizer;
-use alloc::vec;
-use alloc::vec::Vec;
 
 fn plane_s(w: usize, h: usize, contours: &[Contour], rule: FillRule) -> Vec<u8> {
   let mut r = CellRaster::new(w, h);

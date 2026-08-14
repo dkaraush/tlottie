@@ -1,5 +1,4 @@
 use super::*;
-use alloc::vec::Vec;
 
 /// Inclusive rectangle containing every pixel written to a canvas.
 /// Pixels outside it remain transparent.

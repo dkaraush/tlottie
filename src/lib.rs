@@ -12,23 +12,9 @@
 // opt-in FFI, and opt-in Vulkan modules locally allow only the operations
 // required at those boundaries. `deny` (not `forbid`) lets those modules opt
 // in explicitly while keeping the rest of the crate safe by default.
-#![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
-// Available in std builds too, so the rest of the crate can name `alloc`
-// paths unconditionally and read identically in both configurations.
-extern crate alloc;
-
-#[cfg(all(not(feature = "std"), not(feature = "hashbrown")))]
-compile_error!("building without `std` needs a hash map: add `--features hashbrown` (see the `compat` module)");
-
-// Only a staticlib handed to a C host needs these; a Rust binary linking the
-// crate brings its own.
-#[cfg(all(not(feature = "std"), feature = "c-api"))]
-mod no_std_runtime;
-
-mod compat;
 mod composition;
 mod error;
 mod math;

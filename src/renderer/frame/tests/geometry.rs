@@ -1,6 +1,4 @@
 use super::*;
-use alloc::vec;
-use alloc::vec::Vec;
 
 #[test]
 fn rounds_each_corner_of_a_closed_square() {

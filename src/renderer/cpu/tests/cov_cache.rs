@@ -1,6 +1,4 @@
 use super::*;
-use alloc::vec;
-use alloc::vec::Vec;
 
 fn entry(bytes: usize) -> CovEntry {
   CovEntry {

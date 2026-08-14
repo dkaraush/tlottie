@@ -1,8 +1,5 @@
 //! Small single-precision geometry and math primitives.
 
-#[cfg(not(feature = "std"))]
-use crate::compat::FloatExt as _;
-
 /// 2D point / vector.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct Vec2 {

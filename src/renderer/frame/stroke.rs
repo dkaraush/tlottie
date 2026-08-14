@@ -4,11 +4,8 @@
 //! with opposite winding. Input cleanup lives here so every renderer sees
 //! identical stroke geometry.
 
-#[cfg(not(feature = "std"))]
-use crate::compat::FloatExt as _;
 use crate::geometry::Contour;
 use crate::math::Vec2;
-use alloc::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Cap {
