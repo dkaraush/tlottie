@@ -3,6 +3,9 @@
 #![allow(unsafe_code)]
 
 use crate::{CPURenderer, ChannelOrder, Composition, FitzModifier, LayerColorReplacement, Limits, ParseOptions, RenderOptions, SourceColorReplacement};
+use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 /// One constructor-time layer-prefix color override.
 #[repr(C)]

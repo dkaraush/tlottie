@@ -1,4 +1,6 @@
 use super::*;
+use alloc::vec;
+use alloc::vec::Vec;
 
 fn stroke(pts: &[(f32, f32)], closed: bool, hw: f32, cap: Cap, join: Join, ml: f32) -> Vec<Contour> {
   let v: Vec<Vec2> = pts.iter().map(|&(x, y)| Vec2::new(x, y)).collect();

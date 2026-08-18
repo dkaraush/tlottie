@@ -5,8 +5,12 @@
 //! v0 keeps a full w×h f32 accumulation buffer. The cell/RLE engine with
 //! small-mask output replaces this in the rasterizer phase.
 
+#[cfg(not(feature = "std"))]
+use crate::compat::FloatExt as _;
 use crate::geometry::Contour;
 use crate::model::FillRule;
+use alloc::vec;
+use alloc::vec::Vec;
 
 #[path = "mapped_accumulator.rs"]
 mod mapped_accumulator;

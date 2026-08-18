@@ -35,14 +35,14 @@ if [ -n "$rustup_toolchain" ]; then
     --target "$target" \
     --profile "$profile" \
     --no-default-features \
-    --features wasm
+    --features wasm,std
 else
   cargo build \
     --manifest-path "$repo_root/Cargo.toml" \
     --target "$target" \
     --profile "$profile" \
     --no-default-features \
-    --features wasm
+    --features wasm,std
 fi
 
 cp "$CARGO_TARGET_DIR/$target/$profile/tlottie.wasm" "$script_dir/tlottie.wasm"

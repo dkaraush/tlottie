@@ -2,6 +2,7 @@
 
 use crate::model::FillRule;
 use crate::renderer::frame::{Composite, FrameRenderer, Geometry, GradientKind, GradientPaint, Paint, Rule};
+use alloc::vec::Vec;
 
 use super::executor::{mode_s_wins, pack_span, unpack_span, CovEntry, PlaneData, RenderScratch, SPAN_CAPTURE_MAX};
 

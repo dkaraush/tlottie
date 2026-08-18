@@ -1,4 +1,5 @@
 use super::*;
+use alloc::vec::Vec;
 
 struct Rng(u64);
 

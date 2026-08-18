@@ -4,8 +4,12 @@
 //! polygon length in device space; the adaptive/scale-aware flattener comes
 //! with the quality/perf phases.
 
+#[cfg(not(feature = "std"))]
+use crate::compat::FloatExt as _;
 use crate::math::{Mat2x3, Vec2};
 use crate::model::PathData;
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// One closed (or open) contour as a device-space polyline.
 #[derive(Debug, Clone, Default)]

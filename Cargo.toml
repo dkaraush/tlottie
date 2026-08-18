@@ -14,20 +14,24 @@ path = "src/cli/main.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cpu"]
+default = ["cpu", "std"]
 cpu = []
-vulkan = ["cpu", "dep:ash", "dep:naga"]
-opengl = ["cpu", "dep:glow"]
+no-std = ["dep:hashbrown", "dep:dlmalloc"]
+std = []
+vulkan = ["cpu", "std", "dep:ash", "dep:naga"]
+opengl = ["cpu", "std", "dep:glow"]
 webgl = ["opengl", "wasm", "dep:wasm-bindgen", "dep:web-sys"]
-cli = ["cpu"]
+cli = ["cpu", "std"]
 c-api = ["cpu"]
 wasm = ["cpu"]
 
 [dependencies]
 ash = { version = "0.37.3", default-features = false, features = ["loaded"], optional = true }
 glow = { version = "0.18", optional = true }
+hashbrown = { version = "0.15", default-features = false, features = ["default-hasher", "inline-more"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+dlmalloc = { version = "0.2.14", default-features = false, features = ["global"], optional = true }
 wasm-bindgen = { version = "0.2.126", optional = true }
 web-sys = { version = "0.3.103", features = ["HtmlCanvasElement", "WebGl2RenderingContext"], optional = true }
 
@@ -58,3 +62,7 @@ codegen-units = 1
 inherits = "release"
 opt-level = "z"
 strip = "symbols"
+
+[profile.release-nostd]
+inherits = "release"
+panic = "abort"
