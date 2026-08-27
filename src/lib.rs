@@ -1,4 +1,4 @@
-//! tlottie — a Lottie evaluator with CPU and optional GPU presentation/rendering backends.
+//! tlottie — a Lottie evaluator with a CPU rendering backend.
 //!
 //! Core contracts:
 //! - malformed input yields [`Error`] rather than intentionally panicking;
@@ -8,8 +8,8 @@
 //!   independent and the host owns all concurrency;
 //! - the default CPU build has no mandatory third-party dependencies.
 
-// Unsafe is denied by default. The isolated SIMD,
-// opt-in FFI, and opt-in Vulkan modules locally allow only the operations
+// Unsafe is denied by default. The isolated SIMD and opt-in FFI modules
+// locally allow only the operations
 // required at those boundaries. `deny` (not `forbid`) lets those modules opt
 // in explicitly while keeping the rest of the crate safe by default.
 // Unit tests always use the standard test harness even when exercising the
@@ -51,11 +51,6 @@ pub(crate) use composition::{json, limits, model, parse, property};
 #[cfg(feature = "cpu")]
 pub(crate) use renderer::cpu::{cells, raster, simd};
 pub(crate) use renderer::frame::{geometry, stroke};
-
-#[cfg(feature = "opengl")]
-pub use renderer::opengl;
-#[cfg(feature = "vulkan")]
-pub use renderer::vulkan;
 
 #[doc(hidden)]
 #[cfg(feature = "cpu")]

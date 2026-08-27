@@ -1,4 +1,4 @@
-// tlottie vs rlottie vs thorvg (cpu + webgpu) wasm demo. Every engine sits
+// tlottie vs rlottie vs thorvg (cpu) wasm demo. Every engine sits
 // behind the same tiny C ABI (src/bindings/wasm.rs,
 // rlottie_shim.cpp, tvg_shim.cpp); this file drives them symmetrically and
 // shows per-engine draw times.
@@ -27,19 +27,10 @@ const sizeVal = document.getElementById('sizeval');
 const err = document.getElementById('err');
 const picker = document.getElementById('picker');
 
-// thorvg's webgpu backend needs a GPUDevice created before module init
-// (emdawnwebgpu's preinitializedWebGPUDevice hook). No WebGPU -> the twg
-// panel reports unavailable and the other three engines run as usual.
-let gpuDevice = null;
-try {
-  const adapter = await navigator.gpu?.requestAdapter();
-  gpuDevice = adapter ? await adapter.requestDevice() : null;
-} catch { /* no WebGPU */ }
-
 const [{ instance }, rl, tv] = await Promise.all([
   WebAssembly.instantiateStreaming(fetch('tlottie.wasm'), {}),
   initRlottie(),
-  initThorvg(gpuDevice ? { preinitializedWebGPUDevice: gpuDevice } : {}),
+  initThorvg(),
 ]);
 const tl = instance.exports;
 
@@ -92,29 +83,6 @@ const engines = [
     free: (p, n) => tv._tv_free(p, n),
     heap: () => tv.HEAPU8,
     create: (p, n) => tv._tv_new(p, n, 0, 0),
-    drop: (i) => tv._tv_drop(i),
-    width: (i) => tv._tv_width(i),
-    height: (i) => tv._tv_height(i),
-    frameRate: (i) => tv._tv_frame_rate(i),
-    frameCount: (i) => tv._tv_frame_count(i),
-    render: (i, f, w, h) => tv._tv_render(i, f, w, h),
-  },
-  {
-    ...engineDom('twg'),
-    // Draws straight into #canvas-twg via WebGPU: no ImageData blit, and
-    // draw time is measured submit -> onSubmittedWorkDone (GPU completion),
-    // one frame in flight at a time.
-    direct: true,
-    unavailable: !gpuDevice,
-    alloc: (n) => tv._tv_alloc(n),
-    free: (p, n) => tv._tv_free(p, n),
-    heap: () => tv.HEAPU8,
-    create: (p, n) => {
-      const sel = tv.stringToNewUTF8('#canvas-twg');
-      const inst = tv._tv_new(p, n, 1, sel);
-      tv._tv_free(sel, 0);
-      return inst;
-    },
     drop: (i) => tv._tv_drop(i),
     width: (i) => tv._tv_width(i),
     height: (i) => tv._tv_height(i),
@@ -182,7 +150,7 @@ tabs.addEventListener('click', (ev) => {
     if (e.drawMs) e.drawMs.length = 0;
   }
 });
-const active = (e) => !e.unavailable && (mode === 'both' || mode === e.key);
+const active = (e) => mode === 'both' || mode === e.key;
 
 // Render-size slider: sets the long side of the render target (the canvas
 // CSS size stays put — this changes how many pixels the engines rasterize,
@@ -225,10 +193,8 @@ function loadLottie(bytes, name) {
   for (const e of engines) {
     if (e.inst) { e.drop(e.inst); e.inst = null; }
     e.dead = false;
-    e.inFlight = false;
     e.drawMs = [];
     e.statsEl.textContent = '';
-    if (e.unavailable) { e.statsEl.textContent = 'WebGPU unavailable'; continue; }
 
     const ptr = e.alloc(bytes.length);
     if (!ptr) { e.statsEl.textContent = 'allocation failed'; continue; }
@@ -238,7 +204,7 @@ function loadLottie(bytes, name) {
     if (!inst) { e.statsEl.textContent = `rejected ${name}`; continue; }
 
     e.inst = inst;
-    e.ctx = e.direct ? null : e.canvasEl.getContext('2d');
+    e.ctx = e.canvasEl.getContext('2d');
     e.cw = e.width(inst);
     e.ch = e.height(inst);
     e.fps = e.frameRate(inst);
@@ -309,7 +275,6 @@ function loadLottie(bytes, name) {
       const order = flip ? [...engines].reverse() : engines;
       for (const e of order) {
         if (!e.inst || e.dead || !active(e)) continue;
-        if (e.inFlight) continue;  // one GPU frame in flight at a time
         const frame = pos % e.frames;
         const d0 = performance.now();
         const alpha8 = e.key === 'tl' && alphaOnly.checked;
@@ -319,21 +284,6 @@ function loadLottie(bytes, name) {
               +curveTolerance.value)
           : e.render(e.inst, frame, e.w, e.h, antialias.checked, +curveTolerance.value);
         if (!px) { e.dead = true; e.statsEl.textContent = 'render failed'; continue; }
-        if (e.direct) {
-          // GPU submit done; sample completes when the queue drains.
-          e.inFlight = true;
-          gpuDevice.queue.onSubmittedWorkDone().then(() => {
-            e.inFlight = false;
-            const ms = performance.now() - d0;
-            // >500ms means the tab was suspended mid-flight (the promise
-            // resolves on the event loop), not real GPU time — discard.
-            if (ms < 500) {
-              e.drawMs.push(ms);
-              if (e.drawMs.length > WINDOW) e.drawMs.shift();
-            }
-          });
-          continue;
-        }
         const rgba = new Uint8ClampedArray(e.heap().buffer, px, e.w * e.h * 4);
         e.ctx.putImageData(new ImageData(rgba, e.w, e.h), 0, 0);
         e.drawMs.push(performance.now() - d0);

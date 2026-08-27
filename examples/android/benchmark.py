@@ -20,21 +20,17 @@ DEFAULT_FIXTURE = ("/storage/emulated/0/Android/data/com.example.tlottie/files/t
                    "HarryGorilla/effects/5282751684647339553.json")
 BACKENDS = {
     "tlottie-cpu": 0,
-    "tlottie-vulkan": 1,
-    "rlottie": 2,
-    "rlottie-2019": 3,
-    "rlottie-2019-patched": 4,
-    "thorvg-cpu": 5,
-    "thorvg-gpu": 6,
+    "rlottie": 1,
+    "rlottie-2019": 2,
+    "rlottie-2019-patched": 3,
+    "thorvg-cpu": 4,
 }
 ACTUAL_BACKENDS = {
     "tlottie-cpu": "tlottie_CPU",
-    "tlottie-vulkan": "tlottie_Vulkan",
     "rlottie": "rlottie",
     "rlottie-2019": "rlottie_2019",
     "rlottie-2019-patched": "rlottie_2019_patched",
     "thorvg-cpu": "ThorVG_CPU",
-    "thorvg-gpu": "ThorVG_GPU_(OpenGL_ES)",
 }
 
 
@@ -58,9 +54,8 @@ def build() -> None:
     )
 
 
-def wait_for_result(serial: str, seconds: int, expect_gpu: bool) -> tuple[str, str, str]:
+def wait_for_result(serial: str, seconds: int) -> tuple[str, str]:
     deadline = time.monotonic() + seconds + 30
-    result_seen_at: float | None = None
     presentation_started = False
     presentation = ""
     while time.monotonic() < deadline:
@@ -80,22 +75,11 @@ def wait_for_result(serial: str, seconds: int, expect_gpu: bool) -> tuple[str, s
             "",
         )
         if result:
-            if result_seen_at is None:
-                result_seen_at = time.monotonic()
-                result_fields = fields(result)
-                presentation = surface_presentation_summary(
-                    serial,
-                    expect_gpu,
-                    float(result_fields.get("refresh_hz", "60")),
-                )
-            if not expect_gpu:
-                return result, "", presentation
-            gpu = next(
-                (line.split("GPU ", 1)[1] for line in output.splitlines() if "TLottieBench" in line and "GPU " in line),
-                "",
+            result_fields = fields(result)
+            presentation = surface_presentation_summary(
+                serial, float(result_fields.get("refresh_hz", "60"))
             )
-            if gpu or time.monotonic() - result_seen_at >= 10:
-                return result, gpu, presentation
+            return result, presentation
         if error:
             raise RuntimeError(error)
         time.sleep(0.25)
@@ -116,7 +100,7 @@ def reset_surface_stats(serial: str) -> None:
     adb(serial, "shell", "dumpsys", "SurfaceFlinger", "--timestats", "-enable", check=False)
 
 
-def surface_presentation_summary(serial: str, _gpu_surface: bool, refresh_hz: float) -> str:
+def surface_presentation_summary(serial: str, refresh_hz: float) -> str:
     dump = adb(
         serial, "shell", "dumpsys", "SurfaceFlinger", "--timestats", "-dump",
         check=False,
@@ -219,9 +203,7 @@ def main() -> int:
                     "--ez", "benchmark_aa", str(args.aa).lower(),
                     "--ef", "benchmark_curve_tolerance", str(args.curve_tolerance),
                 )
-                result, gpu, presentation = wait_for_result(
-                    args.serial, args.seconds, name in ("tlottie-vulkan", "thorvg-gpu")
-                )
+                result, presentation = wait_for_result(args.serial, args.seconds)
                 row = fields(result)
                 if row.get("backend") != ACTUAL_BACKENDS[name]:
                     raise RuntimeError(
@@ -230,8 +212,6 @@ def main() -> int:
                 row["requested"] = name
                 rows.append(row)
                 print("  " + result)
-                if gpu:
-                    print("  GPU " + gpu)
                 if presentation:
                     row.update(fields(presentation))
                     print("  PRESENT " + presentation)

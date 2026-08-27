@@ -1,11 +1,9 @@
 mod rlottie;
 mod thorvg;
-mod thorvg_gl;
-mod vulkan;
 
 use std::sync::Arc;
 
-use jni::objects::{JByteArray, JClass, JIntArray, JObject};
+use jni::objects::{JByteArray, JClass, JIntArray};
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring};
 use jni::JNIEnv;
 use tlottie::{CPURenderer, Composition, Limits, RenderOptions};
@@ -14,11 +12,9 @@ struct State {
     json: Vec<u8>,
     composition: Arc<Composition>,
     cpu: CPURenderer,
-    gpu: Option<vulkan::GpuRenderer>,
     pixels: Vec<u32>,
     rlottie: [Option<rlottie::Rlottie>; 3],
     thorvg_cpu: Option<thorvg::ThorvgCpu>,
-    thorvg_gpu: Option<thorvg_gl::ThorvgGl>,
 }
 
 fn state_mut(handle: jlong) -> Result<&'static mut State, String> {
@@ -96,11 +92,9 @@ pub extern "system" fn Java_com_example_tlottie_NativeBridge_create(
         json: bytes,
         composition,
         cpu,
-        gpu: None,
         pixels: Vec::new(),
         rlottie: [None, None, None],
         thorvg_cpu: None,
-        thorvg_gpu: None,
     })) as jlong
 }
 
@@ -176,7 +170,7 @@ fn render_cpu(
     state.pixels.resize(len, 0);
     state
         .cpu
-        .render(frame, &mut state.pixels, width, height)
+        .render(frame, &mut state.pixels, width, height, RenderOptions::default())
         .map_err(|error| format!("CPU render: {error}"))?;
 
     // SAFETY: u32 and Java jint are both aligned four-byte integer types, and
@@ -291,123 +285,6 @@ pub extern "system" fn Java_com_example_tlottie_NativeBridge_renderThorvgCpu(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_example_tlottie_NativeBridge_setSurface(
-    mut env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    handle: jlong,
-    surface: JObject<'_>,
-    width: jint,
-    height: jint,
-) -> jstring {
-    let result = (|| {
-        let width = u32::try_from(width).map_err(|_| "negative surface width".to_string())?;
-        let height = u32::try_from(height).map_err(|_| "negative surface height".to_string())?;
-        let state = state_mut(handle)?;
-        state.gpu = None;
-        state.gpu = Some(vulkan::GpuRenderer::new(&env, &surface, width, height)?);
-        Ok(())
-    })();
-    java_error(&mut env, result)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_example_tlottie_NativeBridge_clearSurface(
-    _env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    handle: jlong,
-) {
-    if let Ok(state) = state_mut(handle) {
-        state.gpu = None;
-        state.thorvg_gpu = None;
-    }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_example_tlottie_NativeBridge_setThorvgSurface(
-    mut env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    handle: jlong,
-    surface: JObject<'_>,
-    width: jint,
-    height: jint,
-) -> jstring {
-    let result = (|| {
-        let width = u32::try_from(width).map_err(|_| "negative surface width".to_string())?;
-        let height = u32::try_from(height).map_err(|_| "negative surface height".to_string())?;
-        let state = state_mut(handle)?;
-        state.gpu = None;
-        state.thorvg_gpu = None;
-        state.thorvg_gpu = Some(thorvg_gl::ThorvgGl::new(
-            &env,
-            &surface,
-            width,
-            height,
-            &state.json,
-        )?);
-        Ok(())
-    })();
-    java_error(&mut env, result)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_example_tlottie_NativeBridge_renderThorvgGpu(
-    mut env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    handle: jlong,
-    frame: jfloat,
-) -> jstring {
-    let result = (|| {
-        state_mut(handle)?
-            .thorvg_gpu
-            .as_mut()
-            .ok_or_else(|| "ThorVG GPU surface is not ready".to_string())?
-            .render(frame)
-    })();
-    java_error(&mut env, result)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_example_tlottie_NativeBridge_renderVulkan(
-    mut env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    handle: jlong,
-    frame: jfloat,
-    antialias: jboolean,
-    curve_tolerance: jfloat,
-) -> jstring {
-    let result = (|| {
-        let state = state_mut(handle)?;
-        let gpu = state
-            .gpu
-            .as_mut()
-            .ok_or_else(|| "TextureView Vulkan surface is not ready".to_string())?;
-        gpu.render(
-            &state.composition,
-            frame,
-            RenderOptions {
-                antialias: antialias != 0,
-                curve_tolerance,
-                ..RenderOptions::default()
-            },
-        )
-    })();
-    java_error(&mut env, result)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_example_tlottie_NativeBridge_lastVulkanGpuNs(
-    _env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    handle: jlong,
-) -> jlong {
-    state_mut(handle)
-        .ok()
-        .and_then(|state| state.gpu.as_ref())
-        .map(|gpu| gpu.latest_gpu_ns().min(jlong::MAX as u64) as jlong)
-        .unwrap_or(0)
-}
-
-#[no_mangle]
 pub extern "system" fn Java_com_example_tlottie_NativeBridge_benchmarkCpu(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -448,7 +325,7 @@ fn benchmark_cpu(
         let started = std::time::Instant::now();
         state
             .cpu
-            .render_with_options(frame, &mut state.pixels, size, size, options)
+            .render(frame, &mut state.pixels, size, size, options)
             .map_err(|error| format!("CPU benchmark render: {error}"))?;
         if index >= warmup {
             samples.push(started.elapsed().as_nanos() as u64);
@@ -456,62 +333,3 @@ fn benchmark_cpu(
     }
     Ok(summarize("cpu", size, antialias, samples))
 }
-
-#[no_mangle]
-pub extern "system" fn Java_com_example_tlottie_NativeBridge_benchmarkVulkan(
-    mut env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    handle: jlong,
-    warmup_frames: jint,
-    measured_frames: jint,
-    antialias: jboolean,
-    curve_tolerance: jfloat,
-) -> jstring {
-    let result = (|| {
-        let warmup = usize::try_from(warmup_frames.max(0)).unwrap_or(0);
-        let measured = usize::try_from(measured_frames.max(1)).unwrap_or(1);
-        let state = state_mut(handle)?;
-        let gpu = state
-            .gpu
-            .as_mut()
-            .ok_or_else(|| "Vulkan benchmark surface is not ready".to_string())?;
-        let benchmark = gpu.benchmark(
-            &state.composition,
-            warmup,
-            measured,
-            RenderOptions {
-                antialias: antialias != 0,
-                curve_tolerance,
-                ..RenderOptions::default()
-            },
-        )?;
-        Ok(benchmark.summary(antialias != 0, curve_tolerance))
-    })();
-    java_string(&mut env, result)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_example_tlottie_NativeBridge_benchmarkThorvgGpu(
-    mut env: JNIEnv<'_>,
-    _class: JClass<'_>,
-    handle: jlong,
-    warmup_frames: jint,
-    measured_frames: jint,
-) -> jstring {
-    let result = (|| {
-        let warmup = usize::try_from(warmup_frames.max(0)).unwrap_or(0);
-        let measured = usize::try_from(measured_frames.max(1)).unwrap_or(1);
-        let state = state_mut(handle)?;
-        let (size, samples, disjoint) = state
-            .thorvg_gpu
-            .as_mut()
-            .ok_or_else(|| "ThorVG GPU surface is not ready".to_string())?
-            .benchmark(warmup, measured)?;
-        Ok(format!(
-            "{} disjoint_samples={disjoint}",
-            summarize("thorvg-gl-gpu", size, true, samples)
-        ))
-    })();
-    java_string(&mut env, result)
-}
-

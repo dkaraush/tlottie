@@ -6,7 +6,6 @@ import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
-import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Bundle;
@@ -14,9 +13,6 @@ import android.provider.OpenableColumns;
 import android.util.Log;
 import android.view.Choreographer;
 import android.view.Gravity;
-import android.view.Surface;
-import android.view.SurfaceHolder;
-import android.view.SurfaceView;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
@@ -127,8 +123,8 @@ public final class MainActivity extends Activity {
 
     private void showBackendMenu(View anchor) {
         String[] names = {
-                "tlottie CPU", "tlottie Vulkan", "rlottie",
-                "rlottie 2019", "rlottie 2019 patched", "ThorVG CPU", "ThorVG GPU (GL)"
+                "tlottie CPU", "rlottie",
+                "rlottie 2019", "rlottie 2019 patched", "ThorVG CPU"
         };
         PopupMenu menu = new PopupMenu(this, anchor);
         for (int index = 0; index < names.length; index++) {
@@ -164,9 +160,7 @@ public final class MainActivity extends Activity {
             lottieView.setRenderSize(Math.max(64, Math.min(1024, size)));
             lottieView.antialias = antialias;
             lottieView.curveTolerance = curveTolerance;
-            if (!lottieView.setBackend(selected)) {
-                throw new IllegalStateException("backend surface initialization failed");
-            }
+            lottieView.setBackend(selected);
             backend.setText(lottieView.backendName());
             lottieView.beginBenchmark(Math.max(1, seconds));
         } catch (Exception error) {
@@ -320,8 +314,7 @@ public final class MainActivity extends Activity {
     }
 
     private final class LottieView extends FrameLayout
-            implements SurfaceHolder.Callback, Choreographer.FrameCallback {
-        private SurfaceView gpuView;
+            implements Choreographer.FrameCallback {
         private final CpuView cpuView;
         private final Rect source = new Rect();
         private final Rect target = new Rect();
@@ -338,7 +331,6 @@ public final class MainActivity extends Activity {
         private int renderedFrames;
         private boolean running;
         private int backendMode;
-        private boolean surfaceReady;
         private boolean antialias = true;
         private float curveTolerance = 0.5f;
         private String fileName = "";
@@ -354,8 +346,6 @@ public final class MainActivity extends Activity {
             super(MainActivity.this);
             source.set(0, 0, renderSize, renderSize);
             setBackgroundColor(Color.rgb(34, 39, 51));
-            gpuView = createGpuView();
-            addView(gpuView, new FrameLayout.LayoutParams(-1, -1));
             cpuView = new CpuView();
             addView(cpuView, new FrameLayout.LayoutParams(-1, -1));
         }
@@ -363,65 +353,21 @@ public final class MainActivity extends Activity {
         void load(byte[] json, String name) {
             long next = NativeBridge.create(json);
             if (next == 0) throw new IllegalArgumentException("tlottie rejected the JSON");
-            if (handle != 0) {
-                NativeBridge.clearSurface(handle);
-                NativeBridge.destroy(handle);
-            }
+            if (handle != 0) NativeBridge.destroy(handle);
             handle = next;
             frames = Math.max(1, NativeBridge.frameCount(handle));
             frameRate = Math.max(1f, NativeBridge.frameRate(handle));
             fileName = name;
-            if (isGpuBackend() && surfaceReady && !attachGpuSurface()) {
-                setBackend(0);
-                backend.setText("tlottie CPU");
-            }
             resetClock();
             updateStatus(0);
         }
 
         boolean setBackend(int selected) {
             if (selected == backendMode) return true;
-            int previous = backendMode;
-            if (isGpuBackend() && handle != 0) NativeBridge.clearSurface(handle);
-            if (selected == 1 || selected == 6) {
-                backendMode = selected;
-                if ((previous == 1 || previous == 6) && previous != selected) {
-                    replaceGpuView();
-                }
-                gpuView.setVisibility(VISIBLE);
-                cpuView.setVisibility(INVISIBLE);
-                if (surfaceReady && handle != 0 && !attachGpuSurface()) {
-                    backendMode = 0;
-                    gpuView.setVisibility(INVISIBLE);
-                    cpuView.setVisibility(VISIBLE);
-                    return false;
-                }
-            } else {
-                backendMode = selected;
-                gpuView.setVisibility(INVISIBLE);
-                cpuView.setVisibility(VISIBLE);
-            }
+            backendMode = selected;
             resetClock();
             updateStatus(0);
             return true;
-        }
-
-        private SurfaceView createGpuView() {
-            SurfaceView view = new SurfaceView(MainActivity.this);
-            view.setZOrderOnTop(true);
-            view.getHolder().setFormat(PixelFormat.TRANSLUCENT);
-            view.getHolder().setFixedSize(renderSize, renderSize);
-            view.getHolder().addCallback(this);
-            view.setVisibility(INVISIBLE);
-            return view;
-        }
-
-        private void replaceGpuView() {
-            surfaceReady = false;
-            gpuView.getHolder().removeCallback(this);
-            removeView(gpuView);
-            gpuView = createGpuView();
-            addView(gpuView, 0, new FrameLayout.LayoutParams(-1, -1));
         }
 
         void setRenderSize(int size) {
@@ -431,11 +377,6 @@ public final class MainActivity extends Activity {
             pixels = new int[size * size];
             bitmap.recycle();
             bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
-            gpuView.getHolder().setFixedSize(size, size);
-            if (isGpuBackend() && surfaceReady && !attachGpuSurface()) {
-                setBackend(0);
-                backend.setText("tlottie CPU");
-            }
             resetClock();
         }
 
@@ -448,21 +389,6 @@ public final class MainActivity extends Activity {
             benchmarkIntervals.clear();
             benchmarkRenders.clear();
             start();
-        }
-
-        private boolean attachGpuSurface() {
-            Surface surface = gpuView.getHolder().getSurface();
-            if (!surface.isValid() || handle == 0) return false;
-            String error;
-            error = backendMode == 6
-                    ? NativeBridge.setThorvgSurface(handle, surface, renderSize, renderSize)
-                    : NativeBridge.setSurface(handle, surface, renderSize, renderSize);
-            if (error != null) {
-                Log.e("TLottieBackend", backendName() + " surface error: " + error);
-                status.setText(backendName() + " surface error: " + error);
-                return false;
-            }
-            return true;
         }
 
         private void resetClock() {
@@ -487,7 +413,6 @@ public final class MainActivity extends Activity {
         void release() {
             stop();
             if (handle != 0) {
-                NativeBridge.clearSurface(handle);
                 NativeBridge.destroy(handle);
                 handle = 0;
             }
@@ -496,21 +421,16 @@ public final class MainActivity extends Activity {
         @Override
         public void doFrame(long frameTimeNanos) {
             if (!running) return;
-            if (handle != 0 && (!isGpuBackend() || surfaceReady)) {
+            if (handle != 0) {
                 float frame = ((frameTimeNanos - animationStartNs)
                         / 1_000_000_000f * frameRate) % frames;
                 long before = System.nanoTime();
                 long elapsed = 0;
                 String error;
-                if (backendMode == 1) {
-                    error = NativeBridge.renderVulkan(
-                            handle, frame, antialias, curveTolerance);
-                } else if (backendMode == 6) {
-                    error = NativeBridge.renderThorvgGpu(handle, frame);
-                } else if (backendMode >= 2 && backendMode <= 4) {
+                if (backendMode >= 1 && backendMode <= 3) {
                     error = NativeBridge.renderRlottie(
-                            handle, backendMode - 2, frame, renderSize, renderSize, pixels);
-                } else if (backendMode == 5) {
+                            handle, backendMode - 1, frame, renderSize, renderSize, pixels);
+                } else if (backendMode == 4) {
                     error = NativeBridge.renderThorvgCpu(
                             handle, frame, renderSize, renderSize, pixels);
                 } else {
@@ -518,7 +438,7 @@ public final class MainActivity extends Activity {
                             handle, frame, renderSize, renderSize, pixels);
                 }
                 if (error == null) {
-                    if (!isGpuBackend()) drawCpuFrame();
+                    drawCpuFrame();
                     elapsed = System.nanoTime() - before;
                     totalRenderNs += elapsed;
                     renderedFrames++;
@@ -579,20 +499,6 @@ public final class MainActivity extends Activity {
             Log.i("TLottieBench", result);
             status.setText(result);
             stop();
-            int measuredBackend = backendMode;
-            boolean measuredAntialias = antialias;
-            float measuredCurveTolerance = curveTolerance;
-            if (measuredBackend == 1 || measuredBackend == 6) {
-                postDelayed(() -> {
-                    if (handle == 0) return;
-                    String gpu = measuredBackend == 1
-                            ? NativeBridge.benchmarkVulkan(
-                                    handle, 10, 30, measuredAntialias,
-                                    measuredCurveTolerance)
-                            : NativeBridge.benchmarkThorvgGpu(handle, 10, 30);
-                    Log.i("TLottieBench", "GPU " + gpu);
-                }, 750);
-            }
         }
 
         private long percentile(List<Long> values, int percent) {
@@ -610,33 +516,20 @@ public final class MainActivity extends Activity {
         private void updateStatus(long lastNs) {
             double avgMs = renderedFrames == 0 ? 0
                     : totalRenderNs / renderedFrames / 1_000_000.0;
-            if (backendMode == 1 && handle != 0) {
-                double gpuMs = NativeBridge.lastVulkanGpuNs(handle) / 1_000_000.0;
-                status.setText(String.format(Locale.US,
-                        "%s  •  %s  •  GPU work %.2f ms  •  CPU submit %.2f ms",
-                        fileName, backendName(), gpuMs, lastNs / 1_000_000.0));
-            } else {
-                status.setText(String.format(Locale.US,
-                        "%s  •  %s  •  frame work %.2f ms avg (%.2f ms last)",
-                        fileName, backendName(),
-                        avgMs, lastNs / 1_000_000.0));
-            }
+            status.setText(String.format(Locale.US,
+                    "%s  •  %s  •  frame work %.2f ms avg (%.2f ms last)",
+                    fileName, backendName(),
+                    avgMs, lastNs / 1_000_000.0));
         }
 
         private String backendName() {
             switch (backendMode) {
-                case 1: return "tlottie Vulkan";
-                case 2: return "rlottie";
-                case 3: return "rlottie 2019";
-                case 4: return "rlottie 2019 patched";
-                case 5: return "ThorVG CPU";
-                case 6: return "ThorVG GPU (OpenGL ES)";
+                case 1: return "rlottie";
+                case 2: return "rlottie 2019";
+                case 3: return "rlottie 2019 patched";
+                case 4: return "ThorVG CPU";
                 default: return "tlottie CPU";
             }
-        }
-
-        private boolean isGpuBackend() {
-            return backendMode == 1 || backendMode == 6;
         }
 
         @Override
@@ -645,7 +538,6 @@ public final class MainActivity extends Activity {
             int side = Math.min(getMeasuredWidth(), getMeasuredHeight());
             setMeasuredDimension(side, side);
             int square = MeasureSpec.makeMeasureSpec(side, MeasureSpec.EXACTLY);
-            gpuView.measure(square, square);
             cpuView.measure(square, square);
         }
 
@@ -656,27 +548,7 @@ public final class MainActivity extends Activity {
             int side = Math.min(width, height);
             int childLeft = (width - side) / 2;
             int childTop = (height - side) / 2;
-            gpuView.layout(childLeft, childTop, childLeft + side, childTop + side);
             cpuView.layout(childLeft, childTop, childLeft + side, childTop + side);
-        }
-
-        @Override
-        public void surfaceCreated(SurfaceHolder holder) {
-            holder.setFixedSize(renderSize, renderSize);
-            surfaceReady = true;
-            if (isGpuBackend() && handle != 0 && !attachGpuSurface()) {
-                setBackend(0);
-                backend.setText("tlottie CPU");
-            }
-        }
-
-        @Override
-        public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {}
-
-        @Override
-        public void surfaceDestroyed(SurfaceHolder holder) {
-            surfaceReady = false;
-            if (handle != 0) NativeBridge.clearSurface(handle);
         }
 
         private final class CpuView extends View {

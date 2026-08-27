@@ -1,10 +1,6 @@
-//! Renderer-neutral frame evaluation and optional rendering backends.
+//! Renderer-neutral frame evaluation and the CPU rendering backend.
 
 #[cfg(feature = "cpu")]
 pub(crate) mod cpu;
 pub(crate) mod frame;
-#[cfg(feature = "opengl")]
-pub mod opengl;
 pub mod options;
-#[cfg(feature = "vulkan")]
-pub mod vulkan;

@@ -8,9 +8,8 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-ash = { version = "0.37.3", default-features = false, features = ["loaded"] }
 jni = { version = "0.21", default-features = false }
 libloading = "0.8"
-tlottie = { path = "../../..", features = ["vulkan"] }
+tlottie = { path = "../../.." }
 
 [workspace]

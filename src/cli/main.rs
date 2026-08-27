@@ -9,10 +9,8 @@ use tlottie::{CPURenderer, Composition, FitzModifier, LayerColorReplacement, Lim
 #[path = "../pixel.rs"]
 mod pixel;
 mod png;
-mod vulkan_host;
 
 struct RenderArgs<'a> {
-  backend: &'a str,
   file: &'a str,
   frame: &'a str,
   size: &'a str,
@@ -54,7 +52,6 @@ fn parse_layer_color(value: &str) -> Result<LayerColorReplacement, String> {
 }
 
 fn parse_render_args(args: &[String]) -> Result<RenderArgs<'_>, String> {
-  let mut backend = "cpu";
   let mut options = RenderOptions::default();
   let mut parse_options = ParseOptions::default();
   let mut positional = Vec::with_capacity(4);
@@ -62,7 +59,6 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs<'_>, String> {
 
   while let Some(arg) = args.next() {
     match arg.as_str() {
-      "--backend" => backend = args.next().ok_or("--backend requires cpu or vulkan")?,
       "--antialias" | "--aa" | "-a" => options.antialias = true,
       "--no-antialias" | "--no-aa" => options.antialias = false,
       "--curve-tolerance" => {
@@ -97,7 +93,6 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs<'_>, String> {
     return Err("render requires a file, frame, size, and output path".into());
   };
   Ok(RenderArgs {
-    backend,
     file,
     frame,
     size,
@@ -113,7 +108,6 @@ fn main() -> ExitCode {
     Some((cmd, files)) if cmd == "info" && !files.is_empty() => info(files),
     Some((cmd, rest)) if cmd == "render" => render_cmd(rest),
     Some((cmd, rest)) if cmd == "bench" => bench_cmd(rest),
-    Some((cmd, rest)) if cmd == "vulkan-batch" => vulkan_batch_cmd(rest),
     _ => usage(),
   }
 }
@@ -122,39 +116,7 @@ fn usage() -> ExitCode {
   eprintln!("usage: tlottie-cli info <file.json>...");
   eprintln!("       tlottie-cli render [--fitz 12|3|4|5|6] [--layer-color PREFIX=AARRGGBB] [render options] <file.json> <frame> <size> <out.png>");
   eprintln!("       tlottie-cli bench [--fitz 12|3|4|5|6] [--layer-color PREFIX=AARRGGBB] [render options] <file.json> <size> <frames>");
-  eprintln!("       tlottie-cli vulkan-batch [--alpha-only] [--curve-tolerance <pixels>] <size>");
   ExitCode::from(2)
-}
-
-fn vulkan_batch_cmd(args: &[String]) -> ExitCode {
-  let mut options = RenderOptions::default();
-  let mut size = None;
-  let mut args = args.iter();
-  while let Some(arg) = args.next() {
-    match arg.as_str() {
-      "--curve-tolerance" => {
-        let Some(value) = args.next().and_then(|value| value.parse::<f32>().ok()).filter(|value| value.is_finite() && *value > 0.0) else {
-          eprintln!("vulkan-batch: --curve-tolerance requires a positive number");
-          return ExitCode::from(2);
-        };
-        options.curve_tolerance = value;
-      }
-      "--alpha-only" | "--single-color" => options.alpha_only = true,
-      option if option.starts_with("--") => {
-        eprintln!("vulkan-batch: unknown option: {option}");
-        return ExitCode::from(2);
-      }
-      value if size.is_none() => size = value.parse::<u32>().ok().filter(|size| *size > 0),
-      value => {
-        eprintln!("vulkan-batch: unexpected argument: {value}");
-        return ExitCode::from(2);
-      }
-    }
-  }
-  let Some(size) = size else {
-    return usage();
-  };
-  vulkan_host::batch(size, size, options)
 }
 
 fn bench_cmd(args: &[String]) -> ExitCode {
@@ -271,7 +233,7 @@ fn render_cmd(args: &[String]) -> ExitCode {
       return usage();
     }
   };
-  render(args.file, args.frame, args.size, args.out, args.backend, args.options, &args.parse_options)
+  render(args.file, args.frame, args.size, args.out, args.options, &args.parse_options)
 }
 
 fn info(files: &[String]) -> ExitCode {
@@ -313,7 +275,7 @@ fn info(files: &[String]) -> ExitCode {
   }
 }
 
-fn render(file: &str, frame: &str, size: &str, out: &str, backend: &str, options: RenderOptions, parse_options: &ParseOptions) -> ExitCode {
+fn render(file: &str, frame: &str, size: &str, out: &str, options: RenderOptions, parse_options: &ParseOptions) -> ExitCode {
   let (Ok(frame), Ok(size)) = (frame.parse::<f32>(), size.parse::<u32>()) else {
     eprintln!("bad frame/size");
     return ExitCode::from(2);
@@ -338,24 +300,10 @@ fn render(file: &str, frame: &str, size: &str, out: &str, backend: &str, options
   };
   let n = (size as usize).saturating_mul(size as usize);
   let mut pixels = vec![0u32; n];
-  match backend {
-    "cpu" => {
-      let mut renderer = CPURenderer::new(comp);
-      if let Err(e) = renderer.render(frame, &mut pixels, size, size, options) {
-        eprintln!("{file}: render error: {e}");
-        return ExitCode::FAILURE;
-      }
-    }
-    "vulkan" => {
-      let code = vulkan_host::render(&comp, frame, &mut pixels, size, size, options);
-      if code != ExitCode::SUCCESS {
-        return code;
-      }
-    }
-    _ => {
-      eprintln!("unknown backend: {backend}");
-      return ExitCode::from(2);
-    }
+  let mut renderer = CPURenderer::new(comp);
+  if let Err(e) = renderer.render(frame, &mut pixels, size, size, options) {
+    eprintln!("{file}: render error: {e}");
+    return ExitCode::FAILURE;
   }
 
   let covered = pixels.iter().filter(|px| (*px >> 24) & 0xff > 8).count();
@@ -377,10 +325,9 @@ mod tests {
 
   #[test]
   fn parses_render_options_and_positionals_in_any_order() {
-    let values = args(&["animation.json", "--no-antialias", "12", "--backend", "vulkan", "512", "out.png", "--curve-tolerance", "0.125"]);
+    let values = args(&["animation.json", "--no-antialias", "12", "512", "out.png", "--curve-tolerance", "0.125"]);
     let parsed = parse_render_args(&values).unwrap();
 
-    assert_eq!(parsed.backend, "vulkan");
     assert_eq!((parsed.file, parsed.frame, parsed.size, parsed.out), ("animation.json", "12", "512", "out.png"));
     assert!(!parsed.options.antialias);
     assert_eq!(parsed.options.curve_tolerance, 0.125);
@@ -391,7 +338,6 @@ mod tests {
     let values = args(&["animation.json", "0", "256", "out.png"]);
     let parsed = parse_render_args(&values).unwrap();
 
-    assert_eq!(parsed.backend, "cpu");
     assert!(parsed.options.antialias);
     assert_eq!(parsed.options.curve_tolerance, 0.125);
   }
