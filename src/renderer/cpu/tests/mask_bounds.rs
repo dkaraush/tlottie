@@ -40,7 +40,6 @@ fn mask(mode: u8, invert: bool, path: PathData, opacity: f32) -> Mask {
 
 fn layer_with_masks(masks: Vec<Mask>) -> Layer {
   Layer {
-    name: String::new(),
     color_override: None,
     kind: LayerKind::Shape,
     index: 0,

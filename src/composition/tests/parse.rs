@@ -262,6 +262,23 @@ fn layer_prefix_color_propagates_through_a_precomp_instance() {
 }
 
 #[test]
+fn empty_prefix_overrides_layers_with_and_without_nm() {
+  let json = r#"{"fr":30,"ip":0,"op":30,"w":16,"h":16,"layers":[
+    {"ty":4,"nm":"Anything","ind":1,"ip":0,"op":30,"ks":{},"shapes":[]},
+    {"ty":4,"ind":2,"ip":0,"op":30,"ks":{},"shapes":[]}
+  ]}"#;
+  let options = ParseOptions {
+    layer_color_replacements: vec![LayerColorReplacement {
+      layer_name_prefix: String::new(),
+      color: 0xff00_00ff,
+    }],
+    ..ParseOptions::default()
+  };
+  let comp = parse_composition(json.as_bytes(), &Limits::default(), &options).unwrap();
+  assert!(comp.layers.iter().all(|layer| layer.color_override.is_some()));
+}
+
+#[test]
 fn parses_round_corners_modifier() {
   let comp = parse(
     r#"{"fr":30,"ip":0,"op":30,"w":100,"h":100,"layers":[
