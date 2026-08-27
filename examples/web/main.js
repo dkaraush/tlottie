@@ -19,6 +19,7 @@ const globalStats = document.getElementById('stats');
 const capFps = document.getElementById('capfps');
 const antialias = document.getElementById('antialias');
 const alphaOnly = document.getElementById('alphaonly');
+const noSimd = document.getElementById('nosimd');
 const fitz = document.getElementById('fitz');
 const curveTolerance = document.getElementById('curvetolerance');
 const curveToleranceVal = document.getElementById('curvetoleranceval');
@@ -32,7 +33,8 @@ const [{ instance }, rl, tv] = await Promise.all([
   initRlottie(),
   initThorvg(),
 ]);
-const tl = instance.exports;
+let tl = instance.exports;
+let tlNosimd = null;  // lazily fetched tlottie.nosimd.wasm
 
 function engineDom(key) {
   return {
@@ -99,6 +101,7 @@ const WINDOW = 360;  // rolling-average window, in draws
 
 let raf = 0;
 let currentBytes = null;
+let currentName = '';
 
 function fitzModifierValue() {
   return Number(fitz.value);
@@ -130,6 +133,24 @@ function recreateTlottie() {
 }
 
 fitz.addEventListener('change', recreateTlottie);
+noSimd.addEventListener('change', async () => {
+  err.textContent = '';
+  try {
+    if (noSimd.checked && !tlNosimd) {
+      const { instance } = await WebAssembly
+        .instantiateStreaming(fetch('tlottie.nosimd.wasm'), {});
+      tlNosimd = instance;
+    }
+  } catch (e) {
+    noSimd.checked = false;
+    err.textContent = `no-simd build unavailable (${e.message}); run build.sh`;
+    return;
+  }
+  const engine = engines.find((candidate) => candidate.key === 'tl');
+  if (engine.inst) { engine.drop(engine.inst); engine.inst = null; }
+  tl = (noSimd.checked ? tlNosimd : instance).exports;
+  if (currentBytes) loadLottie(currentBytes, currentName);
+});
 
 // Renderer tabs: 'both' shows every available engine; an engine key shows
 // just that panel. Hidden engines are skipped in the render loop, so
@@ -188,6 +209,7 @@ function loadLottie(bytes, name) {
   err.textContent = '';
   globalStats.textContent = '';
   currentBytes = bytes.slice();
+  currentName = name;
 
   let loaded = null;  // engine-independent comp info from whichever parsed
   for (const e of engines) {

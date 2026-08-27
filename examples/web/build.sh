@@ -26,24 +26,32 @@ else
   fi
 fi
 
-export CARGO_TARGET_DIR="$repo_root/target"
-export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=+simd128"
+base_rustflags=${RUSTFLAGS:-}
 
-if [ -n "$rustup_toolchain" ]; then
-  rustup run "$rustup_toolchain" cargo build \
-    --manifest-path "$repo_root/Cargo.toml" \
-    --target "$target" \
-    --profile "$profile" \
-    --no-default-features \
-    --features wasm,std
-else
-  cargo build \
-    --manifest-path "$repo_root/Cargo.toml" \
-    --target "$target" \
-    --profile "$profile" \
-    --no-default-features \
-    --features wasm,std
-fi
+build_variant() {
+  variant=$1
+  simd_flag=$2
+  export CARGO_TARGET_DIR="$repo_root/target/web-$variant"
+  export RUSTFLAGS="$base_rustflags -C target-feature=$simd_flag"
+  if [ -n "$rustup_toolchain" ]; then
+    rustup run "$rustup_toolchain" cargo build \
+      --manifest-path "$repo_root/Cargo.toml" \
+      --target "$target" \
+      --profile "$profile" \
+      --no-default-features \
+      --features wasm,std
+  else
+    cargo build \
+      --manifest-path "$repo_root/Cargo.toml" \
+      --target "$target" \
+      --profile "$profile" \
+      --no-default-features \
+      --features wasm,std
+  fi
+  out=$3
+  cp "$CARGO_TARGET_DIR/$target/$profile/tlottie.wasm" "$script_dir/$out"
+  echo "Built $script_dir/$out"
+}
 
-cp "$CARGO_TARGET_DIR/$target/$profile/tlottie.wasm" "$script_dir/tlottie.wasm"
-echo "Built $script_dir/tlottie.wasm"
+build_variant simd +simd128 tlottie.wasm
+build_variant nosimd -simd128 tlottie.nosimd.wasm
