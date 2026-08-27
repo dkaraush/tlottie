@@ -62,14 +62,14 @@ fn use_avx512() -> bool {
 /// `ca = (cov*sa+127)/255`, source channels scaled by `ca`, then
 /// premultiplied source-over into `dst`. `sr/sg/sb/sa` are 0..=255.
 /// Mirrors (and on NEON must match bit-for-bit) the scalar loop.
-pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb: u32, sa: u32, large_canvas: bool) {
+pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb: u32, sa: u32, _large_canvas: bool) {
   // Opaque source: full-coverage pixels are EXACTLY the source color
   // (ca=255 -> s_x=x, inv=0 -> o=s), so interior runs become plain stores
   // — large fills are memory-bound and interiors dominate at 320/720px.
   if sa == 255 {
     let color = crate::pixel::pack_premultiplied_rgba(sr, sg, sb, 255);
     #[cfg(target_arch = "aarch64")]
-    if large_canvas && dst.len() >= SIMD_MIN_SPAN {
+    if dst.len() >= SIMD_MIN_SPAN {
       let n = dst.len().min(cov.len());
       let full = n - n % 8;
       let (dst_v, dst_tail) = dst.split_at_mut(full);
@@ -85,7 +85,7 @@ pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb:
       return;
     }
     #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
-    if large_canvas && dst.len() >= SIMD_MIN_SPAN && use_avx2() {
+    if _large_canvas && dst.len() >= SIMD_MIN_SPAN && use_avx2() {
       if use_avx512() {
         let n = dst.len().min(cov.len());
         let full = n - n % 16;
