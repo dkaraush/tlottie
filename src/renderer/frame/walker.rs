@@ -295,7 +295,7 @@ fn static_jobs_bytes(context: &StaticContext, jobs: &Vec<CachedJob>) -> usize {
         .saturating_add(contour.anchors.capacity().saturating_mul(core::mem::size_of::<bool>()));
     }
     if let CachedPaint::Gradient(paint) = &job.paint {
-      let ptr = alloc::sync::Arc::as_ptr(&paint.lut);
+      let ptr = paint.lut.as_ptr();
       if !gradient_luts.contains(&ptr) {
         gradient_luts.push(ptr);
         bytes = bytes.saturating_add(core::mem::size_of::<[u32; GRADIENT_LUT_SIZE]>());

@@ -5,12 +5,19 @@ use alloc::vec::Vec;
 
 /// Builds a premultiplied RGBA8 lookup table from independently interpolated
 /// Lottie color and opacity stops.
-pub(crate) fn build_gradient_lut(stops: &FloatList, color_count: usize, opacity: f32) -> [u32; GRADIENT_LUT_SIZE] {
+pub(crate) fn build_gradient_lut(stops: &FloatList, color_count: usize, opacity: f32) -> GradientLut {
   let data = &stops.0;
   let n = color_count.min(data.len() / 4);
   let mut lut = [0u32; GRADIENT_LUT_SIZE];
   let opac = data.get(n * 4..).unwrap_or(&[]);
   let opacity_stop_count = if opac.len() >= 4 && opac.len() % 2 == 0 { opac.len() / 2 } else { 0 };
+  let uniform_stop_alpha = if opacity_stop_count == 0 {
+    Some(1.0)
+  } else {
+    let alpha = opac.get(1).copied().unwrap_or(1.0);
+    opac.chunks_exact(2).all(|stop| stop.get(1).copied().unwrap_or(1.0) == alpha).then_some(alpha)
+  };
+  let uniform_alpha = uniform_stop_alpha.map(|alpha| ((alpha * opacity).clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
 
   for (i, slot) in lut.iter_mut().enumerate() {
     let t = i as f32 / (GRADIENT_LUT_SIZE - 1) as f32;
@@ -78,7 +85,7 @@ pub(crate) fn build_gradient_lut(stops: &FloatList, color_count: usize, opacity:
     let pb = (b.clamp(0.0, 1.0) * a * 255.0 + 0.5) as u32;
     *slot = crate::pixel::pack_premultiplied_rgba(pr, pg, pb, pa);
   }
-  lut
+  GradientLut::new(lut, uniform_alpha)
 }
 
 /// Gradient parametrization. The shape geometry (`sx/sy/…`) lives in LOCAL
@@ -212,6 +219,23 @@ impl Canvas<'_> {
     lut: &[u32; GRADIENT_LUT_SIZE],
     map: &GradientMap,
   ) {
+    let lut_opaque = lut.iter().all(|&pixel| pixel >> 24 == 255);
+    self.fill_gradient_translated_with_metadata::<TRACK_ROWS>(cache, key, src_key, contours, translation, rule, lut, map, lut_opaque);
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn fill_gradient_translated_with_metadata<const TRACK_ROWS: bool>(
+    &mut self,
+    cache: &mut CovCache,
+    key: u128,
+    src_key: u128,
+    contours: &[Contour],
+    translation: crate::renderer::frame::Point,
+    rule: FillRule,
+    lut: &[u32; GRADIENT_LUT_SIZE],
+    map: &GradientMap,
+    lut_opaque: bool,
+  ) {
     let w = self.w;
     let antialias = self.antialias;
     let dst_clear = self.dirty.is_empty();
@@ -243,7 +267,6 @@ impl Canvas<'_> {
       }
       return;
     }
-    let lut_opaque = lut.iter().all(|&pixel| pixel >> 24 == 255);
     let mut src_entry = CovEntry {
       rows: Vec::new(),
       data: PlaneData::Src(Vec::new()),

@@ -46,10 +46,7 @@ impl<'a> Alpha8Renderer<'a> {
     let key = geometry.cache_key;
     let translation = geometry.raw_translation();
     let uniform_gradient_alpha = match paint {
-      Paint::Gradient(gradient) => {
-        let alpha = (gradient.lut.first().copied().unwrap_or(0) >> 24) as u8;
-        gradient.lut.iter().all(|pixel| (*pixel >> 24) as u8 == alpha).then_some(alpha)
-      }
+      Paint::Gradient(gradient) => gradient.lut.uniform_alpha(),
       Paint::Solid(_) => None,
     };
 

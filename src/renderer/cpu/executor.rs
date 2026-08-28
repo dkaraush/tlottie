@@ -22,7 +22,7 @@ use crate::model::shapes_have_multiple_paints;
 use crate::model::LayerKind;
 use crate::model::{Composition, DashElement, FillRule, FloatList, GradientKind, Layer, Shape, Transform, TrimMode};
 use crate::raster::Rasterizer;
-use crate::renderer::frame::renderer::GRADIENT_LUT_SIZE;
+use crate::renderer::frame::renderer::{GradientLut, GRADIENT_LUT_SIZE};
 use crate::stroke::{stroke_polyline, StrokeSegment};
 use alloc::vec::Vec;
 
@@ -53,7 +53,7 @@ pub(crate) struct RenderScratch {
   /// from the stop list is pure, and stop values repeat across frames
   /// (static gradients: every frame; animated: on hold segments and loop
   /// repeats). Keyed by the exact input bits — no collision risk.
-  lut_cache: crate::compat::HashMap<Vec<u32>, alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>>,
+  lut_cache: crate::compat::HashMap<Vec<u32>, GradientLut>,
   lut_key: Vec<u32>,
   /// Recycled contour point buffers: stroke pieces + fill snapshots draw
   /// from here and return after their paint executes (measured: 2,683
@@ -113,7 +113,7 @@ enum ReplayJob {
     key: u128,
     src_key: u128,
     rule: FillRule,
-    lut: alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
+    lut: GradientLut,
     map: GradientMap,
   },
 }
@@ -258,7 +258,7 @@ impl RenderScratch {
 
   /// Returns the LUT plus a 64-bit id of its exact inputs (used in the
   /// gradient source-plane cache key).
-  fn lut_for(&mut self, stops: &crate::model::FloatList, color_count: usize, opacity: f32) -> (alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>, u64) {
+  fn lut_for(&mut self, stops: &crate::model::FloatList, color_count: usize, opacity: f32) -> (GradientLut, u64) {
     self.lut_key.clear();
     self.lut_key.reserve(stops.0.len() + 2);
     self.lut_key.push(color_count as u32);
@@ -274,7 +274,7 @@ impl RenderScratch {
     if let Some(lut) = self.lut_cache.get(self.lut_key.as_slice()) {
       return (lut.clone(), id);
     }
-    let lut: alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]> = alloc::sync::Arc::new(build_gradient_lut(stops, color_count, opacity));
+    let lut = build_gradient_lut(stops, color_count, opacity);
     if self.lut_cache.len() >= LUT_CACHE_CAP {
       self.lut_cache.clear();
     }

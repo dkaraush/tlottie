@@ -30,13 +30,13 @@ enum PendingPaint {
   },
   Gradient {
     rule: FillRule,
-    lut: alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
+    lut: GradientLut,
     lut_id: u64,
     map: GradientMap,
   },
   Stroke {
     color: Option<Color>,
-    lut: Option<(alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>, u64, GradientMap)>,
+    lut: Option<(GradientLut, u64, GradientMap)>,
     opacity: f32,
     hw: f32,
     cap: crate::stroke::Cap,
@@ -70,7 +70,7 @@ pub(crate) enum DrawJob {
     contours: Vec<Contour>,
     borrowed: Option<usize>,
     rule: FillRule,
-    lut: alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
+    lut: GradientLut,
     map: GradientMap,
   },
 }
