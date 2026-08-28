@@ -243,7 +243,7 @@ impl Canvas<'_> {
       }
       return;
     }
-    let radial_opaque = matches!(&map.kind, GradientMapKind::Radial { .. }) && lut.iter().all(|&pixel| pixel >> 24 == 255);
+    let lut_opaque = lut.iter().all(|&pixel| pixel >> 24 == 255);
     let mut src_entry = CovEntry {
       rows: Vec::new(),
       data: PlaneData::Src(Vec::new()),
@@ -299,7 +299,7 @@ impl Canvas<'_> {
           } else if dst_clear {
             gradient_span_uniform_clear(dst_row, cov, y, x0, lut, map);
           } else {
-            gradient_span_uniform(dst_row, cov, y, x0, lut, map, radial_opaque);
+            gradient_span_uniform(dst_row, cov, y, x0, lut, map, lut_opaque);
           }
         }
         if !capture {
@@ -391,7 +391,7 @@ impl Canvas<'_> {
         if dst_clear {
           gradient_span_uniform_clear(dst_row, cov, y, x0, lut, map);
         } else {
-          gradient_span_uniform(dst_row, cov, y, x0, lut, map, radial_opaque);
+          gradient_span_uniform(dst_row, cov, y, x0, lut, map, lut_opaque);
         }
       });
       if overflow || !capture {
@@ -884,7 +884,7 @@ fn gradient_row(dst_row: &mut [u32], cov_row: &[u8], y: usize, x0: usize, lut: &
 /// same math as `gradient_row` over a synthetic constant coverage row, but
 /// full-coverage spans can jump straight to the fused LUT-over kernels and
 /// partial spans avoid allocating/filling a temporary coverage slice.
-fn gradient_span_uniform(dst_row: &mut [u32], cov: u8, y: usize, x0: usize, lut: &[u32; GRADIENT_LUT_SIZE], map: &GradientMap, radial_opaque: bool) {
+fn gradient_span_uniform(dst_row: &mut [u32], cov: u8, y: usize, x0: usize, lut: &[u32; GRADIENT_LUT_SIZE], map: &GradientMap, lut_opaque: bool) {
   if cov == 0 || dst_row.is_empty() {
     return;
   }
@@ -897,7 +897,13 @@ fn gradient_span_uniform(dst_row: &mut [u32], cov: u8, y: usize, x0: usize, lut:
       let row_base = ((lx0 - sx) * dx + (ly0 - sy) * dy) * inv_len_sq;
       let dt = (inv.a * dx + inv.b * dy) * inv_len_sq;
       if cov == 255 {
-        crate::simd::linear_lut_over(dst_row, lut, row_base, dt, x0 as f32);
+        let last_x = x0 as f32 + dst_row.len().saturating_sub(1) as f32;
+        let span_finite = (row_base + x0 as f32 * dt).is_finite() && (row_base + last_x * dt).is_finite();
+        if lut_opaque && span_finite {
+          crate::simd::linear_lut_fill(dst_row, lut, row_base, dt, x0 as f32);
+        } else {
+          crate::simd::linear_lut_over(dst_row, lut, row_base, dt, x0 as f32);
+        }
         return;
       }
       for (i, dst) in dst_row.iter_mut().enumerate() {
@@ -908,7 +914,7 @@ fn gradient_span_uniform(dst_row: &mut [u32], cov: u8, y: usize, x0: usize, lut:
     GradientMapKind::Radial { sx, sy, inv_r } => {
       let (dd0x, dd0y) = (lx0 - sx, ly0 - sy);
       if cov == 255 {
-        if radial_opaque {
+        if lut_opaque {
           crate::simd::radial_lut_fill(dst_row, lut, dd0x, dd0y, inv.a, inv.b, *inv_r, x0 as f32);
         } else {
           crate::simd::radial_lut_over(dst_row, lut, dd0x, dd0y, inv.a, inv.b, *inv_r, x0 as f32);
