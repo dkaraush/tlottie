@@ -19,6 +19,20 @@ fn static_eval() {
 }
 
 #[test]
+fn static_value_borrows_only_static_properties() {
+  let p = Property::Static(5.0f32);
+  assert_eq!(p.static_value(), Some(&5.0));
+  let animated = animated(vec![Keyframe {
+    t: 0.0,
+    value: 5.0,
+    end: None,
+    easing: Easing::LINEAR,
+    spatial: None,
+  }]);
+  assert_eq!(animated.static_value(), None);
+}
+
+#[test]
 fn linear_two_keyframes() {
   let p = animated(vec![
     Keyframe {

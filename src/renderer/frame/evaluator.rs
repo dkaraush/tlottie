@@ -346,10 +346,17 @@ impl ShapeWalker<'_> {
           self.walk(&g.shapes, child_m, opacity * gop, depth + 1, arena, pending)?;
         }
         Shape::Path(p) => {
-          let data = p.path.eval(self.frame);
-          let closed = data.closed;
-          let contour = self.scratch.take_contour();
-          arena.push((flatten_path_reusing(&data, &m, self.curve_tolerance, contour), closed));
+          if let Some(data) = p.path.static_value() {
+            let closed = data.closed;
+            let contour = self.scratch.take_contour();
+            let contour = flatten_path_reusing(data, &m, self.curve_tolerance, contour);
+            arena.push((contour, closed));
+          } else {
+            let data = p.path.eval(self.frame);
+            let closed = data.closed;
+            let contour = self.scratch.take_contour();
+            arena.push((flatten_path_reusing(&data, &m, self.curve_tolerance, contour), closed));
+          }
         }
         Shape::Rect(r) => {
           let pos = r.position.eval(self.frame);
