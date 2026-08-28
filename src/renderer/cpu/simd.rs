@@ -345,6 +345,25 @@ fn fill_span_uniform_scalar(dst: &mut [u32], ca: u32, s_r: u32, s_g: u32, s_b: u
   }
 }
 
+#[inline]
+fn linear_uniform_lut_color(lut: &[u32], row_base: f32, dt: f32, x_start: f32, len: usize, scale: f32) -> Option<u32> {
+  if len < SIMD_MIN_SPAN || lut.is_empty() {
+    return None;
+  }
+  let last_x = x_start + len.saturating_sub(1) as f32;
+  let first_t = row_base + x_start * dt;
+  let last_t = row_base + last_x * dt;
+  if !first_t.is_finite() || !last_t.is_finite() {
+    return None;
+  }
+  let first_idx = (first_t.clamp(0.0, 1.0) * scale + 0.5) as usize;
+  let last_idx = (last_t.clamp(0.0, 1.0) * scale + 0.5) as usize;
+  if first_idx != last_idx {
+    return None;
+  }
+  lut.get(first_idx).copied()
+}
+
 /// Fills `out` with LUT colors for a FULL-COVERAGE linear gradient run,
 /// sampled like `lut_sample`. Positions are SEGMENTATION-INVARIANT: each
 /// pixel evaluates `t(X) = row_base + X·dt` as one rounded expression from
@@ -354,6 +373,10 @@ fn fill_span_uniform_scalar(dst: &mut [u32], ca: u32, s_r: u32, s_g: u32, s_b: u
 /// protocol as the radial/focal kernels.
 pub(crate) fn linear_lut_fill(out: &mut [u32], lut: &[u32], row_base: f32, dt: f32, x_start: f32) {
   let scale = (lut.len().saturating_sub(1)) as f32;
+  if let Some(color) = linear_uniform_lut_color(lut, row_base, dt, x_start, out.len(), scale) {
+    out.fill(color);
+    return;
+  }
   #[cfg(target_arch = "aarch64")]
   {
     if out.len() >= SIMD_MIN_SPAN {
@@ -734,6 +757,40 @@ fn over_px_k255(d: &mut u32, s: u32) {
   *d = (a.min(255) << 24) | (r.min(255) << 16) | (g.min(255) << 8) | b.min(255);
 }
 
+/// Source-over a single premultiplied color over a whole span. Linear
+/// gradients use this when both span endpoints quantize to the same LUT
+/// entry, including fully clamped regions before/after the gradient ramp.
+fn over_uniform_premultiplied(dst: &mut [u32], src: u32) {
+  if src == 0 {
+    return;
+  }
+  let sa = (src >> 24) & 0xff;
+  if sa == 255 {
+    dst.fill(src);
+    return;
+  }
+  #[cfg(target_arch = "aarch64")]
+  {
+    if dst.len() >= SIMD_MIN_SPAN {
+      let full = dst.len() - dst.len() % 8;
+      let (head, tail) = dst.split_at_mut(full);
+      // SAFETY: NEON is mandatory on aarch64; `head` is a multiple of eight
+      // pixels and the packed channels are already premultiplied by `sa`.
+      #[allow(unsafe_code)]
+      unsafe {
+        neon::fill_span_uniform_neon(head, sa, src & 0xff, (src >> 8) & 0xff, (src >> 16) & 0xff)
+      };
+      for pixel in tail {
+        over_px_k255(pixel, src);
+      }
+      return;
+    }
+  }
+  for pixel in dst {
+    over_px_k255(pixel, src);
+  }
+}
+
 /// FUSED linear gradient generate+blend: for each pixel computes the LUT
 /// color exactly like [`linear_lut_fill`] and immediately source-overs it
 /// into `dst` (k=255), in a single pass with no materialized src plane.
@@ -742,6 +799,10 @@ fn over_px_k255(d: &mut u32, s: u32) {
 /// deterministic on the same inputs, so fusing them preserves every byte.
 pub(crate) fn linear_lut_over(dst: &mut [u32], lut: &[u32], row_base: f32, dt: f32, x_start: f32) {
   let scale = (lut.len().saturating_sub(1)) as f32;
+  if let Some(color) = linear_uniform_lut_color(lut, row_base, dt, x_start, dst.len(), scale) {
+    over_uniform_premultiplied(dst, color);
+    return;
+  }
   #[cfg(target_arch = "aarch64")]
   {
     if dst.len() >= SIMD_MIN_SPAN {
