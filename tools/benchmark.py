@@ -646,7 +646,7 @@ class Tlottie:
         pixels = self._pixel_buffer(size * size)
         try:
             count = max(1, int(self.lib.tlottie_frame_count(anim)))
-            frames = count if frames <= 0 else frames
+            frames = count if frames <= 0 else min(count, frames)
             rss_samples: list[float] = []
             rc = self._render(
                 anim, 0.0, size, size, pixels, size * size, 1
@@ -736,7 +736,7 @@ class Tlottie:
         pixels = self._pixel_buffer(size * size)
         try:
             count = max(1, int(self.lib.tlottie_frame_count(anim)))
-            frames = count if frames <= 0 else frames
+            frames = count if frames <= 0 else min(count, frames)
             rss_samples: list[float] = []
             out_frames: list[list[int]] = []
             rc = self._render(
@@ -831,7 +831,7 @@ class Rlottie:
         pixels = (C.c_uint32 * (size * size))()
         try:
             count = max(1, int(self.lib.lottie_animation_get_totalframe(anim)))
-            frames = count if frames <= 0 else frames
+            frames = count if frames <= 0 else min(count, frames)
             rss_samples: list[float] = []
             self.lib.lottie_animation_render(anim, 0, pixels, size, size, size * 4)
             first_ms = (time.perf_counter_ns() - t0) / 1_000_000.0
@@ -900,7 +900,7 @@ class Rlottie:
         pixels = (C.c_uint32 * (size * size))()
         try:
             count = max(1, int(self.lib.lottie_animation_get_totalframe(anim)))
-            frames = count if frames <= 0 else frames
+            frames = count if frames <= 0 else min(count, frames)
             rss_samples: list[float] = []
             out_frames: list[list[int]] = []
             self.lib.lottie_animation_render(anim, 0, pixels, size, size, size * 4)
@@ -1030,7 +1030,7 @@ class Thorvg:
             total = C.c_float(0.0)
             self.lib.tvg_animation_get_total_frame(anim, C.byref(total))
             count = max(1, int(total.value))
-            frames = count if frames <= 0 else frames
+            frames = count if frames <= 0 else min(count, frames)
             pixels = (C.c_uint32 * (size * size))()
             canvas = self.lib.tvg_swcanvas_create(self.ENGINE_NONE)
             if not canvas:
@@ -1191,7 +1191,7 @@ class Thorvg:
             total = C.c_float(0.0)
             self.lib.tvg_animation_get_total_frame(anim, C.byref(total))
             count = max(1, int(total.value))
-            frames = count if frames <= 0 else frames
+            frames = count if frames <= 0 else min(count, frames)
             pixels = (C.c_uint32 * (size * size))()
             canvas = self.lib.tvg_swcanvas_create(self.ENGINE_NONE)
             if not canvas:
@@ -2619,6 +2619,28 @@ def tl_vs_rl19_cell(row: dict[str, Any], renderer: str) -> str:
     )
 
 
+def total_tl_vs_rl19_by_size(
+    file_rows: list[dict[str, Any]], renderer: str
+) -> dict[int, tuple[float, int]]:
+    totals: dict[int, list[float]] = {}
+    rows = pivot_aggregate(file_rows, ("pack", "file", "size"))
+    for row in rows:
+        tlottie_ms = row.get("tlottie_frame_ms")
+        rlottie_2019_ms = row.get(f"{renderer}_frame_ms")
+        if tlottie_ms is None or rlottie_2019_ms is None or rlottie_2019_ms <= 0:
+            continue
+        size = row["size"]
+        total = totals.setdefault(size, [0.0, 0.0, 0.0])
+        total[0] += tlottie_ms
+        total[1] += rlottie_2019_ms
+        total[2] += 1
+    return {
+        size: ((tlottie_ms / rlottie_2019_ms - 1.0) * 100.0, int(pairs))
+        for size, (tlottie_ms, rlottie_2019_ms, pairs) in totals.items()
+        if rlottie_2019_ms > 0
+    }
+
+
 def format_cell(v: Any) -> str:
     if v is None:
         return "n/a"
@@ -2681,6 +2703,11 @@ h1{font-size:20px;margin:0 0 4px}
 h2{font-size:15px;margin:28px 0 8px}
 a{color:var(--tl)}
 .note{color:var(--muted);font-size:13px;margin:2px 0;}
+.totals{display:flex;align-items:baseline;gap:8px 18px;flex-wrap:wrap;margin:18px 0 4px;
+padding:10px 12px;background:var(--surface);border:1px solid var(--line);border-radius:6px}
+.totals span{font-family:ui-monospace,Menlo,monospace;
+font-variant-numeric:tabular-nums}.totals .faster{color:var(--good);font-weight:700}
+.totals .slower{color:var(--bad);font-weight:700}.totals .equal{color:var(--muted);font-weight:700}
 .tablewrap{overflow-x:auto;max-width:100%;width:fit-content;background:var(--surface);
 border:1px solid var(--line);border-radius:6px;margin:0 0 8px}
 table{border-collapse:collapse;width:auto;font-size:12px}
@@ -2793,6 +2820,18 @@ document.querySelectorAll('table').forEach((table) => {
         f.write("<main>")
         f.write(f"<p class='note'><code>{esc(benchmark_command)}</code></p>")
         f.write(f"<p class='note'>{esc(machine_details)}</p>")
+        comparison_renderer = tl_vs_rl19_renderer(renderers)
+        if comparison_renderer is not None:
+            totals = total_tl_vs_rl19_by_size(file_rows, comparison_renderer)
+            if totals:
+                f.write("<div class='totals'>")
+                for size, (percent, pairs) in sorted(totals.items()):
+                    direction = "faster" if percent < 0 else "slower" if percent > 0 else "equal"
+                    f.write(
+                        f"<span title='{pairs} paired animations'>{size}px "
+                        f"<b class='{direction}'>{percent:+.1f}%</b></span>"
+                    )
+                f.write("</div>")
         for size in sorted({r["size"] for r in pack_rows}):
             f.write(f"<h2>{size}px</h2>")
             rows = pivot_aggregate([r for r in pack_rows if r["size"] == size], ("pack", "size"))
@@ -2902,7 +2941,10 @@ def write_grouped_table(
                 )
             if include_energy:
                 cells.append(f"<td>{num(row.get(f'{r}_energy_j'))}</td>")
-            cells[-1] = cells[-1].replace("<td", "<td class='metric-last'", 1)
+            if " class='" in cells[-1]:
+                cells[-1] = cells[-1].replace(" class='", " class='metric-last ", 1)
+            else:
+                cells[-1] = cells[-1].replace("<td", "<td class='metric-last'", 1)
             f.write("\n".join(cells))
         f.write("</tr>")
     f.write("</table></div>")
