@@ -319,6 +319,39 @@ fn linear_lut_over_matches_two_pass() {
 }
 
 #[test]
+fn opaque_linear_lut_fill_matches_source_over() {
+  let mut rng = Rng(0x0fac_e123_55aa_9911);
+  let lut: Vec<u32> = (0..1024).map(|_| rng.next() as u32 | 0xff00_0000).collect();
+  for len in [1usize, 4, 15, 16, 17, 32, 64, 257, 720] {
+    for &(row_base, dt, x_start) in &[(0.0f32, 0.001, 0.0), (-0.5, 0.003, 37.0), (1.5, -0.002, 719.0)] {
+      let mut filled = vec![0u32; len];
+      let mut blended: Vec<u32> = (0..len).map(|_| premult(rng.next() as u32)).collect();
+      linear_lut_fill(&mut filled, &lut, row_base, dt, x_start);
+      linear_lut_over(&mut blended, &lut, row_base, dt, x_start);
+      assert_eq!(filled, blended, "len={len} row_base={row_base} dt={dt} x_start={x_start}");
+    }
+  }
+}
+
+#[test]
+fn linear_lut_over_uniform_and_clamped_spans_match_two_pass() {
+  let lut: Vec<u32> = (0..1024u32).map(|i| premult(i.wrapping_mul(0x72ab_91d3))).collect();
+  let base: Vec<u32> = (0..720u32).map(|i| premult(i.wrapping_mul(0x19e3_77a1))).collect();
+  for &(row_base, dt, x_start) in &[(0.25f32, 0.0, 0.0), (-3.0, 0.0001, 0.0), (4.0, -0.0001, 0.0), (0.3, 0.0000001, 137.0)] {
+    let mut filled = vec![0u32; base.len()];
+    let mut expected_fill = vec![0u32; base.len()];
+    linear_lut_fill(&mut filled, &lut, row_base, dt, x_start);
+    linear_lut_fill_scalar(&mut expected_fill, &lut, row_base, dt, x_start, (lut.len() - 1) as f32);
+    assert_eq!(filled, expected_fill, "fill row_base={row_base} dt={dt} x_start={x_start}");
+    let mut actual = base.clone();
+    let mut expected = base.clone();
+    linear_lut_over(&mut actual, &lut, row_base, dt, x_start);
+    linear_over_ref(&mut expected, &lut, row_base, dt, x_start);
+    assert_eq!(actual, expected, "row_base={row_base} dt={dt} x_start={x_start}");
+  }
+}
+
+#[test]
 fn radial_lut_over_matches_two_pass() {
   let mut rng = Rng(0x5555_6666_7777_8888);
   let lut: Vec<u32> = (0..1024u32).map(|i| premult(i.wrapping_mul(0x0193_7caf))).collect();

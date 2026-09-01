@@ -1333,7 +1333,7 @@ fn parse_gradient_stops(c: &mut Cursor<'_>, limits: &Limits) -> Result<(Property
 // Layers
 // ---------------------------------------------------------------------------
 
-fn parse_layer(c: &mut Cursor<'_>, limits: &Limits, total_masks: &mut usize, total_painted_shape_layers: &mut usize, total_solid_layers: &mut usize) -> Result<Layer> {
+fn parse_layer(c: &mut Cursor<'_>, limits: &Limits, replacements: &[LayerColorReplacement], total_masks: &mut usize, total_painted_shape_layers: &mut usize, total_solid_layers: &mut usize) -> Result<Layer> {
   let mut ty = 255u8;
   let mut index = 0i32;
   let mut parent: Option<i32> = None;
@@ -1358,14 +1358,16 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits, total_masks: &mut usize, tot
   let mut solid_color: Option<Color> = None;
   let mut time_remap_pos: Option<usize> = None;
   let mut auto_orient = false;
-  let mut name = String::new();
+  // A layer with no `nm` behaves like the empty name, so an (empty) prefix
+  // matching "" already decides the override before the object is walked.
+  let mut color_override = match_layer_color(b"", replacements);
 
   parse_object_once!(c, |c, key| {
       b"ty" => {
         ty = parse_f32(c)? as u8;
       }
       b"nm" => {
-        name = String::from_utf8_lossy(c.read_string_bytes()?).into_owned();
+        color_override = match_layer_color(c.read_string_bytes()?, replacements);
       }
       b"ind" => {
         index = parse_f32(c)? as i32;
@@ -1510,8 +1512,7 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits, total_masks: &mut usize, tot
     _ => None,
   };
   let layer = Layer {
-    name,
-    color_override: None,
+    color_override,
     kind,
     index,
     parent,
@@ -1534,6 +1535,14 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits, total_masks: &mut usize, tot
   Ok(layer)
 }
 
+/// Matches a raw (unescaped) `nm` byte string against the configured prefixes.
+/// Byte-wise `starts_with` is equivalent to the previous `String::from_utf8_lossy`
+/// comparison for every prefix that is itself valid UTF-8 and contains no
+/// U+FFFD, and avoids allocating a `String` per layer.
+fn match_layer_color(raw: &[u8], replacements: &[LayerColorReplacement]) -> Option<Color> {
+  replacements.iter().find(|replacement| raw.starts_with(replacement.layer_name_prefix.as_bytes())).map(|replacement| argb_color(replacement.color))
+}
+
 fn argb_color(argb: u32) -> Color {
   Color {
     r: ((argb >> 16) & 0xff) as f32 / 255.0,
@@ -1541,10 +1550,6 @@ fn argb_color(argb: u32) -> Color {
     b: (argb & 0xff) as f32 / 255.0,
     a: ((argb >> 24) & 0xff) as f32 / 255.0,
   }
-}
-
-fn apply_layer_color(layer: &mut Layer, replacement: &LayerColorReplacement) {
-  layer.color_override = Some(argb_color(replacement.color));
 }
 
 #[derive(Clone, Copy)]
@@ -1689,14 +1694,6 @@ fn apply_fitz(layers: &mut [Layer], assets: &mut [Asset], entries: &[FitzEntry],
   apply_fitz_layers(layers, entries, index);
   for asset in assets {
     apply_fitz_layers(&mut asset.layers, entries, index);
-  }
-}
-
-fn apply_layer_replacements(layers: &mut [Layer], replacements: &[LayerColorReplacement]) {
-  for layer in layers {
-    if let Some(replacement) = replacements.iter().find(|replacement| layer.name.starts_with(&replacement.layer_name_prefix)) {
-      apply_layer_color(layer, replacement);
-    }
   }
 }
 
@@ -1872,6 +1869,7 @@ fn parent_chain_depth(slot: usize, layers: &[Layer], lookup: &ParentLookup<'_>, 
 fn parse_layer_list(
   c: &mut Cursor<'_>,
   limits: &Limits,
+  replacements: &[LayerColorReplacement],
   total_layers: &mut usize,
   total_masks: &mut usize,
   total_painted_shape_layers: &mut usize,
@@ -1883,7 +1881,7 @@ fn parse_layer_list(
     if *total_layers > limits.max_layers {
       return Err(Error::LimitExceeded(Limit::Layers));
     }
-    layers.push(parse_layer(c, limits, total_masks, total_painted_shape_layers, total_solid_layers)?);
+    layers.push(parse_layer(c, limits, replacements, total_masks, total_painted_shape_layers, total_solid_layers)?);
     Ok(())
   })?;
   validate_layer_parent_chains(&layers, limits)?;
@@ -2000,6 +1998,7 @@ fn path_property_exceeds_points(path: &Property<PathData>, max_points: usize) ->
 fn parse_asset(
   c: &mut Cursor<'_>,
   limits: &Limits,
+  replacements: &[LayerColorReplacement],
   total_layers: &mut usize,
   total_masks: &mut usize,
   total_painted_shape_layers: &mut usize,
@@ -2015,7 +2014,7 @@ fn parse_asset(
       }
       b"layers" => {
         has_layers = true;
-        layers = parse_layer_list(c, limits, total_layers, total_masks, total_painted_shape_layers, total_solid_layers)?;
+        layers = parse_layer_list(c, limits, replacements, total_layers, total_masks, total_painted_shape_layers, total_solid_layers)?;
       }
       _ => { c.skip_value()? },
   })?;
@@ -2055,14 +2054,14 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
       b"ip" => { in_point = Some(c.parse_f64()?); },
       b"op" => { out_point = Some(c.parse_f64()?); },
       b"layers" => {
-        layers = parse_layer_list(c, limits, &mut total_layers, &mut total_masks, &mut total_painted_shape_layers, &mut total_solid_layers)?;
+        layers = parse_layer_list(c, limits, &options.layer_color_replacements, &mut total_layers, &mut total_masks, &mut total_painted_shape_layers, &mut total_solid_layers)?;
       }
       b"assets" => {
         for_each_element(c, |c| {
           if assets.len() >= limits.max_assets {
             return Err(Error::LimitExceeded(Limit::Assets));
           }
-          if let Some(asset) = parse_asset(c, limits, &mut total_layers, &mut total_masks, &mut total_painted_shape_layers, &mut total_solid_layers)? {
+          if let Some(asset) = parse_asset(c, limits, &options.layer_color_replacements, &mut total_layers, &mut total_masks, &mut total_painted_shape_layers, &mut total_solid_layers)? {
             assets.push(asset);
           }
           Ok(())
@@ -2117,10 +2116,6 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
     apply_fitz(&mut layers, &mut assets, &fitz_entries, index);
   }
   apply_source_colors(&mut layers, &mut assets, &options.source_color_replacements);
-  apply_layer_replacements(&mut layers, &options.layer_color_replacements);
-  for asset in &mut assets {
-    apply_layer_replacements(&mut asset.layers, &options.layer_color_replacements);
-  }
 
   let mut composition = Composition {
     width: width as u32,

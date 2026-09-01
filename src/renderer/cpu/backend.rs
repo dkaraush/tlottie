@@ -488,8 +488,7 @@ fn paint_is_retained(cache: &CovCache, key: u128, paint: Paint<'_>, alpha_only: 
   if !alpha_only {
     return cache.contains(gradient.source_key);
   }
-  let first_alpha = gradient.lut.first().copied().unwrap_or(0) >> 24;
-  if gradient.lut.iter().all(|pixel| pixel >> 24 == first_alpha) {
+  if gradient.lut.uniform_alpha().is_some() {
     false
   } else {
     cache.contains(gradient.source_key ^ (1u128 << 127))
@@ -511,17 +510,26 @@ fn fill_gradient<const TRACK_ROWS: bool>(
       canvas.fill_gradient_translated_alpha::<TRACK_ROWS>(cache, key, gradient.source_key, contours, translation, fill_rule(gradient.rule), &gradient.lut, map, gradient.alpha);
       return;
     }
-    canvas.fill_gradient_translated::<TRACK_ROWS>(cache, key, gradient.source_key, contours, translation, fill_rule(gradient.rule), &gradient.lut, map);
+    canvas.fill_gradient_translated_with_metadata::<TRACK_ROWS>(
+      cache,
+      key,
+      gradient.source_key,
+      contours,
+      translation,
+      fill_rule(gradient.rule),
+      &gradient.lut,
+      map,
+      gradient.lut.is_opaque(),
+    );
     return;
   }
 
-  let first_alpha = gradient.lut.first().copied().unwrap_or(0) >> 24;
-  if gradient.lut.iter().all(|pixel| pixel >> 24 == first_alpha) {
+  if let Some(first_alpha) = gradient.lut.uniform_alpha() {
     let color = crate::math::Color {
       r: 0.0,
       g: 0.0,
       b: 0.0,
-      a: first_alpha as f32 / 255.0 * f32::from(gradient.alpha) / 255.0,
+      a: f32::from(first_alpha) / 255.0 * f32::from(gradient.alpha) / 255.0,
     };
     canvas.fill_translated::<TRACK_ROWS>(cache, key, contours, translation, fill_rule(gradient.rule), color, 1.0);
     return;

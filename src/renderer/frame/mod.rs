@@ -9,7 +9,7 @@ mod walker;
 pub(crate) use renderer::GRADIENT_LUT_SIZE;
 #[doc(hidden)]
 #[cfg(feature = "cpu")]
-pub use renderer::{Composite, ContourRef, FrameRenderer, Geometry, GradientKind, GradientPaint, GradientTransform, Paint, Point, Rule, SolidPaint};
+pub use renderer::{Composite, ContourRef, FrameRenderer, Geometry, GradientKind, GradientLut, GradientPaint, GradientTransform, Paint, Point, Rule, SolidPaint};
 #[doc(hidden)]
 #[cfg(feature = "cpu")]
 pub use walker::{walk_frame_into, FrameWalker};

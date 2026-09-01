@@ -3,7 +3,7 @@
 //! stays <= 65407.
 
 use core::arch::aarch64::{
-  uint16x8_t, uint32x4_t, uint8x16_t, uint8x8x4_t, vabsq_f32, vaddq_f32, vaddq_u16, vandq_u32, vbslq_u32, vceqq_u16, vcgeq_f32, vcltq_f32, vcombine_u8, vcvtq_u32_f32, vdupq_n_f32, vdupq_n_u16, vdupq_n_u32,
+  float32x4_t, uint16x8_t, uint32x4_t, uint8x16_t, uint8x8x4_t, vabsq_f32, vaddq_f32, vaddq_u16, vandq_u32, vbslq_u32, vceqq_u16, vcgeq_f32, vcltq_f32, vcombine_u8, vcvtq_u32_f32, vdupq_n_f32, vdupq_n_u16, vdupq_n_u32,
   vget_high_u8, vget_low_u8, vgetq_lane_u32, vld1_u8, vld1q_f32, vld1q_u8, vld4_u8, vmaxq_f32, vmaxq_u16, vminq_f32, vminq_u16, vminvq_u16, vminv_u8, vmovl_u8, vmovn_u16, vmulq_f32, vmulq_u16, vnegq_f32,
   vshrq_n_u16, vsqrtq_f32, vst1q_u32, vst1q_u8, vst4_u8, vsubq_f32, vsubq_u16,
 };
@@ -504,6 +504,29 @@ fn blend8_over_k255(dpx: &mut [u32], src: &[u32; 8]) {
 /// LUT index computations (identical to [`linear_lut_fill_neon`]) fill a
 /// 32-byte stack buffer, then [`blend8_over_k255`] source-overs it. The
 /// buffer never reaches DRAM — that eliminated round-trip is the win.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "neon")]
+fn linear_gather4(
+  lut: &[u32],
+  kf: float32x4_t,
+  t0v: float32x4_t,
+  dtv: float32x4_t,
+  scalev: float32x4_t,
+  half: float32x4_t,
+  zero: float32x4_t,
+  one: float32x4_t,
+  inf: float32x4_t,
+  sentinel: uint32x4_t,
+  out: &mut [u32],
+) {
+  let t = vaddq_f32(t0v, vmulq_f32(kf, dtv));
+  let tc = vminq_f32(vmaxq_f32(t, zero), one);
+  let idx = vcvtq_u32_f32(vaddq_f32(vmulq_f32(tc, scalev), half));
+  let finite = vcltq_f32(vabsq_f32(t), inf);
+  gather4(lut, vbslq_u32(finite, idx, sentinel), out);
+}
+
 #[target_feature(enable = "neon")]
 pub(super) fn linear_lut_over_neon(dst: &mut [u32], lut: &[u32], row_base: f32, dt: f32, x_start: f32, scale: f32) {
   let lanes = [0.0f32, 1.0, 2.0, 3.0];
@@ -520,20 +543,29 @@ pub(super) fn linear_lut_over_neon(dst: &mut [u32], lut: &[u32], row_base: f32, 
   let scalev = vdupq_n_f32(scale);
   let inf = vdupq_n_f32(f32::INFINITY);
   let sentinel = vdupq_n_u32(u32::MAX);
-  let mut src = [0u32; 8];
-  for dpx in dst.chunks_exact_mut(8) {
-    for h in 0..2 {
-      let t = vaddq_f32(t0v, vmulq_f32(kf, dtv));
-      let tc = vminq_f32(vmaxq_f32(t, zero), one);
-      let idx = vcvtq_u32_f32(vaddq_f32(vmulq_f32(tc, scalev), half));
-      let finite = vcltq_f32(vabsq_f32(t), inf);
-      let idx = vbslq_u32(finite, idx, sentinel);
-      if let Some(out) = src.get_mut(h * 4..h * 4 + 4) {
-        gather4(lut, idx, out);
-      }
-      kf = vaddq_f32(kf, four);
-    }
-    blend8_over_k255(dpx, &src);
+  let mut blocks = dst.chunks_exact_mut(16);
+  for dpx in &mut blocks {
+    let mut src0 = [0u32; 8];
+    let mut src1 = [0u32; 8];
+    linear_gather4(lut, kf, t0v, dtv, scalev, half, zero, one, inf, sentinel, &mut src0[..4]);
+    kf = vaddq_f32(kf, four);
+    linear_gather4(lut, kf, t0v, dtv, scalev, half, zero, one, inf, sentinel, &mut src0[4..]);
+    kf = vaddq_f32(kf, four);
+    linear_gather4(lut, kf, t0v, dtv, scalev, half, zero, one, inf, sentinel, &mut src1[..4]);
+    kf = vaddq_f32(kf, four);
+    linear_gather4(lut, kf, t0v, dtv, scalev, half, zero, one, inf, sentinel, &mut src1[4..]);
+    kf = vaddq_f32(kf, four);
+    let (dst0, dst1) = dpx.split_at_mut(8);
+    blend8_over_k255(dst0, &src0);
+    blend8_over_k255(dst1, &src1);
+  }
+  let tail = blocks.into_remainder();
+  if tail.len() == 8 {
+    let mut src = [0u32; 8];
+    linear_gather4(lut, kf, t0v, dtv, scalev, half, zero, one, inf, sentinel, &mut src[..4]);
+    kf = vaddq_f32(kf, four);
+    linear_gather4(lut, kf, t0v, dtv, scalev, half, zero, one, inf, sentinel, &mut src[4..]);
+    blend8_over_k255(tail, &src);
   }
 }
 

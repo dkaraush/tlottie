@@ -5,12 +5,23 @@ use alloc::vec::Vec;
 
 /// Builds a premultiplied RGBA8 lookup table from independently interpolated
 /// Lottie color and opacity stops.
-pub(crate) fn build_gradient_lut(stops: &FloatList, color_count: usize, opacity: f32) -> [u32; GRADIENT_LUT_SIZE] {
+pub(crate) fn build_gradient_lut(stops: &FloatList, color_count: usize, opacity: f32) -> GradientLut {
   let data = &stops.0;
   let n = color_count.min(data.len() / 4);
   let mut lut = [0u32; GRADIENT_LUT_SIZE];
   let opac = data.get(n * 4..).unwrap_or(&[]);
-  let opacity_stop_count = if opac.len() >= 4 && opac.len() % 2 == 0 { opac.len() / 2 } else { 0 };
+  // rlottie consumes at most one opacity pair per color stop (lottiemodel.cpp
+  // populate: `j` advances alongside `i`); leftover trailing pairs never reach
+  // the stop list, so the pad color keeps the last consumed pair's opacity.
+  let opacity_stop_count = if opac.len() >= 4 && opac.len() % 2 == 0 { (opac.len() / 2).min(n) } else { 0 };
+  let opac = opac.get(..opacity_stop_count.saturating_mul(2)).unwrap_or(opac);
+  let uniform_stop_alpha = if opacity_stop_count == 0 {
+    Some(1.0)
+  } else {
+    let alpha = opac.get(1).copied().unwrap_or(1.0);
+    opac.chunks_exact(2).all(|stop| stop.get(1).copied().unwrap_or(1.0) == alpha).then_some(alpha)
+  };
+  let uniform_alpha = uniform_stop_alpha.map(|alpha| ((alpha * opacity).clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
 
   for (i, slot) in lut.iter_mut().enumerate() {
     let t = i as f32 / (GRADIENT_LUT_SIZE - 1) as f32;
@@ -78,7 +89,7 @@ pub(crate) fn build_gradient_lut(stops: &FloatList, color_count: usize, opacity:
     let pb = (b.clamp(0.0, 1.0) * a * 255.0 + 0.5) as u32;
     *slot = crate::pixel::pack_premultiplied_rgba(pr, pg, pb, pa);
   }
-  lut
+  GradientLut::new(lut, uniform_alpha)
 }
 
 /// Gradient parametrization. The shape geometry (`sx/sy/…`) lives in LOCAL
@@ -212,6 +223,23 @@ impl Canvas<'_> {
     lut: &[u32; GRADIENT_LUT_SIZE],
     map: &GradientMap,
   ) {
+    let lut_opaque = lut.iter().all(|&pixel| pixel >> 24 == 255);
+    self.fill_gradient_translated_with_metadata::<TRACK_ROWS>(cache, key, src_key, contours, translation, rule, lut, map, lut_opaque);
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn fill_gradient_translated_with_metadata<const TRACK_ROWS: bool>(
+    &mut self,
+    cache: &mut CovCache,
+    key: u128,
+    src_key: u128,
+    contours: &[Contour],
+    translation: crate::renderer::frame::Point,
+    rule: FillRule,
+    lut: &[u32; GRADIENT_LUT_SIZE],
+    map: &GradientMap,
+    lut_opaque: bool,
+  ) {
     let w = self.w;
     let antialias = self.antialias;
     let dst_clear = self.dirty.is_empty();
@@ -243,7 +271,6 @@ impl Canvas<'_> {
       }
       return;
     }
-    let radial_opaque = matches!(&map.kind, GradientMapKind::Radial { .. }) && lut.iter().all(|&pixel| pixel >> 24 == 255);
     let mut src_entry = CovEntry {
       rows: Vec::new(),
       data: PlaneData::Src(Vec::new()),
@@ -299,7 +326,7 @@ impl Canvas<'_> {
           } else if dst_clear {
             gradient_span_uniform_clear(dst_row, cov, y, x0, lut, map);
           } else {
-            gradient_span_uniform(dst_row, cov, y, x0, lut, map, radial_opaque);
+            gradient_span_uniform(dst_row, cov, y, x0, lut, map, lut_opaque);
           }
         }
         if !capture {
@@ -391,7 +418,7 @@ impl Canvas<'_> {
         if dst_clear {
           gradient_span_uniform_clear(dst_row, cov, y, x0, lut, map);
         } else {
-          gradient_span_uniform(dst_row, cov, y, x0, lut, map, radial_opaque);
+          gradient_span_uniform(dst_row, cov, y, x0, lut, map, lut_opaque);
         }
       });
       if overflow || !capture {
@@ -884,7 +911,7 @@ fn gradient_row(dst_row: &mut [u32], cov_row: &[u8], y: usize, x0: usize, lut: &
 /// same math as `gradient_row` over a synthetic constant coverage row, but
 /// full-coverage spans can jump straight to the fused LUT-over kernels and
 /// partial spans avoid allocating/filling a temporary coverage slice.
-fn gradient_span_uniform(dst_row: &mut [u32], cov: u8, y: usize, x0: usize, lut: &[u32; GRADIENT_LUT_SIZE], map: &GradientMap, radial_opaque: bool) {
+fn gradient_span_uniform(dst_row: &mut [u32], cov: u8, y: usize, x0: usize, lut: &[u32; GRADIENT_LUT_SIZE], map: &GradientMap, lut_opaque: bool) {
   if cov == 0 || dst_row.is_empty() {
     return;
   }
@@ -897,7 +924,13 @@ fn gradient_span_uniform(dst_row: &mut [u32], cov: u8, y: usize, x0: usize, lut:
       let row_base = ((lx0 - sx) * dx + (ly0 - sy) * dy) * inv_len_sq;
       let dt = (inv.a * dx + inv.b * dy) * inv_len_sq;
       if cov == 255 {
-        crate::simd::linear_lut_over(dst_row, lut, row_base, dt, x0 as f32);
+        let last_x = x0 as f32 + dst_row.len().saturating_sub(1) as f32;
+        let span_finite = (row_base + x0 as f32 * dt).is_finite() && (row_base + last_x * dt).is_finite();
+        if lut_opaque && span_finite {
+          crate::simd::linear_lut_fill(dst_row, lut, row_base, dt, x0 as f32);
+        } else {
+          crate::simd::linear_lut_over(dst_row, lut, row_base, dt, x0 as f32);
+        }
         return;
       }
       for (i, dst) in dst_row.iter_mut().enumerate() {
@@ -908,7 +941,7 @@ fn gradient_span_uniform(dst_row: &mut [u32], cov: u8, y: usize, x0: usize, lut:
     GradientMapKind::Radial { sx, sy, inv_r } => {
       let (dd0x, dd0y) = (lx0 - sx, ly0 - sy);
       if cov == 255 {
-        if radial_opaque {
+        if lut_opaque {
           crate::simd::radial_lut_fill(dst_row, lut, dd0x, dd0y, inv.a, inv.b, *inv_r, x0 as f32);
         } else {
           crate::simd::radial_lut_over(dst_row, lut, dd0x, dd0y, inv.a, inv.b, *inv_r, x0 as f32);

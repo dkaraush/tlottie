@@ -6,7 +6,7 @@
 //! `end` value, a solid layer, a nested group), the two renders stop being
 //! byte-swaps of each other and these tests fail.
 
-use tlottie::{ChannelOrder, Composition, Limits, ParseOptions, RenderOptions};
+use crate::{ChannelOrder, Composition, CPURenderer, Limits, ParseOptions, RenderOptions};
 
 /// `0xAABBGGRR` -> `0xAARRGGBB`; green and alpha stay put.
 fn swap_rb(pixel: u32) -> u32 {
@@ -19,7 +19,7 @@ fn render(json: &[u8], order: ChannelOrder, frame: f32, size: u32) -> Option<Vec
     ..ParseOptions::default()
   };
   let comp = Composition::parse_with_options(json, &Limits::default(), &options).ok()?;
-  let mut renderer = tlottie::CPURenderer::new(comp);
+  let mut renderer = CPURenderer::new(comp);
   let mut pixels = vec![0u32; (size as usize) * (size as usize)];
   renderer.render(frame, &mut pixels, size, size, RenderOptions::default()).ok()?;
   Some(pixels)

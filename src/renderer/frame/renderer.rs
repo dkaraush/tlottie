@@ -6,6 +6,48 @@ use crate::geometry::Contour;
 
 pub(crate) const GRADIENT_LUT_SIZE: usize = 1024;
 
+#[derive(Debug)]
+struct GradientLutData {
+  pixels: [u32; GRADIENT_LUT_SIZE],
+  uniform_alpha: Option<u8>,
+}
+
+/// Shared premultiplied gradient lookup table and its build-time metadata.
+#[derive(Clone, Debug)]
+pub struct GradientLut(alloc::sync::Arc<GradientLutData>);
+
+impl GradientLut {
+  pub(crate) fn new(pixels: [u32; GRADIENT_LUT_SIZE], uniform_alpha: Option<u8>) -> Self {
+    Self(alloc::sync::Arc::new(GradientLutData { pixels, uniform_alpha }))
+  }
+
+  pub(crate) fn uniform_alpha(&self) -> Option<u8> {
+    self.0.uniform_alpha
+  }
+
+  pub(crate) fn is_opaque(&self) -> bool {
+    self.uniform_alpha() == Some(255)
+  }
+
+  pub(crate) fn as_ptr(&self) -> *const [u32; GRADIENT_LUT_SIZE] {
+    core::ptr::from_ref(&self.0.pixels)
+  }
+}
+
+impl core::ops::Deref for GradientLut {
+  type Target = [u32; GRADIENT_LUT_SIZE];
+
+  fn deref(&self) -> &Self::Target {
+    &self.0.pixels
+  }
+}
+
+impl AsRef<[u32; GRADIENT_LUT_SIZE]> for GradientLut {
+  fn as_ref(&self) -> &[u32; GRADIENT_LUT_SIZE] {
+    &self.0.pixels
+  }
+}
+
 /// Device-space point.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Point {
@@ -58,7 +100,7 @@ pub enum GradientKind {
 #[derive(Clone, Debug)]
 pub struct GradientPaint {
   pub rule: Rule,
-  pub lut: alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
+  pub lut: GradientLut,
   pub transform: GradientTransform,
   pub kind: GradientKind,
   pub(crate) source_key: u128,

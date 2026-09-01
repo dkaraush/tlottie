@@ -30,13 +30,13 @@ enum PendingPaint {
   },
   Gradient {
     rule: FillRule,
-    lut: alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
+    lut: GradientLut,
     lut_id: u64,
     map: GradientMap,
   },
   Stroke {
     color: Option<Color>,
-    lut: Option<(alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>, u64, GradientMap)>,
+    lut: Option<(GradientLut, u64, GradientMap)>,
     opacity: f32,
     hw: f32,
     cap: crate::stroke::Cap,
@@ -70,7 +70,7 @@ pub(crate) enum DrawJob {
     contours: Vec<Contour>,
     borrowed: Option<usize>,
     rule: FillRule,
-    lut: alloc::sync::Arc<[u32; GRADIENT_LUT_SIZE]>,
+    lut: GradientLut,
     map: GradientMap,
   },
 }
@@ -346,10 +346,17 @@ impl ShapeWalker<'_> {
           self.walk(&g.shapes, child_m, opacity * gop, depth + 1, arena, pending)?;
         }
         Shape::Path(p) => {
-          let data = p.path.eval(self.frame);
-          let closed = data.closed;
-          let contour = self.scratch.take_contour();
-          arena.push((flatten_path_reusing(&data, &m, self.curve_tolerance, contour), closed));
+          if let Some(data) = p.path.static_value() {
+            let closed = data.closed;
+            let contour = self.scratch.take_contour();
+            let contour = flatten_path_reusing(data, &m, self.curve_tolerance, contour);
+            arena.push((contour, closed));
+          } else {
+            let data = p.path.eval(self.frame);
+            let closed = data.closed;
+            let contour = self.scratch.take_contour();
+            arena.push((flatten_path_reusing(&data, &m, self.curve_tolerance, contour), closed));
+          }
         }
         Shape::Rect(r) => {
           let pos = r.position.eval(self.frame);

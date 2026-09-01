@@ -102,3 +102,7 @@ fn map_property<T>(property: &mut Property<T>, f: &mut impl FnMut(&mut T)) {
     }
   }
 }
+
+#[cfg(test)]
+#[path = "tests/swizzle.rs"]
+mod tests;
