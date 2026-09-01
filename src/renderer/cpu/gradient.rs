@@ -10,7 +10,11 @@ pub(crate) fn build_gradient_lut(stops: &FloatList, color_count: usize, opacity:
   let n = color_count.min(data.len() / 4);
   let mut lut = [0u32; GRADIENT_LUT_SIZE];
   let opac = data.get(n * 4..).unwrap_or(&[]);
-  let opacity_stop_count = if opac.len() >= 4 && opac.len() % 2 == 0 { opac.len() / 2 } else { 0 };
+  // rlottie consumes at most one opacity pair per color stop (lottiemodel.cpp
+  // populate: `j` advances alongside `i`); leftover trailing pairs never reach
+  // the stop list, so the pad color keeps the last consumed pair's opacity.
+  let opacity_stop_count = if opac.len() >= 4 && opac.len() % 2 == 0 { (opac.len() / 2).min(n) } else { 0 };
+  let opac = opac.get(..opacity_stop_count.saturating_mul(2)).unwrap_or(opac);
   let uniform_stop_alpha = if opacity_stop_count == 0 {
     Some(1.0)
   } else {

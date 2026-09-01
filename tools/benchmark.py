@@ -89,13 +89,17 @@ LIBS = {
 }
 
 
+TLOTTIE_VERSION_TREES: dict[str, Path] = {}
+
+
 def add_tlottie_versions(versions: list[str]) -> tuple[str, ...]:
     """Registers extra tlottie builds (from `--tlottie-version NAME=PATH`) as
     renderers in `LIBS`/`RENDERERS`. Returns the added renderer names.
 
     PATH may be a source tree (its `target/release/libtlottie.so` is used) or
-    a direct path to a `libtlottie.so`. `--skip-build` must be used: extra
-    builds are never compiled by this script, only validated for existence.
+    a direct path to a `libtlottie.so`. Source trees are compiled by
+    `ensure_builds` like the primary tlottie, unless `--skip-build` is given;
+    direct .so paths are only validated for existence.
     """
     global RENDERERS, TLOTTIE_VERSION_NAMES
     added: list[str] = []
@@ -109,6 +113,8 @@ def add_tlottie_versions(versions: list[str]) -> tuple[str, ...]:
         lib = tree / "target" / "release" / f"libtlottie{LIB_SUFFIX}" if tree.is_dir() else tree
         LIBS[name] = lib
         RENDERERS = RENDERERS + (name,)
+        if tree.is_dir():
+            TLOTTIE_VERSION_TREES[name] = tree
         added.append(name)
     TLOTTIE_VERSION_NAMES = tuple(added)
     return tuple(added)
@@ -158,6 +164,10 @@ def ensure_builds(skip: bool, required: set[str]) -> None:
     env["RUSTFLAGS"] = env.get("RUSTFLAGS", "-C target-cpu=native")
     if "tlottie" in required:
         run(["cargo", "build", "--release", "--lib", "--features", "c-api"], ROOT, env)
+    for name in sorted(TLOTTIE_VERSION_NAMES):
+        tree = TLOTTIE_VERSION_TREES.get(name)
+        if tree is not None and name in required:
+            run(["cargo", "build", "--release", "--lib", "--features", "c-api"], tree, env)
 
     external = required.intersection(PROJECT_DIRS)
     if not external:
@@ -2446,11 +2456,12 @@ def write_tgv(
     key_cols: tuple[str, ...],
     include_memory: bool = True,
     include_energy: bool = True,
+    vs: tuple[str, str] | None = None,
 ) -> None:
     cols = list(key_cols)
-    comparison_renderer = tl_vs_rl19_renderer(renderers)
-    comparison_col = tl_vs_rl19_label(comparison_renderer)
-    include_comparison = comparison_renderer is not None
+    comparison = comparison_pair(renderers, vs)
+    comparison_col = comparison_label(comparison) if comparison is not None else None
+    include_comparison = comparison is not None
     if include_comparison:
         cols.insert(cols.index("pack") + 1, comparison_col)
     for r in renderers:
@@ -2466,8 +2477,8 @@ def write_tgv(
             values = {
                 **row,
                 comparison_col: (
-                    format_tl_vs_rl19_percent(row, comparison_renderer)
-                    if comparison_renderer is not None
+                    format_tl_vs_rl19_percent(row, comparison)
+                    if comparison is not None
                     else None
                 ),
             }
@@ -2589,26 +2600,59 @@ def imported_pack_rows(
     return out
 
 
-def tl_vs_rl19_label(renderer: str | None) -> str:
-    return "tl vs rl19 patched" if renderer == "rlottie_2019_patched" else "tl vs rl19"
+def comparison_pair(
+    renderers: tuple[str, ...], vs: tuple[str, str] | None = None
+) -> tuple[str, str] | None:
+    if vs is not None:
+        if vs[0] == vs[1]:
+            raise SystemExit(f"--vs needs two different renderers, got {vs[0]} twice")
+        missing = [r for r in vs if r not in renderers]
+        if missing:
+            raise SystemExit(
+                f"--vs renderers not measured: {', '.join(missing)} "
+                f"(measured: {', '.join(renderers)})"
+            )
+        return vs
+    renderer = tl_vs_rl19_renderer(renderers)
+    return ("tlottie", renderer) if renderer is not None else None
 
 
-def tl_vs_rl19_percent(row: dict[str, Any], renderer: str) -> float | None:
-    tlottie_ms = row.get("tlottie_frame_ms")
-    rlottie_2019_ms = row.get(f"{renderer}_frame_ms")
-    if tlottie_ms is None or rlottie_2019_ms is None or rlottie_2019_ms <= 0:
+def comparison_label(pair: tuple[str, str]) -> str:
+    if pair == ("tlottie", "rlottie_2019"):
+        return "tl vs rl19"
+    if pair == ("tlottie", "rlottie_2019_patched"):
+        return "tl vs rl19 patched"
+    return f"{_abbreviate_renderer(pair[0])} vs {_abbreviate_renderer(pair[1])}"
+
+
+def _abbreviate_renderer(name: str) -> str:
+    parts = []
+    for word in name.split("_"):
+        if not word:
+            continue
+        if "lottie" in word.lower():
+            parts.append(re.sub("(?i)lottie", "l", word))
+        else:
+            parts.append(word[0])
+    return "_".join(parts) or name
+
+
+def tl_vs_rl19_percent(row: dict[str, Any], pair: tuple[str, str]) -> float | None:
+    first_ms = row.get(f"{pair[0]}_frame_ms")
+    second_ms = row.get(f"{pair[1]}_frame_ms")
+    if first_ms is None or second_ms is None or second_ms <= 0:
         return None
-    percent = (tlottie_ms / rlottie_2019_ms - 1.0) * 100.0
+    percent = (first_ms / second_ms - 1.0) * 100.0
     return percent if math.isfinite(percent) else None
 
 
-def format_tl_vs_rl19_percent(row: dict[str, Any], renderer: str) -> str:
-    percent = tl_vs_rl19_percent(row, renderer)
+def format_tl_vs_rl19_percent(row: dict[str, Any], pair: tuple[str, str]) -> str:
+    percent = tl_vs_rl19_percent(row, pair)
     return "n/a" if percent is None else f"{percent:+.1f}%"
 
 
-def tl_vs_rl19_cell(row: dict[str, Any], renderer: str) -> str:
-    percent = tl_vs_rl19_percent(row, renderer)
+def tl_vs_rl19_cell(row: dict[str, Any], pair: tuple[str, str]) -> str:
+    percent = tl_vs_rl19_percent(row, pair)
     if percent is None:
         return "<td class='comparison muted'>n/a</td>"
     direction = "faster" if percent < 0 else "slower" if percent > 0 else "equal"
@@ -2620,13 +2664,13 @@ def tl_vs_rl19_cell(row: dict[str, Any], renderer: str) -> str:
 
 
 def total_tl_vs_rl19_by_size(
-    file_rows: list[dict[str, Any]], renderer: str
+    file_rows: list[dict[str, Any]], pair: tuple[str, str]
 ) -> dict[int, tuple[float, int]]:
     totals: dict[int, list[float]] = {}
     rows = pivot_aggregate(file_rows, ("pack", "file", "size"))
     for row in rows:
-        tlottie_ms = row.get("tlottie_frame_ms")
-        rlottie_2019_ms = row.get(f"{renderer}_frame_ms")
+        tlottie_ms = row.get(f"{pair[0]}_frame_ms")
+        rlottie_2019_ms = row.get(f"{pair[1]}_frame_ms")
         if tlottie_ms is None or rlottie_2019_ms is None or rlottie_2019_ms <= 0:
             continue
         size = row["size"]
@@ -2680,6 +2724,7 @@ def write_html(
     benchmark_command: str | None = None,
     machine_details: str | None = None,
     include_memory: bool = True,
+    vs: tuple[str, str] | None = None,
 ) -> None:
     # Emit a J column only when some renderer actually reported energy values;
     # otherwise the whole column would read n/a for every row.
@@ -2820,13 +2865,13 @@ document.querySelectorAll('table').forEach((table) => {
         f.write("<main>")
         f.write(f"<p class='note'><code>{esc(benchmark_command)}</code></p>")
         f.write(f"<p class='note'>{esc(machine_details)}</p>")
-        comparison_renderer = tl_vs_rl19_renderer(renderers)
-        if comparison_renderer is not None:
-            totals = total_tl_vs_rl19_by_size(file_rows, comparison_renderer)
+        comparison = comparison_pair(renderers, vs)
+        if comparison is not None:
+            totals = total_tl_vs_rl19_by_size(file_rows, comparison)
             if totals:
                 f.write("<div class='totals'>")
                 for size, (percent, pairs) in sorted(totals.items()):
-                    direction = "faster" if percent < 0 else "slower" if percent > 0 else "equal"
+                    direction = "slower" if percent < 0 else "faster" if percent > 0 else "equal"
                     f.write(
                         f"<span title='{pairs} paired animations'>{size}px "
                         f"<b class='{direction}'>{percent:+.1f}%</b></span>"
@@ -2844,6 +2889,7 @@ document.querySelectorAll('table').forEach((table) => {
                 accuracy_by_pack=accuracy_by_pack,
                 include_memory=include_memory,
                 include_energy=include_energy,
+                vs=vs,
             )
         effect_file_rows = [
             r
@@ -2863,6 +2909,7 @@ document.querySelectorAll('table').forEach((table) => {
                 accuracy_by_pack=accuracy_by_pack,
                 include_memory=include_memory,
                 include_energy=include_energy,
+                vs=vs,
             )
         f.write("</main>")
         f.write(f"<script>{sorting_js}</script>")
@@ -2877,15 +2924,17 @@ def write_grouped_table(
     accuracy_by_pack: dict[str, dict[str, Any]] | None = None,
     include_memory: bool = True,
     include_energy: bool = True,
+    vs: tuple[str, str] | None = None,
 ) -> None:
-    comparison_renderer = tl_vs_rl19_renderer(renderers)
-    include_comparison = comparison_renderer is not None
+    comparison = comparison_pair(renderers, vs)
+    include_comparison = comparison is not None
     f.write("<div class='tablewrap'><table><tr>")
     for label in labels:
         f.write(f"<th rowspan='2' class='left'>{esc(label)}</th>")
         if label == "pack" and include_comparison:
+            assert comparison is not None
             f.write(
-                f"<th rowspan='2'>{esc(tl_vs_rl19_label(comparison_renderer))}</th>"
+                f"<th rowspan='2'>{esc(comparison_label(comparison))}</th>"
             )
     if include_size:
         f.write("<th rowspan='2'>size</th>")
@@ -2919,8 +2968,8 @@ def write_grouped_table(
             else:
                 f.write(f"<td class='left'>{esc(value)}</td>")
             if label == "pack" and include_comparison:
-                assert comparison_renderer is not None
-                f.write(tl_vs_rl19_cell(row, comparison_renderer))
+                assert comparison is not None
+                f.write(tl_vs_rl19_cell(row, comparison))
         if include_size:
             f.write(f"<td>{row['size']}</td>")
         for r in renderers:
@@ -3024,6 +3073,7 @@ def benchmark_invocation(args: argparse.Namespace, accuracy_size: int) -> str:
     for option, value in (
         ("--limit", args.limit),
         ("--packs", args.packs),
+        ("--vs", args.vs),
     ):
         if value is not None:
             command.extend((option, str(value)))
@@ -3542,7 +3592,11 @@ def android_benchmark_invocation(args: argparse.Namespace) -> str:
         "--core-mask",
         args.core_mask,
     ]
-    for option, value in (("--limit", args.limit), ("--packs", args.packs)):
+    for option, value in (
+        ("--limit", args.limit),
+        ("--packs", args.packs),
+        ("--vs", args.vs),
+    ):
         if value is not None:
             command.extend((option, str(value)))
     for option, enabled in (
@@ -3565,6 +3619,7 @@ def run_android_benchmark(args: argparse.Namespace) -> int:
     renderer_list = args.renderers or ",".join(ANDROID_DEFAULT_RENDERERS)
     args.renderers = renderer_list
     renderers = tuple(item.strip() for item in renderer_list.split(",") if item.strip())
+    comparison_pair(renderers, args.vs_pair)
     unknown = [item for item in renderers if item not in ANDROID_RENDERERS]
     if unknown:
         raise SystemExit(f"unknown Android renderers: {','.join(unknown)}")
@@ -3689,7 +3744,7 @@ def run_android_benchmark(args: argparse.Namespace) -> int:
     pivot = pivot_aggregate(pack_rows, ("pack", "size"))
     tgv = args.out / "benchmark.tgv"
     html_path = args.out / "benchmark.html"
-    write_tgv(tgv, pivot, renderers, ("pack", "size"))
+    write_tgv(tgv, pivot, renderers, ("pack", "size"), vs=args.vs_pair)
     write_html(
         html_path,
         pack_rows,
@@ -3703,6 +3758,7 @@ def run_android_benchmark(args: argparse.Namespace) -> int:
         args.accuracy_diff_threshold,
         android_benchmark_invocation(args),
         android_device_info(serial, detailed=True),
+        vs=args.vs_pair,
     )
     if args.write_raw:
         (args.out / "benchmark.raw.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
@@ -3771,6 +3827,16 @@ def main(argv: list[str] | None = None) -> int:
         help="save up to N worst failing diff PNG grids, balanced across packs",
     )
     ap.add_argument("--diff-dir", type=Path, help="directory for --save-diffs PNG grids")
+    ap.add_argument(
+        "--vs",
+        metavar="A,B",
+        help=(
+            "renderer pair for the comparison column and totals, as A,B; "
+            "shows percent the first renderer is faster/slower than the second "
+            "(e.g. --vs tlottie,tlottie_baseline). Defaults to tl vs rl19 "
+            "when rlottie_2019 is measured"
+        ),
+    )
     ap.add_argument("--write-raw", action="store_true", help="write benchmark raw JSON files")
     ap.add_argument(
         "--jobs",
@@ -3808,7 +3874,8 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "add an extra tlottie build as its own renderer, measured interleaved "
             "with the primary tlottie in the same run (for A/B of two versions). "
-            "PATH is either the source tree whose target/release/libtlottie.so to use, "
+            "PATH is either the source tree to build (cargo build --release, skipped "
+            "under --skip-build) and whose target/release/libtlottie.so to use, "
             "or the .so directly. Repeatable; each NAME becomes a renderer referenceable "
             "in --renderers (e.g. --tlottie-version=avx=/tmp/tl-avx)"
         ),
@@ -3851,6 +3918,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
 
+    if args.vs is not None:
+        vs_parts = [part.strip() for part in args.vs.split(",")]
+        if len(vs_parts) != 2 or not all(vs_parts):
+            raise SystemExit("--vs must be two renderer names separated by a comma, e.g. --vs tlottie,tlottie_baseline")
+        args.vs_pair = (vs_parts[0], vs_parts[1])
+    else:
+        args.vs_pair = None
+
     if args.curve_tolerance is None:
         args.curve_tolerance = 0.125 if not args.no_accuracy else 0.3
 
@@ -3869,6 +3944,7 @@ def main(argv: list[str] | None = None) -> int:
     bad = [r for r in renderers if r not in RENDERERS]
     if bad:
         raise SystemExit(f"unknown renderers: {', '.join(bad)}")
+    comparison_pair(renderers, args.vs_pair)
     sizes = tuple(int(s) for s in args.sizes.split(",") if s)
     if args.reps <= 0:
         raise SystemExit("--reps must be positive")
@@ -4078,6 +4154,7 @@ def main(argv: list[str] | None = None) -> int:
         ("pack", "size"),
         include_memory=include_memory,
         include_energy=energy_present,
+        vs=args.vs_pair,
     )
     write_html(
         html_path,
@@ -4093,6 +4170,7 @@ def main(argv: list[str] | None = None) -> int:
         benchmark_invocation(args, accuracy_size),
         current_machine_details(),
         include_memory=include_memory,
+        vs=args.vs_pair,
     )
     raw = args.out / "benchmark.raw.json"
     accuracy_raw = args.out / "benchmark-accuracy.raw.json"

@@ -2,6 +2,23 @@ use super::*;
 use alloc::vec;
 
 #[test]
+fn opacity_stops_beyond_color_stops_are_dropped() {
+  // rlottie::LOTGradient::populate consumes one opacity pair per color stop;
+  // surplus trailing pairs (here two extra stops at position 1.0 with
+  // opacity 0.5/1.0) must not lift the pad color back to opaque.
+  let stops = FloatList(vec![
+    0.0, 0.0, 0.792, 1.0, //
+    0.5, 0.0, 0.894, 1.0, //
+    1.0, 0.0, 0.996, 1.0, //
+    0.0, 1.0, 0.5, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0, 1.0,
+  ]);
+  let lut = build_gradient_lut(&stops, 3, 1.0);
+  assert_eq!(lut[GRADIENT_LUT_SIZE - 1] >> 24, 0);
+  let mid_alpha = lut[GRADIENT_LUT_SIZE / 2] >> 24;
+  assert!((127..=128).contains(&mid_alpha), "mid_alpha={mid_alpha}");
+}
+
+#[test]
 fn opacity_stops_do_not_shift_color_interpolation() {
   let stops = FloatList(vec![
     0.0, 1.0, 0.0, 0.0, // red
