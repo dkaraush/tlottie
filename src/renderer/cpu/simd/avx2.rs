@@ -20,12 +20,12 @@
 //! scalar `lut.get(idx).unwrap_or(0)`.
 
 use core::arch::x86_64::{
-  _CMP_GE_OQ, _CMP_LT_OQ, _CMP_UNORD_Q, __m256, __m256i, _mm256_add_epi16, _mm256_add_ps, _mm256_and_ps, _mm256_and_si256, _mm256_andnot_ps, _mm256_andnot_si256,
-  _mm256_castps_si256, _mm256_castsi128_si256, _mm256_castsi256_ps, _mm256_castsi256_si128, _mm256_cmp_ps, _mm256_cmpeq_epi16, _mm256_cmpeq_epi32, _mm256_cmpgt_epi32, _mm256_cvtepu8_epi16, _mm256_cvttps_epi32,
-  _mm256_extracti128_si256, _mm256_inserti128_si256, _mm256_loadu_si256, _mm256_mask_i32gather_epi32, _mm256_max_epi16, _mm256_max_ps, _mm256_min_epi16, _mm256_min_ps, _mm256_movemask_epi8,
-  _mm256_mul_ps, _mm256_mullo_epi16, _mm256_or_ps, _mm256_or_si256, _mm256_packus_epi16, _mm256_permute4x64_epi64, _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_ps, _mm256_setr_epi16,
-  _mm256_setr_ps, _mm256_setzero_ps, _mm256_setzero_si256, _mm256_shufflehi_epi16, _mm256_shufflelo_epi16, _mm256_sqrt_ps, _mm256_srli_epi16, _mm256_storeu_si256, _mm256_sub_epi16,
-  _mm256_sub_ps, _mm_cvtsi32_si128, _mm_unpacklo_epi8, _mm_unpacklo_epi16,
+  __m256, __m256i, _mm256_add_epi16, _mm256_add_ps, _mm256_and_ps, _mm256_and_si256, _mm256_andnot_ps, _mm256_andnot_si256, _mm256_castps_si256, _mm256_castsi128_si256, _mm256_castsi256_ps,
+  _mm256_castsi256_si128, _mm256_cmp_ps, _mm256_cmpeq_epi16, _mm256_cmpeq_epi32, _mm256_cmpgt_epi32, _mm256_cvtepu8_epi16, _mm256_cvttps_epi32, _mm256_extracti128_si256, _mm256_inserti128_si256,
+  _mm256_loadu_si256, _mm256_mask_i32gather_epi32, _mm256_max_epi16, _mm256_max_ps, _mm256_min_epi16, _mm256_min_ps, _mm256_movemask_epi8, _mm256_mul_ps, _mm256_mullo_epi16, _mm256_or_ps,
+  _mm256_or_si256, _mm256_packus_epi16, _mm256_permute4x64_epi64, _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_ps, _mm256_setr_epi16, _mm256_setr_ps, _mm256_setzero_ps, _mm256_setzero_si256,
+  _mm256_shufflehi_epi16, _mm256_shufflelo_epi16, _mm256_sqrt_ps, _mm256_srli_epi16, _mm256_storeu_si256, _mm256_sub_epi16, _mm256_sub_ps, _mm_cvtsi32_si128, _mm_unpacklo_epi16, _mm_unpacklo_epi8,
+  _CMP_GE_OQ, _CMP_LT_OQ, _CMP_UNORD_Q,
 };
 
 /// Widens the low 16 bytes of `v` (first 4 pixels) to 16 u16 lanes.
@@ -244,7 +244,9 @@ pub(super) fn fill_span_solid_avx2(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32
   // Source pattern per pixel is [R,G,B,255]: the 255 alpha lane makes
   // `div255(255*ca+127) == ca` hold exactly, so one multiply yields
   // s_r/s_g/s_b AND s_a = ca in their lanes.
-  let src = _mm256_setr_epi16(sr as i16, sg as i16, sb as i16, 255, sr as i16, sg as i16, sb as i16, 255, sr as i16, sg as i16, sb as i16, 255, sr as i16, sg as i16, sb as i16, 255);
+  let src = _mm256_setr_epi16(
+    sr as i16, sg as i16, sb as i16, 255, sr as i16, sg as i16, sb as i16, 255, sr as i16, sg as i16, sb as i16, 255, sr as i16, sg as i16, sb as i16, 255,
+  );
   let sa_w = _mm256_set1_epi16(sa as i16);
   let full = _mm256_set1_epi16(255);
   for (dpx, cpx) in dst.chunks_exact_mut(8).zip(cov.chunks_exact(8)) {
@@ -267,7 +269,9 @@ pub(super) fn fill_span_solid_avx2(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32
 
 #[target_feature(enable = "avx2")]
 pub(super) fn fill_span_uniform_avx2(dst: &mut [u32], ca: u32, s_r: u32, s_g: u32, s_b: u32) {
-  let s = _mm256_setr_epi16(s_r as i16, s_g as i16, s_b as i16, ca as i16, s_r as i16, s_g as i16, s_b as i16, ca as i16, s_r as i16, s_g as i16, s_b as i16, ca as i16, s_r as i16, s_g as i16, s_b as i16, ca as i16);
+  let s = _mm256_setr_epi16(
+    s_r as i16, s_g as i16, s_b as i16, ca as i16, s_r as i16, s_g as i16, s_b as i16, ca as i16, s_r as i16, s_g as i16, s_b as i16, ca as i16, s_r as i16, s_g as i16, s_b as i16, ca as i16,
+  );
   let inv = _mm256_set1_epi16(255 - ca as i16);
   for dpx in dst.chunks_exact_mut(8) {
     let d = load(dpx.as_ptr().cast());
@@ -467,7 +471,10 @@ pub(super) fn focal_lut_fill_avx2(out: &mut [u32], lut: &[u32], g0x: f32, g0y: f
     let sq = _mm256_sqrt_ps(det);
     let nb = _mm256_sub_ps(zero, b);
     let root = max_ps_rust(_mm256_mul_ps(_mm256_sub_ps(nb, sq), inv2av), _mm256_mul_ps(_mm256_add_ps(nb, sq), inv2av));
-    let valid = _mm256_and_ps(_mm256_and_ps(_mm256_cmp_ps(det, zero, _CMP_GE_OQ), _mm256_cmp_ps(_mm256_mul_ps(rv, root), zero, _CMP_GE_OQ)), _mm256_cmp_ps(abs_ps(root), inf, _CMP_LT_OQ));
+    let valid = _mm256_and_ps(
+      _mm256_and_ps(_mm256_cmp_ps(det, zero, _CMP_GE_OQ), _mm256_cmp_ps(_mm256_mul_ps(rv, root), zero, _CMP_GE_OQ)),
+      _mm256_cmp_ps(abs_ps(root), inf, _CMP_LT_OQ),
+    );
     lut_store(chunk, lut, lut_indices(root, valid, scalev));
     kf = _mm256_add_ps(kf, eight);
   }
@@ -492,7 +499,10 @@ pub(super) fn focal_lut_over_avx2(dst: &mut [u32], lut: &[u32], g0x: f32, g0y: f
     let sq = _mm256_sqrt_ps(det);
     let nb = _mm256_sub_ps(zero, b);
     let root = max_ps_rust(_mm256_mul_ps(_mm256_sub_ps(nb, sq), inv2av), _mm256_mul_ps(_mm256_add_ps(nb, sq), inv2av));
-    let valid = _mm256_and_ps(_mm256_and_ps(_mm256_cmp_ps(det, zero, _CMP_GE_OQ), _mm256_cmp_ps(_mm256_mul_ps(rv, root), zero, _CMP_GE_OQ)), _mm256_cmp_ps(abs_ps(root), inf, _CMP_LT_OQ));
+    let valid = _mm256_and_ps(
+      _mm256_and_ps(_mm256_cmp_ps(det, zero, _CMP_GE_OQ), _mm256_cmp_ps(_mm256_mul_ps(rv, root), zero, _CMP_GE_OQ)),
+      _mm256_cmp_ps(abs_ps(root), inf, _CMP_LT_OQ),
+    );
     lut_blend_over_k255(chunk, lut, lut_indices(root, valid, scalev));
     kf = _mm256_add_ps(kf, eight);
   }
@@ -519,14 +529,7 @@ pub(super) fn fill_span_opaque_avx2(dst: &mut [u32], cov: &[u8], color: u32) {
         _mm256_storeu_si256(dpx.as_mut_ptr().cast(), colorv)
       }
     } else {
-      super::fill_span_solid_scalar(
-        dpx,
-        cpx,
-        (color >> 0) & 0xff,
-        (color >> 8) & 0xff,
-        (color >> 16) & 0xff,
-        255,
-      );
+      super::fill_span_solid_scalar(dpx, cpx, (color >> 0) & 0xff, (color >> 8) & 0xff, (color >> 16) & 0xff, 255);
     }
   }
 }

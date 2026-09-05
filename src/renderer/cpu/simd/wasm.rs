@@ -12,9 +12,9 @@
 //! <= 65407.
 
 use core::arch::wasm32::{
-  f32x4, f32x4_abs, f32x4_add, f32x4_ge, f32x4_lt, f32x4_max, f32x4_min, f32x4_mul, f32x4_neg, f32x4_splat, f32x4_sqrt, f32x4_sub, i16x8_all_true, u16x8, u16x8_add, u16x8_eq, u16x8_extend_high_u8x16, u16x8_extend_low_u8x16,
-  u16x8_max, u16x8_min, u16x8_mul, u16x8_shr, u16x8_splat, u16x8_sub, u32x4_all_true, u32x4_eq, u32x4_extract_lane, u32x4_splat, u32x4_trunc_sat_f32x4, u8x16, u8x16_narrow_i16x8, u8x16_swizzle, v128,
-  v128_and, v128_bitselect, v128_load, v128_store,
+  f32x4, f32x4_abs, f32x4_add, f32x4_ge, f32x4_lt, f32x4_max, f32x4_min, f32x4_mul, f32x4_neg, f32x4_splat, f32x4_sqrt, f32x4_sub, i16x8_all_true, u16x8, u16x8_add, u16x8_eq, u16x8_extend_high_u8x16,
+  u16x8_extend_low_u8x16, u16x8_max, u16x8_min, u16x8_mul, u16x8_shr, u16x8_splat, u16x8_sub, u32x4_all_true, u32x4_eq, u32x4_extract_lane, u32x4_splat, u32x4_trunc_sat_f32x4, u8x16,
+  u8x16_narrow_i16x8, u8x16_swizzle, v128, v128_and, v128_bitselect, v128_load, v128_store,
 };
 
 /// Swizzle pattern replicating each of the low 4 bytes across one

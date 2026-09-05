@@ -21,9 +21,9 @@ use crate::model::{
 };
 use crate::property::{Easing, Keyframe, Lerp, Property, Timeline};
 use crate::stroke::{Cap, Join};
-use alloc::vec;
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
 /// Maximum nesting of `gr` shape groups (separate from raw JSON depth).
@@ -1333,7 +1333,14 @@ fn parse_gradient_stops(c: &mut Cursor<'_>, limits: &Limits) -> Result<(Property
 // Layers
 // ---------------------------------------------------------------------------
 
-fn parse_layer(c: &mut Cursor<'_>, limits: &Limits, replacements: &[LayerColorReplacement], total_masks: &mut usize, total_painted_shape_layers: &mut usize, total_solid_layers: &mut usize) -> Result<Layer> {
+fn parse_layer(
+  c: &mut Cursor<'_>,
+  limits: &Limits,
+  replacements: &[LayerColorReplacement],
+  total_masks: &mut usize,
+  total_painted_shape_layers: &mut usize,
+  total_solid_layers: &mut usize,
+) -> Result<Layer> {
   let mut ty = 255u8;
   let mut index = 0i32;
   let mut parent: Option<i32> = None;
@@ -1540,7 +1547,10 @@ fn parse_layer(c: &mut Cursor<'_>, limits: &Limits, replacements: &[LayerColorRe
 /// comparison for every prefix that is itself valid UTF-8 and contains no
 /// U+FFFD, and avoids allocating a `String` per layer.
 fn match_layer_color(raw: &[u8], replacements: &[LayerColorReplacement]) -> Option<Color> {
-  replacements.iter().find(|replacement| raw.starts_with(replacement.layer_name_prefix.as_bytes())).map(|replacement| argb_color(replacement.color))
+  replacements
+    .iter()
+    .find(|replacement| raw.starts_with(replacement.layer_name_prefix.as_bytes()))
+    .map(|replacement| argb_color(replacement.color))
 }
 
 fn argb_color(argb: u32) -> Color {

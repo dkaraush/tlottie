@@ -168,7 +168,15 @@ pub(crate) fn fill_span_solid(dst: &mut [u32], cov: &[u8], sr: u32, sg: u32, sb:
       let n = dst.len().min(cov.len());
       let use_avx2 = use_avx2();
       let use_avx512 = use_avx512();
-      let full = n - n % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let full = n
+        - n
+          % if use_avx512 {
+            16
+          } else if use_avx2 {
+            8
+          } else {
+            4
+          };
       let (dst_v, dst_tail) = dst.split_at_mut(full);
       let (cov_v, cov_tail) = cov.split_at(full.min(cov.len()));
       if use_avx512 {
@@ -294,7 +302,15 @@ pub(crate) fn fill_span_uniform(dst: &mut [u32], cov: u8, sr: u32, sg: u32, sb: 
     if dst.len() >= SIMD_MIN_SPAN {
       let use_avx2 = use_avx2();
       let use_avx512 = use_avx512();
-      let full = dst.len() - dst.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let full = dst.len()
+        - dst.len()
+          % if use_avx512 {
+            16
+          } else if use_avx2 {
+            8
+          } else {
+            4
+          };
       let (dst_v, dst_tail) = dst.split_at_mut(full);
       if use_avx512 {
         // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
@@ -406,7 +422,15 @@ pub(crate) fn linear_lut_fill(out: &mut [u32], lut: &[u32], row_base: f32, dt: f
     if out.len() >= SIMD_MIN_SPAN {
       let use_avx2 = use_avx2();
       let use_avx512 = use_avx512();
-      let full = out.len() - out.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let full = out.len()
+        - out.len()
+          % if use_avx512 {
+            16
+          } else if use_avx2 {
+            8
+          } else {
+            4
+          };
       let (head, tail) = out.split_at_mut(full);
       if use_avx512 {
         // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
@@ -491,7 +515,15 @@ pub(crate) fn radial_lut_fill(out: &mut [u32], lut: &[u32], dd0x: f32, dd0y: f32
     if out.len() >= SIMD_MIN_SPAN {
       let use_avx2 = use_avx2();
       let use_avx512 = use_avx512();
-      let full = out.len() - out.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let full = out.len()
+        - out.len()
+          % if use_avx512 {
+            16
+          } else if use_avx2 {
+            8
+          } else {
+            4
+          };
       let (head, tail) = out.split_at_mut(full);
       if use_avx512 {
         // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
@@ -574,7 +606,15 @@ pub(crate) fn focal_lut_fill(out: &mut [u32], lut: &[u32], g0x: f32, g0y: f32, s
     if out.len() >= SIMD_MIN_SPAN {
       let use_avx2 = use_avx2();
       let use_avx512 = use_avx512();
-      let full = out.len() - out.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let full = out.len()
+        - out.len()
+          % if use_avx512 {
+            16
+          } else if use_avx2 {
+            8
+          } else {
+            4
+          };
       let (head, tail) = out.split_at_mut(full);
       if use_avx512 {
         // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
@@ -683,7 +723,15 @@ pub(crate) fn composite_over_span(dst: &mut [u32], src: &[u32], k: u32) {
       let n = dst.len().min(src.len());
       let use_avx2 = use_avx2();
       let use_avx512 = use_avx512();
-      let full = n - n % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let full = n
+        - n
+          % if use_avx512 {
+            16
+          } else if use_avx2 {
+            8
+          } else {
+            4
+          };
       let (dst_v, dst_tail) = dst.split_at_mut(full);
       let (src_v, src_tail) = src.split_at(full);
       if use_avx512 {
@@ -832,7 +880,15 @@ pub(crate) fn linear_lut_over(dst: &mut [u32], lut: &[u32], row_base: f32, dt: f
     if dst.len() >= SIMD_MIN_SPAN {
       let use_avx2 = use_avx2();
       let use_avx512 = use_avx512();
-      let full = dst.len() - dst.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let full = dst.len()
+        - dst.len()
+          % if use_avx512 {
+            16
+          } else if use_avx2 {
+            8
+          } else {
+            4
+          };
       let (head, tail) = dst.split_at_mut(full);
       if use_avx512 {
         // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
@@ -907,7 +963,15 @@ pub(crate) fn radial_lut_over(dst: &mut [u32], lut: &[u32], dd0x: f32, dd0y: f32
     if dst.len() >= SIMD_MIN_SPAN {
       let use_avx2 = use_avx2();
       let use_avx512 = use_avx512();
-      let full = dst.len() - dst.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let full = dst.len()
+        - dst.len()
+          % if use_avx512 {
+            16
+          } else if use_avx2 {
+            8
+          } else {
+            4
+          };
       let (head, tail) = dst.split_at_mut(full);
       if use_avx512 {
         // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
@@ -986,7 +1050,15 @@ pub(crate) fn focal_lut_over(dst: &mut [u32], lut: &[u32], g0x: f32, g0y: f32, s
     if dst.len() >= SIMD_MIN_SPAN {
       let use_avx2 = use_avx2();
       let use_avx512 = use_avx512();
-      let full = dst.len() - dst.len() % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+      let full = dst.len()
+        - dst.len()
+          % if use_avx512 {
+            16
+          } else if use_avx2 {
+            8
+          } else {
+            4
+          };
       let (head, tail) = dst.split_at_mut(full);
       if use_avx512 {
         // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
@@ -1071,8 +1143,16 @@ pub(crate) fn alpha_blend_solid(dst: &mut [u8], coverage: &[u8], alpha: u8) {
   #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
   if n >= SIMD_MIN_SPAN {
     let use_avx2 = use_avx2();
-      let use_avx512 = use_avx512();
-    let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
+    let use_avx512 = use_avx512();
+    let full = n
+      - n
+        % if use_avx512 {
+          64
+        } else if use_avx2 {
+          32
+        } else {
+          16
+        };
     let (head, tail) = dst[..n].split_at_mut(full);
     if use_avx512 {
       // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
@@ -1130,8 +1210,16 @@ pub(crate) fn alpha_blend_product(dst: &mut [u8], lhs: &[u8], rhs: &[u8]) {
   #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
   if n >= SIMD_MIN_SPAN {
     let use_avx2 = use_avx2();
-      let use_avx512 = use_avx512();
-    let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
+    let use_avx512 = use_avx512();
+    let full = n
+      - n
+        % if use_avx512 {
+          64
+        } else if use_avx2 {
+          32
+        } else {
+          16
+        };
     let (head, tail) = dst[..n].split_at_mut(full);
     if use_avx512 {
       // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
@@ -1196,8 +1284,16 @@ pub(crate) fn alpha_blend_uniform(dst: &mut [u8], coverage: u8, alpha: u8) {
   #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
   if dst.len() >= SIMD_MIN_SPAN {
     let use_avx2 = use_avx2();
-      let use_avx512 = use_avx512();
-    let full = dst.len() - dst.len() % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
+    let use_avx512 = use_avx512();
+    let full = dst.len()
+      - dst.len()
+        % if use_avx512 {
+          64
+        } else if use_avx2 {
+          32
+        } else {
+          16
+        };
     let (head, tail) = dst.split_at_mut(full);
     if use_avx512 {
       // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
@@ -1257,8 +1353,16 @@ pub(crate) fn alpha_composite_over(dst: &mut [u8], src: &[u8], opacity: u8) {
   #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
   if n >= SIMD_MIN_SPAN {
     let use_avx2 = use_avx2();
-      let use_avx512 = use_avx512();
-    let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
+    let use_avx512 = use_avx512();
+    let full = n
+      - n
+        % if use_avx512 {
+          64
+        } else if use_avx2 {
+          32
+        } else {
+          16
+        };
     let (head, tail) = dst[..n].split_at_mut(full);
     if use_avx512 {
       // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
@@ -1316,8 +1420,16 @@ pub(crate) fn alpha_multiply(dst: &mut [u8], factors: &[u8]) {
   #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
   if n >= SIMD_MIN_SPAN {
     let use_avx2 = use_avx2();
-      let use_avx512 = use_avx512();
-    let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
+    let use_avx512 = use_avx512();
+    let full = n
+      - n
+        % if use_avx512 {
+          64
+        } else if use_avx2 {
+          32
+        } else {
+          16
+        };
     let (head, tail) = dst[..n].split_at_mut(full);
     if use_avx512 {
       // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
@@ -1374,8 +1486,16 @@ pub(crate) fn alpha_matte(dst: &mut [u8], src: &[u8], opacity: u8, inverted: boo
   #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
   if n >= SIMD_MIN_SPAN {
     let use_avx2 = use_avx2();
-      let use_avx512 = use_avx512();
-    let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
+    let use_avx512 = use_avx512();
+    let full = n
+      - n
+        % if use_avx512 {
+          64
+        } else if use_avx2 {
+          32
+        } else {
+          16
+        };
     let (head, tail) = dst[..n].split_at_mut(full);
     if use_avx512 {
       // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
@@ -1434,8 +1554,16 @@ pub(crate) fn alpha_mask_combine(dst: &mut [u8], src: &[u8], mode: u8, inverted:
   #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
   if n >= SIMD_MIN_SPAN {
     let use_avx2 = use_avx2();
-      let use_avx512 = use_avx512();
-    let full = n - n % if use_avx512 { 64 } else if use_avx2 { 32 } else { 16 };
+    let use_avx512 = use_avx512();
+    let full = n
+      - n
+        % if use_avx512 {
+          64
+        } else if use_avx2 {
+          32
+        } else {
+          16
+        };
     let (head, tail) = dst[..n].split_at_mut(full);
     if use_avx512 {
       // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.
@@ -1509,7 +1637,15 @@ pub(crate) fn apply_matte_alpha(dst: &mut [u32], src: &[u32], source_opacity: u8
   if n >= SIMD_MIN_SPAN {
     let use_avx2 = use_avx2();
     let use_avx512 = use_avx512();
-    let full = n - n % if use_avx512 { 16 } else if use_avx2 { 8 } else { 4 };
+    let full = n
+      - n
+        % if use_avx512 {
+          16
+        } else if use_avx2 {
+          8
+        } else {
+          4
+        };
     let (head, tail) = dst[..n].split_at_mut(full);
     if use_avx512 {
       // SAFETY: `use_avx512` gates on `is_x86_feature_detected!("avx2"|"avx512f"|"avx512bw"|"avx512dq"|"avx512vl")`.

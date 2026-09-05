@@ -58,6 +58,7 @@ DEFAULT_RENDERERS = ("tlottie", "rlottie", "rlottie_2019", "rlottie_2019_patched
 RENDERERS = DEFAULT_RENDERERS
 TLOTTIE_VERSION_NAMES: tuple[str, ...] = ()
 RLOTTIE_RENDERERS = ("rlottie", "rlottie_2019", "rlottie_2019_patched")
+ACCURACY_RENDERERS = ("tlottie", "rlottie_2019", "thorvg")
 RENDERER_URLS = {
     "tlottie": "https://github.com/dkaraush/tlottie",
     "rlottie": "https://github.com/Samsung/rlottie",
@@ -1348,7 +1349,7 @@ def init_worker(
 def worker_measure(file_s: str) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     file = Path(file_s)
     rows = []
-    accuracy_renderers = ("tlottie", "rlottie", "thorvg")
+    accuracy_renderers = ACCURACY_RENDERERS
     capture_accuracy = (
         _WORKER_ACCURACY_ENABLED
         and _WORKER_SIZE == _WORKER_ACCURACY_SIZE
@@ -1716,7 +1717,7 @@ def init_accuracy_worker(
     _ACCURACY_NATIVE = NativeAccuracy(Path(native_accuracy_path)) if native_accuracy_path else None
     _ACCURACY_RENDERERS = {
         "tlottie": Tlottie(LIBS["tlottie"], curve_tolerance, alpha_only),
-        "rlottie": Rlottie(LIBS["rlottie"]),
+        "rlottie_2019": Rlottie(LIBS["rlottie_2019"]),
         "thorvg": Thorvg(LIBS["thorvg"]),
     }
 
@@ -1727,7 +1728,7 @@ def worker_accuracy(file_s: str) -> dict[str, Any]:
     counts: dict[str, int] = {}
     errors = []
     with ExitStack() as stack:
-        cpu_renderers = ("tlottie", "rlottie", "thorvg")
+        cpu_renderers = ACCURACY_RENDERERS
         for renderer in cpu_renderers:
             try:
                 stream = stack.enter_context(
@@ -1797,14 +1798,14 @@ def make_accuracy_row(
     }
     if errors:
         return row
-    consensus_available = all(name in rendered for name in ("tlottie", "rlottie", "thorvg"))
+    consensus_available = all(name in rendered for name in ACCURACY_RENDERERS)
     if consensus_available and len(set(counts.values())) != 1:
         row["frame_count_note"] = "mismatch:" + ",".join(
-            f"{name}={counts[name]}" for name in ("tlottie", "rlottie", "thorvg")
+            f"{name}={counts[name]}" for name in ACCURACY_RENDERERS
         )
     total = size * size
     if consensus_available:
-        available_frames = min(len(rendered[name]) for name in ("tlottie", "rlottie", "thorvg"))
+        available_frames = min(len(rendered[name]) for name in ACCURACY_RENDERERS)
         if available_frames <= 0:
             row["error"] = "no_frames"
             return row
@@ -1813,7 +1814,7 @@ def make_accuracy_row(
         worst_frame = 0
         for frame in range(available_frames):
             candidate = rendered["tlottie"][frame]
-            a = rendered["rlottie"][frame]
+            a = rendered["rlottie_2019"][frame]
             b = rendered["thorvg"][frame]
             bad, consensus = diff_from_consensus(candidate, a, b, tolerance, alpha_only, total)
             if consensus == 0:
@@ -2155,6 +2156,47 @@ def aggregate_accuracy(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return out
 
 
+def print_accuracy_summary(rows: list[dict[str, Any]]) -> None:
+    """Print a compact, timing-free summary for an accuracy-only run."""
+    by_pack = aggregate_accuracy(rows)
+    good = sum(1 for row in rows if row["ok"])
+    total = len(rows)
+    frames = sum(int(row.get("frames_tested") or 0) for row in rows)
+    errors = sum(
+        1
+        for row in rows
+        if row.get("error") and row.get("max_diff_percent") is None
+    )
+    ratio = 100.0 * good / total if total else 0.0
+    print(
+        f"== accuracy summary: {good}/{total} files passed ({ratio:.1f}%); "
+        f"{frames} frames compared; {errors} render/comparison error(s)",
+        flush=True,
+    )
+    for pack in sorted(by_pack):
+        summary = by_pack[pack]
+        pack_good = int(summary["good"])
+        pack_total = int(summary["total"])
+        pack_ratio = 100.0 * pack_good / pack_total if pack_total else 0.0
+        print(f"   {pack}: {pack_good}/{pack_total} ({pack_ratio:.1f}%)", flush=True)
+
+    failures = sorted(
+        (row for row in rows if not row["ok"]),
+        key=accuracy_row_diff,
+        reverse=True,
+    )
+    if failures:
+        print(f"== worst accuracy failures (showing up to 10/{len(failures)}):", flush=True)
+        for row in failures[:10]:
+            diff = row.get("max_diff_percent")
+            detail = (
+                f"{float(diff):.3f}% at frame {row.get('worst_frame')}"
+                if diff is not None
+                else row.get("error", "unknown error")
+            )
+            print(f"   {row['file']}: {detail}", flush=True)
+
+
 def save_diff_grids(
     rows: list[dict[str, Any]],
     root: Path,
@@ -2172,7 +2214,7 @@ def save_diff_grids(
     clear_diff_dir(out_dir)
     renderers = {
         "tlottie": Tlottie(LIBS["tlottie"], curve_tolerance, alpha_only),
-        "rlottie": Rlottie(LIBS["rlottie"]),
+        "rlottie_2019": Rlottie(LIBS["rlottie_2019"]),
         "thorvg": Thorvg(LIBS["thorvg"]),
     }
     written: list[Path] = []
@@ -2199,7 +2241,7 @@ def save_diff_grids(
                     (int(alpha) << 24) | (int(alpha) << 16) | (int(alpha) << 8) | int(alpha)
                     for alpha in values
                 ]
-        grid = make_diff_grid(images["tlottie"], images["rlottie"], images["thorvg"], size, tolerance)
+        grid = make_diff_grid(images["tlottie"], images["rlottie_2019"], images["thorvg"], size, tolerance)
         grid_width = 3 * size
         diff_percent = float(row.get("max_diff_percent") or 0.0)
         base = (
@@ -3814,6 +3856,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--no-accuracy", action="store_true")
     ap.add_argument(
+        "--accuracy-only",
+        action="store_true",
+        help=(
+            "host-only accuracy run using tlottie, rlottie_2019, and thorvg; "
+            "skips all timing passes and timing reports"
+        ),
+    )
+    ap.add_argument(
         "--alpha-only",
         "--single-color",
         dest="alpha_only",
@@ -3889,7 +3939,7 @@ def main(argv: list[str] | None = None) -> int:
             "that should be imported in --import-renderers; those renderers are kept "
             "in the report (columns copied from the file) but not run in this session. "
             "tlottie and tlottie-version sibling renderers can never be imported, and "
-            "accuracy still needs its reference renderers (rlottie, thorvg) available"
+            "accuracy still needs its reference renderers (rlottie_2019, thorvg) available"
         ),
     )
     ap.add_argument(
@@ -3918,6 +3968,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
 
+    if args.accuracy_only and args.no_accuracy:
+        raise SystemExit("--accuracy-only conflicts with --no-accuracy")
+    if args.accuracy_only and args.android is not None:
+        raise SystemExit("--accuracy-only is host-only and cannot be used with --android")
+    if args.accuracy_only and args.import_results is not None:
+        raise SystemExit("--accuracy-only cannot import timing results")
+    if args.accuracy_only and args.tlottie_version:
+        raise SystemExit("--accuracy-only uses only tlottie, rlottie_2019, and thorvg")
+
     if args.vs is not None:
         vs_parts = [part.strip() for part in args.vs.split(",")]
         if len(vs_parts) != 2 or not all(vs_parts):
@@ -3944,8 +4003,11 @@ def main(argv: list[str] | None = None) -> int:
     bad = [r for r in renderers if r not in RENDERERS]
     if bad:
         raise SystemExit(f"unknown renderers: {', '.join(bad)}")
-    comparison_pair(renderers, args.vs_pair)
+    if not args.accuracy_only:
+        comparison_pair(renderers, args.vs_pair)
     sizes = tuple(int(s) for s in args.sizes.split(",") if s)
+    if not sizes or any(size <= 0 for size in sizes):
+        raise SystemExit("--sizes must contain positive integers")
     if args.reps <= 0:
         raise SystemExit("--reps must be positive")
     if args.frames < 0:
@@ -3996,10 +4058,14 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
     measured_renderers = tuple(r for r in renderers if r not in imported)
-    required_renderers = set(measured_renderers)
+    required_renderers = (
+        set(ACCURACY_RENDERERS)
+        if args.accuracy_only
+        else set(measured_renderers)
+    )
     if not args.no_accuracy:
         required_renderers.add("tlottie")
-        required_renderers.update(("rlottie", "thorvg"))
+        required_renderers.update(ACCURACY_RENDERERS[1:])
     ensure_builds(args.skip_build, required_renderers)
     for r in required_renderers:
         if not LIBS[r].exists():
@@ -4034,12 +4100,61 @@ def main(argv: list[str] | None = None) -> int:
     mode = " Alpha8" if args.alpha_only else ""
     print(f"== tlottie{mode} curve tolerance {args.curve_tolerance:g}px", flush=True)
 
+    accuracy_size = args.accuracy_size or max(sizes)
+    if accuracy_size <= 0:
+        raise SystemExit("--accuracy-size must be positive")
+    if args.accuracy_only:
+        accuracy_frame_label = (
+            "all frames" if args.frames == 0 else f"first {args.frames} frame(s)"
+        )
+        print(
+            f"== accuracy-only {accuracy_size}px {accuracy_frame_label}: "
+            f"{len(files)} files, {args.jobs} workers, "
+            f"pixel tolerance {args.accuracy_tolerance}, "
+            f"broken if diff > {args.accuracy_diff_threshold:g}%",
+            flush=True,
+        )
+        accuracy_rows = run_accuracy(
+            files,
+            args.input,
+            accuracy_size,
+            args.frames,
+            args.accuracy_tolerance,
+            args.accuracy_diff_threshold,
+            args.jobs,
+            args.curve_tolerance,
+            args.alpha_only,
+        )
+        print_accuracy_summary(accuracy_rows)
+        if args.save_diffs:
+            diff_dir = args.diff_dir or (args.out / "diffs")
+            print(
+                f"== writing up to {args.save_diffs} diff grid(s) to {diff_dir}",
+                flush=True,
+            )
+            diff_paths = save_diff_grids(
+                accuracy_rows,
+                args.input,
+                diff_dir,
+                args.save_diffs,
+                accuracy_size,
+                args.accuracy_tolerance,
+                args.curve_tolerance,
+                args.alpha_only,
+            )
+            print(f"wrote {len(diff_paths)} diff grid(s)", flush=True)
+        if args.write_raw:
+            accuracy_raw = args.out / "benchmark-accuracy.raw.json"
+            accuracy_raw.write_text(json.dumps(accuracy_rows, indent=2), encoding="utf-8")
+            print(f"wrote {accuracy_raw}")
+        print("== timing skipped; no benchmark.tgv or benchmark.html generated", flush=True)
+        return 0
+
     all_rows: list[dict[str, Any]] = []
     accuracy_rows: list[dict[str, Any]] = []
     accuracy_by_pack: dict[str, dict[str, Any]] | None = None
-    accuracy_size = args.accuracy_size or max(sizes)
     accuracy_frame_label = "all frames" if args.frames == 0 else f"first {args.frames} frame(s)"
-    accuracy_renderers = ("tlottie", "rlottie", "thorvg")
+    accuracy_renderers = ACCURACY_RENDERERS
     if not args.no_accuracy:
         for required in accuracy_renderers:
             if not LIBS[required].exists():
