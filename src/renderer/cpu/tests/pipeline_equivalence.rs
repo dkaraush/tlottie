@@ -176,6 +176,28 @@ fn shape_layer_opacity_is_applied_after_paints_are_flattened() {
 }
 
 #[test]
+fn orphan_matte_source_remains_visible() {
+  // A newer export can reference a source below its consumer with `tp`.
+  // Like rlottie, our adjacent-matte fallback ignores `tp` and must not
+  // also discard the otherwise unconsumed `td` source.
+  for hidden in [false, true] {
+    let json = format!(
+      r##"{{"fr":30,"ip":0,"op":2,"w":4,"h":4,"layers":[
+      {{"ty":1,"ind":1,"tt":1,"tp":2,"sw":4,"sh":4,"sc":"#000000","ip":0,"op":2}},
+      {{"ty":1,"ind":2,"td":1,"hd":{hidden},"sw":4,"sh":4,"sc":"#00ff00","ip":0,"op":1}}
+    ]}}"##
+    );
+    let composition = Composition::parse(json.as_bytes(), &Limits::default()).unwrap();
+    let mut renderer = crate::CPURenderer::new(composition);
+    let mut pixels = [0u32; 16];
+    renderer.render(0.0, &mut pixels, 4, 4, RenderOptions::default()).unwrap();
+    assert_eq!(pixels[5], if hidden { 0 } else { 0xff00_ff00 });
+    renderer.render(1.0, &mut pixels, 4, 4, RenderOptions::default()).unwrap();
+    assert_eq!(pixels[5], 0);
+  }
+}
+
+#[test]
 fn matte_source_precomp_opacity_is_applied_after_flattening() {
   let composition = Composition::parse(
     br##"{"fr":30,"ip":0,"op":1,"w":4,"h":4,
