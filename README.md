@@ -7,7 +7,7 @@ Library for drawing [lottie animations](https://en.wikipedia.org/wiki/Lottie_(fi
 - Support of `fitz` modifier and color replacements.
 - Support of rendering into only alpha channel bitmap.
 - Safe. Lottie JSON is treated as untrusted input.
-- Zero dependencies.
+- Zero[^1] dependencies.
 
 ### Building (Native)
 
@@ -34,3 +34,5 @@ Frame time, mainly compared to [rlottie2019](https://github.com/TelegramMessenge
 - [android arm, Samsung F15](https://dkaraush.github.io/tlottie/benchmarks/android-f15.html): **-62.7%** at 64px, **-42.0%** at 320px, **-23.0%** at 720px
 - [macOS arm](https://dkaraush.github.io/tlottie/benchmarks/macos.html): **-61.5%** at 64px, **-47.6%** at 320px, **-27.3%** at 720px
 - [linux x86](https://dkaraush.github.io/tlottie/benchmarks/linux.html): **-70.0%** at 64px, **-50.2%** at 320px, **-36.4%** at 720px
+
+[^1]: `hashbrown` library is taken as a substitute for hashmaps to avoid `std` in Rust.
