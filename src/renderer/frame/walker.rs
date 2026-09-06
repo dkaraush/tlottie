@@ -454,7 +454,9 @@ impl RenderCtx<'_> {
       }
     }
     for (idx, layer) in layers.iter().enumerate().rev() {
-      if consumed_as_matte.get(idx).copied().unwrap_or(false) || layer.matte_src || !self.layer_visible(layer, frame) {
+      // Match rlottie's adjacent-matte behavior: `td` alone does not hide
+      // a layer. Only an actual consumer below marks it as matte-only.
+      if consumed_as_matte.get(idx).copied().unwrap_or(false) || !self.layer_visible(layer, frame) {
         continue;
       }
       let (layer_m, layer_opacity) = layer_transform_at(layer, frame);

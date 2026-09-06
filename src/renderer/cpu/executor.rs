@@ -375,9 +375,6 @@ impl RenderCtx<'_> {
       if consumed_as_matte.get(idx).copied().unwrap_or(false) {
         continue;
       }
-      if layer.matte_src {
-        continue; // matte-only layer without a consumer right below
-      }
       if !self.layer_visible(layer, frame) {
         continue;
       }

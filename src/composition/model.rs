@@ -138,7 +138,8 @@ pub(crate) struct Layer {
   /// `tt`: this layer is matted by the layer above (1 alpha, 2 alpha-inv,
   /// 3 luma, 4 luma-inv).
   pub matte: Option<u8>,
-  /// `td`: this layer only serves as a matte source; not drawn directly.
+  /// `td`: authored matte-source marker. Rendering uses adjacent `tt`
+  /// consumers to determine matte-only layers, matching rlottie.
   pub matte_src: bool,
   /// Solid layer (ty=1): width, height, color.
   pub solid: Option<(f32, f32, Color)>,
