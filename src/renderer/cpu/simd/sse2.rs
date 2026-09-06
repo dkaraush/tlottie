@@ -32,10 +32,10 @@
 //! `#[target_feature(enable = "sse2")]` function.
 
 use core::arch::x86_64::{
-  __m128, __m128i, _mm_add_epi16, _mm_add_ps, _mm_and_ps, _mm_and_si128, _mm_andnot_ps, _mm_andnot_si128, _mm_castps_si128, _mm_castsi128_ps, _mm_cmpeq_epi16, _mm_cmpeq_epi32, _mm_cmpge_ps, _mm_cmplt_ps,
-  _mm_cmpunord_ps, _mm_cvtsi32_si128, _mm_cvttps_epi32, _mm_loadu_si128, _mm_max_epi16, _mm_max_ps, _mm_min_epi16, _mm_min_ps, _mm_movemask_epi8, _mm_mul_ps, _mm_mullo_epi16, _mm_or_ps, _mm_or_si128,
-  _mm_packus_epi16, _mm_set1_epi16, _mm_set1_epi32, _mm_set1_ps, _mm_setr_epi16, _mm_setr_ps, _mm_setzero_ps, _mm_setzero_si128, _mm_shufflehi_epi16, _mm_shufflelo_epi16, _mm_sqrt_ps, _mm_srli_epi16,
-  _mm_storeu_si128, _mm_sub_epi16, _mm_sub_ps, _mm_unpackhi_epi8, _mm_unpacklo_epi16, _mm_unpacklo_epi8,
+  __m128, __m128i, _mm_add_epi16, _mm_add_ps, _mm_and_ps, _mm_and_si128, _mm_andnot_ps, _mm_andnot_si128, _mm_castps_si128, _mm_castsi128_ps, _mm_cmpeq_epi16, _mm_cmpeq_epi32, _mm_cmpge_ps,
+  _mm_cmplt_ps, _mm_cmpunord_ps, _mm_cvtsi32_si128, _mm_cvttps_epi32, _mm_loadu_si128, _mm_max_epi16, _mm_max_ps, _mm_min_epi16, _mm_min_ps, _mm_movemask_epi8, _mm_mul_ps, _mm_mullo_epi16, _mm_or_ps,
+  _mm_or_si128, _mm_packus_epi16, _mm_set1_epi16, _mm_set1_epi32, _mm_set1_ps, _mm_setr_epi16, _mm_setr_ps, _mm_setzero_ps, _mm_setzero_si128, _mm_shufflehi_epi16, _mm_shufflelo_epi16, _mm_sqrt_ps,
+  _mm_srli_epi16, _mm_storeu_si128, _mm_sub_epi16, _mm_sub_ps, _mm_unpackhi_epi8, _mm_unpacklo_epi16, _mm_unpacklo_epi8,
 };
 
 /// Widens the low 8 bytes to u16 lanes.

@@ -10,11 +10,7 @@ pub(crate) fn build_gradient_lut(stops: &FloatList, color_count: usize, opacity:
   let n = color_count.min(data.len() / 4);
   let mut lut = [0u32; GRADIENT_LUT_SIZE];
   let opac = data.get(n * 4..).unwrap_or(&[]);
-  // rlottie consumes at most one opacity pair per color stop (lottiemodel.cpp
-  // populate: `j` advances alongside `i`); leftover trailing pairs never reach
-  // the stop list, so the pad color keeps the last consumed pair's opacity.
-  let opacity_stop_count = if opac.len() >= 4 && opac.len() % 2 == 0 { (opac.len() / 2).min(n) } else { 0 };
-  let opac = opac.get(..opacity_stop_count.saturating_mul(2)).unwrap_or(opac);
+  let opacity_stop_count = if opac.len() >= 4 && opac.len() % 2 == 0 { opac.len() / 2 } else { 0 };
   let uniform_stop_alpha = if opacity_stop_count == 0 {
     Some(1.0)
   } else {
@@ -66,7 +62,7 @@ pub(crate) fn build_gradient_lut(stops: &FloatList, color_count: usize, opacity:
       let last = opacity_stop(opacity_stop_count - 1);
       if t <= first.0 {
         first.1
-      } else if t >= last.0 {
+      } else if t > last.0 {
         last.1
       } else {
         let mut out = last.1;
@@ -612,10 +608,13 @@ impl Canvas<'_> {
         PlaneData::Src(_) => {}
       }
       if had && !src_rows.is_empty() {
-        cache.insert(src_key, CovEntry {
-          rows: src_rows,
-          data: PlaneData::Src(src_data),
-        });
+        cache.insert(
+          src_key,
+          CovEntry {
+            rows: src_rows,
+            data: PlaneData::Src(src_data),
+          },
+        );
       }
       return;
     }
@@ -706,7 +705,6 @@ impl Canvas<'_> {
       cache.insert(key, entry);
     }
   }
-
 }
 
 /// gradient_row variant that also CAPTURES the premultiplied,

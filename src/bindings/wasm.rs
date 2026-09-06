@@ -1,9 +1,9 @@
 #![allow(unsafe_code)]
 
+use alloc::alloc::{alloc, dealloc};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use alloc::alloc::{alloc, dealloc};
 use core::alloc::Layout;
 
 use crate::{CPURenderer, Composition, FitzModifier, LayerColorReplacement, Limits, ParseOptions, RenderOptions};

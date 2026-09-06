@@ -19,12 +19,11 @@
 //! the zero source = transparent, exactly like the scalar `lut.get(idx).unwrap_or(0)`.
 
 use core::arch::x86_64::{
-  _CMP_GE_OQ, _CMP_LT_OQ, _CMP_UNORD_Q, __m512, __m512i, _mm256_setr_epi16, _mm512_add_epi16, _mm512_add_ps, _mm512_and_ps, _mm512_castps_si512, _mm512_castsi128_si512,
-  _mm512_castsi256_si512, _mm512_castsi512_ps, _mm512_castsi512_si256, _mm512_cmpeq_epi16_mask, _mm512_cmpeq_epi32_mask, _mm512_cmp_ps_mask, _mm512_cvtepu8_epi16, _mm512_cvttps_epi32, _mm512_cvtusepi16_epi8,
-  _mm512_extracti64x4_epi64, _mm512_inserti32x4, _mm512_inserti64x4, _mm512_loadu_si512, _mm512_mask_i32gather_epi32, _mm512_mask_mov_epi32, _mm512_max_epi16, _mm512_max_ps,
-  _mm512_min_epi16, _mm512_min_ps, _mm512_mul_ps, _mm512_mullo_epi16, _mm512_set1_epi16, _mm512_set1_epi32, _mm512_set1_ps, _mm512_setr_ps, _mm512_setzero_ps, _mm512_setzero_si512,
-  _mm512_shufflehi_epi16, _mm512_shufflelo_epi16, _mm512_sqrt_ps, _mm512_srli_epi16, _mm512_storeu_si512, _mm512_sub_epi16, _mm512_sub_ps, _mm_cvtsi32_si128, _mm_unpacklo_epi8,
-  _mm_unpacklo_epi16,
+  __m512, __m512i, _mm256_setr_epi16, _mm512_add_epi16, _mm512_add_ps, _mm512_and_ps, _mm512_castps_si512, _mm512_castsi128_si512, _mm512_castsi256_si512, _mm512_castsi512_ps, _mm512_castsi512_si256,
+  _mm512_cmp_ps_mask, _mm512_cmpeq_epi16_mask, _mm512_cmpeq_epi32_mask, _mm512_cvtepu8_epi16, _mm512_cvttps_epi32, _mm512_cvtusepi16_epi8, _mm512_extracti64x4_epi64, _mm512_inserti32x4,
+  _mm512_inserti64x4, _mm512_loadu_si512, _mm512_mask_i32gather_epi32, _mm512_mask_mov_epi32, _mm512_max_epi16, _mm512_max_ps, _mm512_min_epi16, _mm512_min_ps, _mm512_mul_ps, _mm512_mullo_epi16,
+  _mm512_set1_epi16, _mm512_set1_epi32, _mm512_set1_ps, _mm512_setr_ps, _mm512_setzero_ps, _mm512_setzero_si512, _mm512_shufflehi_epi16, _mm512_shufflelo_epi16, _mm512_sqrt_ps, _mm512_srli_epi16,
+  _mm512_storeu_si512, _mm512_sub_epi16, _mm512_sub_ps, _mm_cvtsi32_si128, _mm_unpacklo_epi16, _mm_unpacklo_epi8, _CMP_GE_OQ, _CMP_LT_OQ, _CMP_UNORD_Q,
 };
 
 /// Widens the low 32 bytes of `v` (8 RGBA pixels / 32 Alpha8) to 32 u16 lanes.
@@ -254,13 +253,7 @@ pub(super) fn fill_span_solid_avx512(dst: &mut [u32], cov: &[u8], sr: u32, sg: u
     let crep2 = _mm_unpacklo_epi16(_mm_unpacklo_epi8(c2, c2), _mm_unpacklo_epi8(c2, c2));
     let c3 = _mm_cvtsi32_si128(u32::from_le_bytes(cpx[12..16].try_into().unwrap_or([0; 4])) as i32);
     let crep3 = _mm_unpacklo_epi16(_mm_unpacklo_epi8(c3, c3), _mm_unpacklo_epi8(c3, c3));
-    let crep = _mm512_inserti32x4::<3>(
-      _mm512_inserti32x4::<2>(
-        _mm512_inserti32x4::<1>(_mm512_castsi128_si512(crep0), crep1),
-        crep2,
-      ),
-      crep3,
-    );
+    let crep = _mm512_inserti32x4::<3>(_mm512_inserti32x4::<2>(_mm512_inserti32x4::<1>(_mm512_castsi128_si512(crep0), crep1), crep2), crep3);
     let cl_l = div255_round(_mm512_mullo_epi16(lo(crep), sa_w));
     let cl_h = div255_round(_mm512_mullo_epi16(hi(crep), sa_w));
     let s_l = div255_round(_mm512_mullo_epi16(src_pat, cl_l));
@@ -332,7 +325,10 @@ fn max_ps_rust(a: __m512, b: __m512) -> __m512 {
 #[inline]
 #[target_feature(enable = "avx2,avx512f,avx512bw,avx512dq,avx512vl")]
 fn lane_columns(x_start: f32) -> __m512 {
-  _mm512_add_ps(_mm512_set1_ps(x_start), _mm512_setr_ps(0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0))
+  _mm512_add_ps(
+    _mm512_set1_ps(x_start),
+    _mm512_setr_ps(0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0),
+  )
 }
 
 /// Clamp + LUT index conversion shared by the gradient kernels:
@@ -531,14 +527,7 @@ pub(super) fn fill_span_opaque_avx512(dst: &mut [u32], cov: &[u8], color: u32) {
         _mm512_storeu_si512(dpx.as_mut_ptr().cast(), colorv)
       }
     } else {
-      super::fill_span_solid_scalar(
-        dpx,
-        cpx,
-        (color >> 0) & 0xff,
-        (color >> 8) & 0xff,
-        (color >> 16) & 0xff,
-        255,
-      );
+      super::fill_span_solid_scalar(dpx, cpx, (color >> 0) & 0xff, (color >> 8) & 0xff, (color >> 16) & 0xff, 255);
     }
   }
 }

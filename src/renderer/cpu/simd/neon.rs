@@ -3,9 +3,9 @@
 //! stays <= 65407.
 
 use core::arch::aarch64::{
-  float32x4_t, uint16x8_t, uint32x4_t, uint8x16_t, uint8x8x4_t, vabsq_f32, vaddq_f32, vaddq_u16, vandq_u32, vbslq_u32, vceqq_u16, vcgeq_f32, vcltq_f32, vcombine_u8, vcvtq_u32_f32, vdupq_n_f32, vdupq_n_u16, vdupq_n_u32,
-  vget_high_u8, vget_low_u8, vgetq_lane_u32, vld1_u8, vld1q_f32, vld1q_u8, vld4_u8, vmaxq_f32, vmaxq_u16, vminq_f32, vminq_u16, vminvq_u16, vminv_u8, vmovl_u8, vmovn_u16, vmulq_f32, vmulq_u16, vnegq_f32,
-  vshrq_n_u16, vsqrtq_f32, vst1q_u32, vst1q_u8, vst4_u8, vsubq_f32, vsubq_u16,
+  float32x4_t, uint16x8_t, uint32x4_t, uint8x16_t, uint8x8x4_t, vabsq_f32, vaddq_f32, vaddq_u16, vandq_u32, vbslq_u32, vceqq_u16, vcgeq_f32, vcltq_f32, vcombine_u8, vcvtq_u32_f32, vdupq_n_f32,
+  vdupq_n_u16, vdupq_n_u32, vget_high_u8, vget_low_u8, vgetq_lane_u32, vld1_u8, vld1q_f32, vld1q_u8, vld4_u8, vmaxq_f32, vmaxq_u16, vminq_f32, vminq_u16, vminv_u8, vminvq_u16, vmovl_u8, vmovn_u16,
+  vmulq_f32, vmulq_u16, vnegq_f32, vshrq_n_u16, vsqrtq_f32, vst1q_u32, vst1q_u8, vst4_u8, vsubq_f32, vsubq_u16,
 };
 
 /// Exact `(n + 127) / 255` on u16 lanes (n <= 65025).

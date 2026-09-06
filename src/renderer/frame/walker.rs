@@ -103,7 +103,19 @@ struct StaticContext {
 
 impl StaticContext {
   #[allow(clippy::too_many_arguments)]
-  fn new(comp: &Composition, layer: &Layer, matrix: Mat2x3, opacity: f32, color: Option<Color>, width: usize, height: usize, antialias: bool, curve_tolerance: f32, clip: &ClipQuad, dynamic: bool) -> Self {
+  fn new(
+    comp: &Composition,
+    layer: &Layer,
+    matrix: Mat2x3,
+    opacity: f32,
+    color: Option<Color>,
+    width: usize,
+    height: usize,
+    antialias: bool,
+    curve_tolerance: f32,
+    clip: &ClipQuad,
+    dynamic: bool,
+  ) -> Self {
     let color = match color {
       Some(color) => [1, color.r.to_bits(), color.g.to_bits(), color.b.to_bits(), color.a.to_bits()],
       None => [0; 5],
@@ -271,7 +283,15 @@ impl StaticJobCache {
     }
     self.bytes = self.bytes.saturating_add(bytes);
     let apply_layer_alpha = context.dynamic;
-    self.entries.insert(signature, CachedLayerJobs { context, jobs, bytes, apply_layer_alpha });
+    self.entries.insert(
+      signature,
+      CachedLayerJobs {
+        context,
+        jobs,
+        bytes,
+        apply_layer_alpha,
+      },
+    );
   }
 
   fn reject(&mut self, signature: u128) {
@@ -480,7 +500,23 @@ impl RenderCtx<'_> {
         )?;
         self.collect_masks(width, height, src, source_matrix, frame, clip, renderer);
         renderer.save_layer();
-        self.collect_layer_content(scratch, static_jobs, width, height, antialias, layer, m, frame, 1.0, inherited_color, clip, precomp_depth, 1.0, false, renderer)?;
+        self.collect_layer_content(
+          scratch,
+          static_jobs,
+          width,
+          height,
+          antialias,
+          layer,
+          m,
+          frame,
+          1.0,
+          inherited_color,
+          clip,
+          precomp_depth,
+          1.0,
+          false,
+          renderer,
+        )?;
         self.collect_masks(width, height, layer, m, frame, clip, renderer);
         renderer.end_layer(Composite::Matte {
           kind,
@@ -536,7 +572,13 @@ impl RenderCtx<'_> {
         layer,
         m,
         frame,
-        if isolate { 1.0 } else if dynamic_translucent { 1.0 } else { combined_opacity },
+        if isolate {
+          1.0
+        } else if dynamic_translucent {
+          1.0
+        } else {
+          combined_opacity
+        },
         inherited_color,
         clip,
         precomp_depth,
@@ -601,7 +643,21 @@ impl RenderCtx<'_> {
         // Animated-opacity layers keep the frozen-at-100% paint: their
         // geometry transform is static, so the real-matrix capture is still
         // cacheable and every replay re-applies the current layer opacity.
-        let static_context = layer_static.then(|| StaticContext::new(self.comp, layer, m, content_opacity, color_override, width, height, antialias, self.curve_tolerance, clip, dynamic_layer));
+        let static_context = layer_static.then(|| {
+          StaticContext::new(
+            self.comp,
+            layer,
+            m,
+            content_opacity,
+            color_override,
+            width,
+            height,
+            antialias,
+            self.curve_tolerance,
+            clip,
+            dynamic_layer,
+          )
+        });
         let signature = static_context.as_ref().map(StaticContext::signature);
         let replay_hit = if let (Some(context), Some(signature)) = (static_context.as_ref(), signature) {
           static_jobs.replay(signature, context, 0.0, 0.0, layer_alpha, renderer)

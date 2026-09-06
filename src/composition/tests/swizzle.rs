@@ -6,7 +6,7 @@
 //! `end` value, a solid layer, a nested group), the two renders stop being
 //! byte-swaps of each other and these tests fail.
 
-use crate::{ChannelOrder, Composition, CPURenderer, Limits, ParseOptions, RenderOptions};
+use crate::{CPURenderer, ChannelOrder, Composition, Limits, ParseOptions, RenderOptions};
 
 /// `0xAABBGGRR` -> `0xAARRGGBB`; green and alpha stay put.
 fn swap_rb(pixel: u32) -> u32 {
