@@ -605,8 +605,9 @@ fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
             return Err(Error::LimitExceeded(Limit::GradientStrokesPerGroup));
           }
         }
-        max_dashed_source_segment = max_dashed_source_segment.max(max_path_segment_span(&s));
-        dashed_source_len += path_segment_span_sum(&s);
+        let (segment_span, path_span) = path_span_metrics(&s);
+        max_dashed_source_segment = max_dashed_source_segment.max(segment_span);
+        dashed_source_len += path_span;
         if is_geometry_source(&s) {
           source_items += 1;
         }
@@ -781,34 +782,83 @@ fn property_max_abs_f32(property: &Property<f32>) -> Option<f32> {
   }
 }
 
-fn max_path_segment_span(shape: &Shape) -> f32 {
-  let Shape::Path(path) = shape else {
-    return 0.0;
-  };
-  let data = path.path.eval(0.0);
-  data
-    .vertices
-    .windows(2)
-    .map(|w| match w {
-      [a, b] => (b.x - a.x).abs().max((b.y - a.y).abs()),
-      _ => 0.0,
-    })
-    .fold(0.0, f32::max)
+/// Every `PathData` a path property can evaluate to. Interpolated frames
+/// stay within their two keyframes, so the authored ones bound the timeline.
+fn path_keyframe_values(property: &Property<PathData>) -> Vec<&PathData> {
+  match property {
+    Property::Static(data) => vec![data],
+    Property::Animated(timeline) => {
+      let mut values = Vec::with_capacity(2 * (timeline.rest.len() + 1));
+      values.push(&timeline.first.value);
+      values.extend(timeline.first.end.as_ref());
+      for keyframe in &timeline.rest {
+        values.push(&keyframe.value);
+        values.extend(keyframe.end.as_ref());
+      }
+      values
+    }
+  }
 }
 
-fn path_segment_span_sum(shape: &Shape) -> f32 {
+/// Upper bound on one cubic's arclength, in the Chebyshev metric the dash
+/// limits use: the control polygon. chord <= L <= polygon holds for any
+/// bezier (Gravesen, "Adaptive subdivision and the length and energy of
+/// Bezier curves", Comput. Geom. 8 (1997)); with zero tangents polygon ==
+/// chord, so straight paths score exactly what they scored before.
+///
+/// A bound, not an estimate, on purpose: the chord measures zero for a
+/// segment with both endpoints on one coordinate while its tangents still
+/// pull the real curve ~294k px out and back (bbox.tgs), which a 0.005
+/// dash period then slices into ~1.3e9 pieces. That curve also has a cusp
+/// at t=0.5, exactly where the cheaper arclength estimates lose their
+/// guarantees, so the guard rests on the inequality instead.
+fn cubic_span(a: Vec2, out_a: Vec2, in_b: Vec2, b: Vec2) -> f32 {
+  let hop = |px: f32, py: f32, qx: f32, qy: f32| (qx - px).abs().max((qy - py).abs());
+  let (c0x, c0y) = (a.x + out_a.x, a.y + out_a.y);
+  let (c1x, c1y) = (b.x + in_b.x, b.y + in_b.y);
+  let span = hop(a.x, a.y, c0x, c0y) + hop(c0x, c0y, c1x, c1y) + hop(c1x, c1y, b.x, b.y);
+  //NOTE: a NaN would slip through the max()/sum() comparisons downstream
+  if span.is_finite() {
+    span
+  } else {
+    f32::MAX
+  }
+}
+
+/// `(longest segment, total length)` of one path keyframe.
+fn path_data_span(data: &PathData) -> (f32, f32) {
+  let count = data.vertices.len();
+  // A closed single-vertex path still has a cubic back to itself.
+  if count == 0 {
+    return (0.0, 0.0);
+  }
+  let at = |list: &[Vec2], i: usize| list.get(i).copied().unwrap_or(Vec2::new(0.0, 0.0));
+  let last = if data.closed { count } else { count - 1 };
+  let mut max = 0.0f32;
+  let mut sum = 0.0f32;
+  for i in 0..last {
+    let j = if i + 1 == count { 0 } else { i + 1 };
+    let span = cubic_span(at(&data.vertices, i), at(&data.out_tangents, i), at(&data.in_tangents, j), at(&data.vertices, j));
+    max = max.max(span);
+    sum += span;
+  }
+  (max, sum)
+}
+
+/// `(longest segment, total length)` over the path timeline. Totals are
+/// maxed across keyframes, not summed: the dasher only sees one frame.
+fn path_span_metrics(shape: &Shape) -> (f32, f32) {
   let Shape::Path(path) = shape else {
-    return 0.0;
+    return (0.0, 0.0);
   };
-  let data = path.path.eval(0.0);
-  data
-    .vertices
-    .windows(2)
-    .map(|w| match w {
-      [a, b] => (b.x - a.x).abs().max((b.y - a.y).abs()),
-      _ => 0.0,
-    })
-    .sum()
+  let mut max = 0.0f32;
+  let mut total = 0.0f32;
+  for data in path_keyframe_values(&path.path) {
+    let (segment_max, segment_sum) = path_data_span(data);
+    max = max.max(segment_max);
+    total = total.max(segment_sum);
+  }
+  (max, total)
 }
 
 fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &mut ShapeCounts) -> Result<ParsedItem> {
