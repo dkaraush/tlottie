@@ -1359,7 +1359,12 @@ def worker_measure(file_s: str) -> tuple[list[dict[str, Any]], dict[str, Any] | 
     counts: dict[str, int] = {}
     accuracy_errors: list[str] = []
     for rep in range(_WORKER_REPS):
-        for renderer in _WORKER_RENDERER_ORDER:
+        # Balance execution order: the second renderer otherwise always gets
+        # the allocator/cache state left by the first. With the default two
+        # repetitions, an A/B comparison measures both AB and BA for every file.
+        start = (zlib.crc32(str(file.relative_to(_WORKER_ROOT)).encode()) + rep) % len(_WORKER_RENDERER_ORDER)
+        order = _WORKER_RENDERER_ORDER[start:] + _WORKER_RENDERER_ORDER[:start]
+        for renderer in order:
             energy_before = task_energy_nj()
             (
                 ok,

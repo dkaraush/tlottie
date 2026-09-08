@@ -31,12 +31,22 @@ impl Budget {
   pub(crate) fn layers(&self, amount: usize) -> Result<()> {
     Self::charge(&self.layers, amount, Limits::default().max_precomp_expansion, Limit::PrecompExpansion)
   }
-  pub(crate) fn path(&self, data: &crate::model::PathData, matrix: &crate::math::Mat2x3, tolerance: f32) -> Result<()> {
+  pub(crate) fn path(&self, data: &crate::model::PathData, matrix: &crate::math::Mat2x3, tolerance: f32) -> Result<usize> {
     use crate::math::Vec2;
     let limits = Limits::default();
     let n = data.vertices.len();
     if n.max(data.in_tangents.len()).max(data.out_tangents.len()) > limits.max_path_points {
       return Err(Error::LimitExceeded(Limit::PathPoints));
+    }
+    // Reserve the flattener's proven maximum before any expansion. Usually
+    // this fits without examining coordinates or calculating subdivisions.
+    // Refund unused capacity after flattening. Near the allocation limit,
+    // retain the precise preflight so valid complex paths still fit.
+    let segments = if data.closed { n } else { n.saturating_sub(1) };
+    let maximum = segments.saturating_mul(crate::geometry::MAX_SEGS).saturating_add(1);
+    if maximum <= Limits::default().max_render_points.saturating_sub(self.points.get()) {
+      self.points(maximum)?;
+      return Ok(maximum);
     }
     let mut points = 1usize;
     let segments = if data.closed { n } else { n.saturating_sub(1) };
@@ -60,7 +70,12 @@ impl Budget {
       };
       points = points.saturating_add(count);
     }
-    self.points(points)
+    self.points(points)?;
+    Ok(points)
+  }
+  pub(crate) fn finish_expansion(&self, reserved: usize, actual: usize) {
+    debug_assert!(actual <= reserved);
+    self.points.set(self.points.get().saturating_sub(reserved.saturating_sub(actual.max(1))));
   }
 }
 
@@ -78,6 +93,14 @@ pub(crate) fn canvas_size(width: u32, height: u32) -> Result<usize> {
   Ok(pixels)
 }
 
+/// Bounds belong to the same immutable geometry key as retained coverage.
+#[derive(Clone, Copy)]
+pub(crate) struct DrawCost {
+  work: usize,
+  pixels: usize,
+  sparse: bool,
+}
+
 pub(crate) struct GuardedRenderer<'a, R> {
   inner: &'a mut R,
   width: usize,
@@ -86,10 +109,10 @@ pub(crate) struct GuardedRenderer<'a, R> {
   pixels: Cell<usize>,
   budget: Budget,
   error: Option<Error>,
-  pub(crate) pixel_costs: crate::compat::HashMap<u128, usize>,
+  pub(crate) pixel_costs: crate::compat::HashMap<u128, DrawCost>,
 }
 impl<'a, R: FrameRenderer> GuardedRenderer<'a, R> {
-  pub(crate) fn new(inner: &'a mut R, width: u32, height: u32, pixel_costs: crate::compat::HashMap<u128, usize>) -> Self {
+  pub(crate) fn new(inner: &'a mut R, width: u32, height: u32, pixel_costs: crate::compat::HashMap<u128, DrawCost>) -> Self {
     Self {
       inner,
       width: width as usize,
@@ -121,33 +144,32 @@ impl<'a, R: FrameRenderer> GuardedRenderer<'a, R> {
       Limit::RenderWork,
     )
   }
-  fn geometry(&mut self, geometry: Geometry<'_>, pixel_weight: usize) -> Result<()> {
-    let mut work = 0usize;
-    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for contour in geometry.contours() {
-      let mut points = contour.points();
-      let Some(first) = points.next() else { continue };
-      let mut previous = first;
-      for point in points.chain(core::iter::once(first)) {
-        if !point.x.is_finite() || !point.y.is_finite() || !previous.x.is_finite() || !previous.y.is_finite() {
-          return Err(Error::LimitExceeded(Limit::PathCoordinate));
-        }
-        // Conservative cell-deposit bound after viewport clipping. Charge
-        // scanline splits as well as horizontal crossings; no per-pixel check.
-        x0 = x0.min(point.x);
-        y0 = y0.min(point.y);
-        x1 = x1.max(point.x);
-        y1 = y1.max(point.y);
-        let dx = (point.x.clamp(0.0, self.width as f32) - previous.x.clamp(0.0, self.width as f32)).abs();
-        let dy = (point.y.clamp(0.0, self.height as f32) - previous.y.clamp(0.0, self.height as f32)).abs();
-        work = work.saturating_add((dx + 2.0 * dy) as usize + 8);
-        previous = point;
-      }
+  fn geometry(&mut self, geometry: &mut Geometry<'_>, pixel_weight: usize) -> Result<()> {
+    let translation = geometry.raw_translation();
+    if !translation.x.is_finite() || !translation.y.is_finite() {
+      return Err(Error::LimitExceeded(Limit::PathCoordinate));
     }
+    if let Some(cost) = self.pixel_costs.get(&geometry.cache_key) {
+      self.budget.work(cost.work)?;
+      geometry.raster_mode = Some(cost.sparse);
+      return Budget::charge(&self.pixels, cost.pixels.saturating_mul(pixel_weight), Limits::default().max_render_pixels, Limit::RenderWork);
+    }
+    let metrics = crate::geometry::RasterMetrics::new(geometry.raw_contours());
+    if !metrics.perim.is_finite() {
+      return Err(Error::LimitExceeded(Limit::PathCoordinate));
+    }
+    // Twice the Manhattan perimeter bounds horizontal + twice vertical
+    // crossings. Add fixed per-edge overhead before raster allocation.
+    let work = ((metrics.perim * 2.0).ceil() as usize).saturating_add(metrics.points.saturating_mul(8));
     if work > Limits::default().max_render_points {
       return Err(Error::LimitExceeded(Limit::RenderGeometry));
     }
     self.budget.work(work)?;
+    geometry.raster_mode = Some(metrics.sparse(self.width.saturating_mul(self.height)));
+    let (x0, y0, x1, y1) = (metrics.x0 + translation.x, metrics.y0 + translation.y, metrics.x1 + translation.x, metrics.y1 + translation.y);
+    if metrics.points > 0 && [x0, y0, x1, y1].iter().any(|v| !v.is_finite()) {
+      return Err(Error::LimitExceeded(Limit::PathCoordinate));
+    }
     let pixels = if x0 <= x1 && y0 <= y1 {
       let w = (x1.ceil().clamp(0.0, self.width as f32) - x0.floor().clamp(0.0, self.width as f32)).max(0.0) as usize;
       let h = (y1.ceil().clamp(0.0, self.height as f32) - y0.floor().clamp(0.0, self.height as f32)).max(0.0) as usize;
@@ -156,12 +178,19 @@ impl<'a, R: FrameRenderer> GuardedRenderer<'a, R> {
         self.pixel_costs.clear();
       }
       self.pixel_costs.try_reserve(1).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
-      self.pixel_costs.insert(geometry.cache_key, pixels);
+      self.pixel_costs.insert(
+        geometry.cache_key,
+        DrawCost {
+          work,
+          pixels,
+          sparse: geometry.raster_mode.unwrap_or(false),
+        },
+      );
       pixels
     } else {
       // Coverage replay may omit all points. Retain its previous conservative
       // bounding-box charge across frames; on a miss charge the full canvas.
-      self.pixel_costs.get(&geometry.cache_key).copied().unwrap_or(self.width.saturating_mul(self.height))
+      self.width.saturating_mul(self.height)
     };
     Budget::charge(&self.pixels, pixels.saturating_mul(pixel_weight), Limits::default().max_render_pixels, Limit::RenderWork)
   }
@@ -185,7 +214,7 @@ impl<R: FrameRenderer> FrameRenderer for GuardedRenderer<'_, R> {
       self.inner.save_layer();
     }
   }
-  fn draw(&mut self, geometry: Geometry<'_>, paint: Paint<'_>) {
+  fn draw(&mut self, mut geometry: Geometry<'_>, paint: Paint<'_>) {
     if self.error.is_some() {
       return;
     }
@@ -201,16 +230,16 @@ impl<R: FrameRenderer> FrameRenderer for GuardedRenderer<'_, R> {
         GradientKind::Focal { .. } => 32,
       },
     };
-    let result = self.geometry(geometry, pixel_weight);
+    let result = self.geometry(&mut geometry, pixel_weight);
     if self.accept(result) {
       self.inner.draw(geometry, paint);
     }
   }
-  fn apply_mask(&mut self, geometry: Geometry<'_>, mode: u8, inverted: bool, opacity: u8, first: bool, last: bool) {
+  fn apply_mask(&mut self, mut geometry: Geometry<'_>, mode: u8, inverted: bool, opacity: u8, first: bool, last: bool) {
     if self.error.is_some() {
       return;
     }
-    let result = self.geometry(geometry, 1).and_then(|()| self.pixels(3));
+    let result = self.geometry(&mut geometry, 1).and_then(|()| self.pixels(3));
     if self.accept(result) {
       self.inner.apply_mask(geometry, mode, inverted, opacity, first, last);
     }
@@ -496,4 +525,43 @@ pub(crate) fn parent_matrix(layers: &[crate::model::Layer], layer: &crate::model
     matrix = matrix.concat(*transform);
   }
   Ok(matrix)
+}
+
+/// Inspect immutable property sizes and expanded model work once, independently
+/// of parser validation (tests and embedders may bypass parser limits).
+#[cfg(feature = "cpu")]
+pub(crate) fn validate_model(comp: &crate::Composition) -> Result<()> {
+  let limits = Limits::default();
+  if comp.assets.len() > limits.max_assets {
+    return Err(Error::LimitExceeded(Limit::Assets));
+  }
+  fn layers(comp: &crate::Composition, items: &[crate::model::Layer], resources: &Budget, depth: usize) -> Result<()> {
+    if depth > 16 {
+      return Err(Error::LimitExceeded(Limit::NestingDepth));
+    }
+    resources.layers(items.len())?;
+    for layer in items {
+      resources.transform(&layer.transform)?;
+      if let Some(tm) = &layer.time_remap {
+        resources.property(tm)?;
+      }
+      parent_matrix(items, layer, 0.0, resources)?;
+      resources.shape_tree(&layer.shapes, 0)?;
+      if layer.masks.len() > Limits::default().max_masks_per_layer {
+        return Err(Error::LimitExceeded(Limit::MasksPerLayer));
+      }
+      for mask in &layer.masks {
+        resources.path_property(&mask.path)?;
+        resources.property(&mask.opacity)?;
+      }
+      if layer.kind == crate::model::LayerKind::Precomp {
+        resources.work(comp.assets.len())?;
+        if let Some(asset) = layer.ref_id.as_deref().and_then(|id| comp.assets.iter().find(|asset| asset.id == id)) {
+          layers(comp, &asset.layers, resources, depth + 1)?;
+        }
+      }
+    }
+    Ok(())
+  }
+  layers(comp, &comp.layers, &Budget::default(), 0)
 }

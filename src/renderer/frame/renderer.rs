@@ -116,6 +116,7 @@ pub struct Geometry<'a> {
   contours: &'a [Contour],
   pub(crate) cache_key: u128,
   translation: Point,
+  pub(crate) raster_mode: Option<bool>,
 }
 
 impl<'a> Geometry<'a> {
@@ -124,6 +125,7 @@ impl<'a> Geometry<'a> {
       contours,
       cache_key,
       translation: Point::default(),
+      raster_mode: None,
     }
   }
 
@@ -132,6 +134,7 @@ impl<'a> Geometry<'a> {
       contours,
       cache_key,
       translation: Point { x, y },
+      raster_mode: None,
     }
   }
 

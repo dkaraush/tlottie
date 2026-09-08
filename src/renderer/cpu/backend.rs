@@ -105,6 +105,7 @@ impl CPURenderer {
       Some((raster, cells)) => Canvas::with_raster_and_rows(pixels, self.width, self.height, raster, cells, self.antialias, dirty_rows),
       None => Canvas::with_retained_rows(pixels, self.width, self.height, self.antialias, dirty_rows),
     };
+    canvas.raster_mode = geometry.raster_mode;
     if destination_dirty {
       // `Canvas` uses an empty dirty box to select a gradient copy fast
       // path. It is recreated for each streamed command, so carry the
@@ -220,7 +221,7 @@ impl CPURenderer {
     if first && last {
       let mut active_rows = self.surface_rows.pop();
       if let Some(rows) = active_rows.as_deref_mut() {
-        if mode_s_wins(geometry.raw_contours(), len) {
+        if geometry.raster_mode.unwrap_or_else(|| mode_s_wins(geometry.raw_contours(), len)) {
           let mut cells = self.state.take_cells(self.width, self.height);
           cells.reset();
           cells.fill_contours(geometry.raw_contours());
@@ -240,7 +241,7 @@ impl CPURenderer {
         self.state.take_u8(len, 0)
       };
       let width = self.width;
-      if mode_s_wins(geometry.raw_contours(), len) {
+      if geometry.raster_mode.unwrap_or_else(|| mode_s_wins(geometry.raw_contours(), len)) {
         let mut cells = self.state.take_cells(self.width, self.height);
         cells.reset();
         cells.fill_contours(geometry.raw_contours());
@@ -282,7 +283,7 @@ impl CPURenderer {
     }
     let mut coverage = self.state.take_u8(len, 0);
     let width = self.width;
-    if mode_s_wins(geometry.raw_contours(), len) {
+    if geometry.raster_mode.unwrap_or_else(|| mode_s_wins(geometry.raw_contours(), len)) {
       let mut cells = self.state.take_cells(self.width, self.height);
       cells.reset();
       cells.fill_contours(geometry.raw_contours());

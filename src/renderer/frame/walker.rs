@@ -13,7 +13,7 @@ use crate::geometry::{clip_contour, clip_to_quad, flatten_path, rect_contour, Co
 use crate::limits::Limits;
 use crate::math::{Color, Mat2x3, Vec2};
 use crate::model::{shapes_have_multiple_visible_paints, shapes_static, Composition, FillRule, Layer, LayerKind};
-use crate::renderer::cpu::executor::{layer_transform_at, opacity_byte, ClipQuad, DrawJob, GradientMapKind, PendingJob, RenderCtx, RenderScratch, ShapeWalker, MAX_PRECOMP_DEPTH};
+use crate::renderer::cpu::executor::{layer_transform_at, opacity_byte, parent_chain_matrix, ClipQuad, DrawJob, GradientMapKind, PendingJob, RenderCtx, RenderScratch, ShapeWalker, MAX_PRECOMP_DEPTH};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -24,7 +24,8 @@ use super::renderer::*;
 pub struct FrameWalker {
   scratch: RenderScratch,
   static_jobs: StaticJobCache,
-  pixel_costs: crate::compat::HashMap<u128, usize>,
+  pixel_costs: crate::compat::HashMap<u128, super::budget::DrawCost>,
+  costs_size: (u32, u32),
 }
 
 const STATIC_JOB_CACHE_BYTES: usize = 1024 * 1024;
@@ -333,7 +334,16 @@ impl FrameWalker {
   /// Evaluates `composition` at `frame_index` and synchronously streams its
   /// renderer-neutral drawing operations into `renderer`.
   pub fn render(&mut self, composition: &Composition, frame_index: f32, width: u32, height: u32, options: crate::RenderOptions, renderer: &mut impl FrameRenderer) -> Result<()> {
+    super::budget::validate_model(composition)?;
+    self.render_validated(composition, frame_index, width, height, options, renderer)
+  }
+
+  pub(crate) fn render_validated(&mut self, composition: &Composition, frame_index: f32, width: u32, height: u32, options: crate::RenderOptions, renderer: &mut impl FrameRenderer) -> Result<()> {
     super::budget::canvas_size(width, height)?;
+    if self.costs_size != (width, height) {
+      self.pixel_costs.clear();
+      self.costs_size = (width, height);
+    }
     self.scratch.budget = super::budget::Budget::default();
     let mut guarded = super::budget::GuardedRenderer::new(renderer, width, height, core::mem::take(&mut self.pixel_costs));
     let result = walk_frame(composition, frame_index, width, height, options, self, &mut guarded);
@@ -461,13 +471,6 @@ impl RenderCtx<'_> {
       return Err(Error::LimitExceeded(crate::Limit::NestingDepth));
     }
     renderer.status()?;
-    scratch.budget.layers(layers.len())?;
-    for layer in layers {
-      scratch.budget.transform(&layer.transform)?;
-      if let Some(tm) = &layer.time_remap {
-        scratch.budget.property(tm)?;
-      }
-    }
     let mut consumed_as_matte = vec![false; layers.len()];
     for (i, l) in layers.iter().enumerate() {
       if l.matte.is_some() {
@@ -484,7 +487,7 @@ impl RenderCtx<'_> {
         continue;
       }
       let (layer_m, layer_opacity) = layer_transform_at(layer, frame);
-      let m = base.concat(super::budget::parent_matrix(layers, layer, frame, &scratch.budget)?).concat(layer_m);
+      let m = base.concat(parent_chain_matrix(layers, layer, frame)).concat(layer_m);
       let combined_opacity = opacity * layer_opacity;
       let group_opacity = opacity_byte(combined_opacity);
       if group_opacity == 0 {
@@ -503,7 +506,7 @@ impl RenderCtx<'_> {
         }
         renderer.save_layer();
         let (src_m, src_opacity) = layer_transform_at(src, frame);
-        let source_matrix = base.concat(super::budget::parent_matrix(layers, src, frame, &scratch.budget)?).concat(src_m);
+        let source_matrix = base.concat(parent_chain_matrix(layers, src, frame)).concat(src_m);
         // A matte source's layer opacity applies to its flattened result, not
         // independently to every child of a precomp. Carry it into the fused
         // matte composite instead of distributing it through the source tree.
@@ -565,7 +568,6 @@ impl RenderCtx<'_> {
       // opaque than authored (notably cloud shading made from several
       // overlapping white shapes).
       let translucent_shape = if group_opacity < 255 && layer.kind == LayerKind::Shape {
-        scratch.budget.shape_tree(&layer.shapes, 0)?;
         shapes_have_multiple_visible_paints(&layer.shapes, frame)
       } else {
         false
@@ -801,14 +803,13 @@ impl RenderCtx<'_> {
     let count = masks.len();
     for (index, mask) in masks.into_iter().enumerate() {
       renderer.status()?;
-      scratch.budget.path_property(&mask.path)?;
-      scratch.budget.property(&mask.opacity)?;
       let data = mask.path.eval(frame);
       if data.vertices.len() > Limits::default().max_mask_path_points {
         return Err(Error::LimitExceeded(crate::Limit::MaskPathPoints));
       }
-      scratch.budget.path(&data, &matrix, self.curve_tolerance)?;
+      let reserved = scratch.budget.path(&data, &matrix, self.curve_tolerance)?;
       let mut contour = flatten_path(&data, &matrix, self.curve_tolerance);
+      scratch.budget.finish_expansion(reserved, contour.points.len());
       for quad in clip {
         contour = clip_to_quad(&contour, quad, &scratch.budget)?;
       }

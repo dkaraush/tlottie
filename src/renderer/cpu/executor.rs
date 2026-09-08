@@ -880,7 +880,6 @@ fn luma_premult(p: u32, order: crate::ChannelOrder) -> u32 {
 /// Composites premultiplied `src` over `dst` with a global opacity factor.
 /// Combined matrix of all ancestors of `layer` within `layers` (not
 /// including the layer itself). Cycle-safe: walks at most `layers.len()`.
-#[cfg(test)]
 pub(crate) fn parent_chain_matrix(layers: &[Layer], layer: &Layer, frame: f32) -> Mat2x3 {
   let mut chain: Vec<Mat2x3> = Vec::new();
   let mut current = layer.parent;

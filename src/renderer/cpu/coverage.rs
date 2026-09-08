@@ -1,11 +1,6 @@
 use super::*;
 use alloc::vec::Vec;
 
-/// Paint bbox extent (px, max dimension) ABOVE which the sparse cell/span
-/// engine rasterizes instead of the dense accumulator. The threshold is
-/// centralized here so benchmark-driven tuning cannot diverge by call site.
-pub(super) const MODE_S_MIN_EXTENT: usize = 42;
-
 /// One uniform-coverage span, packed: y:20 | x0:20 | len:16 | cov:8.
 #[inline]
 pub(crate) fn pack_span(y: usize, x0: usize, len: usize, cov: u8) -> u64 {
@@ -17,54 +12,12 @@ pub(crate) fn unpack_span(s: u64) -> (usize, usize, usize, u8) {
   ((s >> 44) as usize, ((s >> 24) & 0xf_ffff) as usize, ((s >> 8) & 0xffff) as usize, (s & 0xff) as u8)
 }
 
-/// Mode-S guard against edge-dense content: the cell engine's cost is
-/// ≈ perimeter px (deposit + sort), the dense engine's is ≈ area bytes.
-/// Stroke piece unions (thousands of tiny quads) have perimeter of the
-/// same order as area — sorting their cell piles loses to the plane
-/// (measured: DogsEmoji@320 cold 1.4x, quicksort 21% of the profile).
-/// S wins when `perimeter * DENSITY < bbox area`. Canvas-scaled per E156B
-/// measurements: 12 remains best at 64, 18 is the selected medium-size
-/// crossover after the opaque-row changes, and 6 remains best at 720.
-/// Extent 32/42/64 measured flat; 42 kept (the d9d6ad5 crossover).
-pub(super) const MODE_S_EDGE_DENSITY_SMALL: f32 = 12.0; // canvas ≤ 160x160
-pub(super) const MODE_S_EDGE_DENSITY_MEDIUM: f32 = 18.0; // canvas ≤ 448x448
-pub(super) const MODE_S_EDGE_DENSITY_LARGE: f32 = 6.0;
-
 /// Decides the rasterizer mode for one paint: sparse cells (mode S) for
 /// large, edge-sparse paints; the dense accumulator (mode D) otherwise.
 /// One pass over points — negligible next to rasterization; non-finite
 /// points are ignored by f32 min/max.
 pub(crate) fn mode_s_wins(contours: &[Contour], canvas_px: usize) -> bool {
-  let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-  let mut perim = 0.0f32;
-  for c in contours {
-    let mut prev: Option<Vec2> = c.points.last().copied();
-    for p in &c.points {
-      x0 = x0.min(p.x);
-      y0 = y0.min(p.y);
-      x1 = x1.max(p.x);
-      y1 = y1.max(p.y);
-      if let Some(q) = prev {
-        perim += (p.x - q.x).abs() + (p.y - q.y).abs();
-      }
-      prev = Some(*p);
-    }
-  }
-  if !(x1 > x0 && y1 > y0) {
-    return false;
-  }
-  if ((x1 - x0).max(y1 - y0)) <= MODE_S_MIN_EXTENT as f32 {
-    return false;
-  }
-  let density = if canvas_px <= 160 * 160 {
-    MODE_S_EDGE_DENSITY_SMALL
-  } else if canvas_px <= 448 * 448 {
-    MODE_S_EDGE_DENSITY_MEDIUM
-  } else {
-    MODE_S_EDGE_DENSITY_LARGE
-  };
-  let s = perim * density < (x1 - x0) * (y1 - y0);
-  s
+  crate::geometry::RasterMetrics::new(contours).sparse(canvas_px)
 }
 
 /// Rebuilds a row-plane cache entry from a span list (exact: spans arrive

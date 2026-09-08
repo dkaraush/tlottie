@@ -78,13 +78,14 @@ pub(crate) fn mark_row_bounds(rows: &mut Option<&mut [RowBounds]>, y: usize, x0:
 }
 
 pub(crate) struct Canvas<'a> {
+  pub(crate) raster_mode: Option<bool>,
   pub(crate) pixels: &'a mut [u32],
   pub(crate) w: usize,
   pub(crate) h: usize,
   pub(crate) antialias: bool,
   pub(crate) raster: Option<Rasterizer>,
   /// Mode-S sparse cell engine, selected per paint when the contours'
-  /// bbox extent exceeds [`MODE_S_MIN_EXTENT`].
+  /// bbox extent exceeds the threshold in `RasterMetrics::sparse`.
   pub(crate) cells: Option<CellRaster>,
   /// Union of all rows/columns written since creation (fills, gradient
   /// fills, and nested offscreen composites all mark it).
@@ -116,6 +117,7 @@ impl<'a> Canvas<'a> {
 
   pub(crate) fn with_raster_and_rows(pixels: &'a mut [u32], w: usize, h: usize, raster: Rasterizer, cells: CellRaster, antialias: bool, dirty_rows: Option<&'a mut [RowBounds]>) -> Self {
     Canvas {
+      raster_mode: None,
       pixels,
       w,
       h,
@@ -132,6 +134,7 @@ impl<'a> Canvas<'a> {
 
   pub(crate) fn with_retained_rows(pixels: &'a mut [u32], w: usize, h: usize, antialias: bool, dirty_rows: Option<&'a mut [RowBounds]>) -> Self {
     Canvas {
+      raster_mode: None,
       pixels,
       w,
       h,
@@ -240,7 +243,7 @@ impl Canvas<'_> {
     let pixels = &mut *self.pixels;
     let dirty = &mut self.dirty;
     let dirty_rows = &mut self.dirty_rows;
-    if mode_s_wins(contours, w * self.h) {
+    if self.raster_mode.unwrap_or_else(|| mode_s_wins(contours, w * self.h)) {
       // Mode S: sparse cells — no w×h plane, cost ∝ edge crossings.
       let cells = self.cells.as_mut().expect("fresh fill requires cell rasterizer");
       cells.reset();

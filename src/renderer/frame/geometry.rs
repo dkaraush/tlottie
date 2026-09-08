@@ -35,7 +35,7 @@ pub(crate) struct Contour {
 const KAPPA: f32 = 0.552_284_8;
 
 /// Max line segments a single cubic can flatten to.
-const MAX_SEGS: usize = 128;
+pub(crate) const MAX_SEGS: usize = 128;
 
 /// Segment length as rlottie measures it (VLine::length, vline.h):
 /// `max(|dx|,|dy|) + 0.375·min(|dx|,|dy|)` — a fast non-Euclidean hypot
@@ -682,6 +682,7 @@ pub(crate) fn dash_polyline_bounded<'a>(
   budget: &'a crate::renderer::frame::budget::Budget,
 ) -> crate::Result<Vec<(Vec<Vec2>, Vec<bool>)>> {
   budget.work(points.len())?;
+  budget.points(points.len())?;
   let mut d = VDasher::new(points, anchors, closed, pattern, offset);
   d.budget = Some(budget);
   d.run();
@@ -708,6 +709,8 @@ struct VDasher<'a> {
   budget: Option<&'a crate::renderer::frame::budget::Budget>,
   #[cfg(feature = "cpu")]
   error: Option<crate::Error>,
+  #[cfg(feature = "cpu")]
+  cycle_length: f64,
   points: &'a [Vec2],
   anchors: &'a [bool],
   /// pattern as (length, gap) pairs
@@ -738,7 +741,11 @@ impl<'a> VDasher<'a> {
         pairs.push((first.max(0.0), 0.0));
       }
     }
+    #[cfg(feature = "cpu")]
+    let cycle_length = pairs.iter().flat_map(|&(l, g)| [l, g]).filter(|v| *v >= 1e-4).map(f64::from).sum();
     VDasher {
+      #[cfg(feature = "cpu")]
+      cycle_length,
       #[cfg(feature = "cpu")]
       budget: None,
       #[cfg(feature = "cpu")]
@@ -913,14 +920,22 @@ impl<'a> VDasher<'a> {
       self.current_length -= remaining;
       self.add_span(&collect(0.0, elem_len));
     } else {
-      while remaining > self.current_length {
-        #[cfg(feature = "cpu")]
-        if let Some(budget) = self.budget {
-          if let Err(error) = budget.work(verts.len().saturating_add(self.pairs.len())).and_then(|()| budget.points(4)) {
-            self.error = Some(error);
-            return;
-          }
+      // A complete pattern cycle consumes cycle_length. Allow an initial
+      // partial cycle and a factor of two for f32 subtraction rounding. The
+      // work cap keeps the cycle/phase count below the precision at which a
+      // whole cycle could stop making progress. Charge all scans and splits
+      // here, before entering the dash loop (including discarded gaps).
+      #[cfg(feature = "cpu")]
+      if let Some(budget) = self.budget {
+        let cycles = ((2.0 * elem_len as f64 / self.cycle_length).ceil() as usize).saturating_add(1);
+        let iterations = cycles.saturating_mul(2 * self.pairs.len());
+        let work = iterations.saturating_mul(verts.len().saturating_add(2 * self.pairs.len() + 2));
+        if let Err(error) = budget.work(work).and_then(|()| budget.points(iterations.saturating_mul(4))) {
+          self.error = Some(error);
+          return;
         }
+      }
+      while remaining > self.current_length {
         remaining -= self.current_length;
         let target = local + self.current_length;
         self.add_span(&collect(local, target));
@@ -999,5 +1014,56 @@ impl<'a> VDasher<'a> {
 
     // drop degenerate 1-point pieces
     self.out.retain(|p| p.0.len() >= 2);
+  }
+}
+
+/// Shared allocation/work estimate and raster-mode selection. Built once per
+/// uncached paint, then passed through to the backend.
+pub(crate) struct RasterMetrics {
+  pub(crate) x0: f32,
+  pub(crate) y0: f32,
+  pub(crate) x1: f32,
+  pub(crate) y1: f32,
+  pub(crate) perim: f32,
+  pub(crate) points: usize,
+}
+impl RasterMetrics {
+  pub(crate) fn new(contours: &[Contour]) -> Self {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    let mut perim = 0.0f32;
+    let mut points = 0usize;
+    for c in contours {
+      points = points.saturating_add(c.points.len());
+      let mut prev: Option<Vec2> = c.points.last().copied();
+      for p in &c.points {
+        x0 = x0.min(p.x);
+        y0 = y0.min(p.y);
+        x1 = x1.max(p.x);
+        y1 = y1.max(p.y);
+        if let Some(q) = prev {
+          perim += (p.x - q.x).abs() + (p.y - q.y).abs();
+        }
+        prev = Some(*p);
+      }
+    }
+    Self { x0, y0, x1, y1, perim, points }
+  }
+  pub(crate) fn sparse(&self, canvas_px: usize) -> bool {
+    let Self { x0, y0, x1, y1, perim, .. } = *self;
+    if !(x1 > x0 && y1 > y0) {
+      return false;
+    }
+    if ((x1 - x0).max(y1 - y0)) <= 42.0 {
+      return false;
+    }
+    let density = if canvas_px <= 160 * 160 {
+      12.0
+    } else if canvas_px <= 448 * 448 {
+      18.0
+    } else {
+      6.0
+    };
+    let s = perim * density < (x1 - x0) * (y1 - y0);
+    s
   }
 }

@@ -83,7 +83,7 @@ impl<'a> Alpha8Renderer<'a> {
       }
     }
 
-    if mode_s_wins(geometry.raw_contours(), width.saturating_mul(self.height)) {
+    if geometry.raster_mode.unwrap_or_else(|| mode_s_wins(geometry.raw_contours(), width.saturating_mul(self.height))) {
       let mut cells = self.state.take_cells(width, self.height);
       cells.fill_contours_translated(geometry.raw_contours(), translation.x, translation.y);
       let capture = self.state.cov_cache.capture_enabled();

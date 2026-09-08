@@ -38,9 +38,8 @@ fn shoelace(pts: &[Vec2]) -> f32 {
 fn one_step_arc_uses_known_outgoing_normal() {
   let start = Vec2::new(1.0, 0.0);
   let end = Vec2::new(0.96, 0.28);
-  let budget = crate::renderer::frame::budget::Budget::default();
-  let mut border = Border::new(vec![start], &budget);
-  border.arc_to(Vec2::new(0.0, 0.0), 1.0, start, end, 0.283_794_1).unwrap();
+  let mut border = Border::new(vec![start]);
+  border.arc_to(Vec2::new(0.0, 0.0), 1.0, start, end, 0.283_794_1);
   assert_eq!(border.pts.len(), 2);
   assert_eq!(border.pts[1], end);
 }
@@ -120,6 +119,37 @@ fn no_panic_garbage() {
         &crate::renderer::frame::budget::Budget::default(),
       )
       .unwrap();
+    }
+  }
+}
+
+#[test]
+fn bulk_bound_covers_caps_joins_cusps_and_reversals() {
+  let points: Vec<Vec2> = (0..64).map(|i| Vec2::new((i % 3) as f32 * 9.0, (i % 7) as f32 * 2.0)).collect();
+  for closed in [false, true] {
+    for hw in [0.01, 2.0, 200.0, 1e6] {
+      for cap in [Cap::Butt, Cap::Square, Cap::Round] {
+        for join in [Join::Bevel, Join::Miter, Join::Round] {
+          for authored in [false, true] {
+            let mut out = Vec::new();
+            stroke_outline(
+              &points,
+              &vec![authored; points.len()],
+              closed,
+              hw,
+              cap,
+              join,
+              4.0,
+              &mut Vec::new(),
+              &mut Vec::new(),
+              &mut out,
+              &crate::renderer::frame::budget::Budget::default(),
+            )
+            .unwrap();
+            assert!(!out.is_empty());
+          }
+        }
+      }
     }
   }
 }

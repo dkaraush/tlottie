@@ -33,6 +33,7 @@ pub struct CPURenderer {
   /// renders are common for players and benchmarks even when frame_count is
   /// one; replaying the complete shape tree in that case only burns CPU.
   static_bitmap: Option<StaticBitmap>,
+  model_validated: bool,
 }
 
 struct StaticBitmap {
@@ -62,6 +63,7 @@ impl CPURenderer {
       mask_accumulator: None,
       alpha_fallback: Vec::new(),
       static_bitmap: None,
+      model_validated: false,
     }
   }
 
@@ -84,6 +86,7 @@ impl CPURenderer {
       mask_accumulator: None,
       alpha_fallback: Vec::new(),
       static_bitmap: None,
+      model_validated: false,
     }
   }
 
@@ -98,6 +101,10 @@ impl CPURenderer {
   /// Discard the partially rendered output on error; the renderer remains usable.
   pub fn render(&mut self, frame: f32, pixels: &mut [u32], width: u32, height: u32, options: crate::RenderOptions) -> Result<()> {
     crate::renderer::frame::budget::canvas_size(width, height)?;
+    if !self.model_validated {
+      crate::renderer::frame::budget::validate_model(&self.comp)?;
+      self.model_validated = true;
+    }
     if options.clear && self.comp.is_static() {
       if let Some(cached) = &self.static_bitmap {
         if cached.width == width && cached.height == height && cached.options == options {
@@ -114,7 +121,9 @@ impl CPURenderer {
     }
     let composition = alloc::sync::Arc::clone(&self.comp);
     let mut walker = core::mem::take(&mut self.walker);
-    let result = self.with_bitmap(pixels, width, height, options, |renderer| walker.render(&composition, frame, width, height, options, renderer));
+    let result = self.with_bitmap(pixels, width, height, options, |renderer| {
+      walker.render_validated(&composition, frame, width, height, options, renderer)
+    });
     self.walker = walker;
     if result.is_err() {
       self.walker = Default::default();
@@ -155,6 +164,10 @@ impl CPURenderer {
   /// Discard the output on error, as with [`Self::render`].
   pub fn render_alpha8(&mut self, frame: f32, alpha: &mut [u8], width: u32, height: u32, mut options: crate::RenderOptions) -> Result<()> {
     crate::renderer::frame::budget::canvas_size(width, height)?;
+    if !self.model_validated {
+      crate::renderer::frame::budget::validate_model(&self.comp)?;
+      self.model_validated = true;
+    }
     let limits = crate::Limits::default();
     if width == 0 || height == 0 || width > limits.max_dimension || height > limits.max_dimension {
       return Err(crate::Error::InvalidLottie {
@@ -200,7 +213,7 @@ impl CPURenderer {
     let composition = alloc::sync::Arc::clone(&self.comp);
     let mut walker = core::mem::take(&mut self.walker);
     let mut backend = super::alpha_backend::Alpha8Renderer::new(target, width as usize, height as usize, options.antialias, options.clear, &mut self.state);
-    let result = walker.render(&composition, frame, width, height, options, &mut backend);
+    let result = walker.render_validated(&composition, frame, width, height, options, &mut backend);
     backend.finish();
     self.walker = walker;
     if result.is_err() {

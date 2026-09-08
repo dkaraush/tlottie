@@ -352,7 +352,6 @@ impl ShapeWalker<'_> {
       if pending.len() >= crate::Limits::default().max_paints_per_layer || arena.len() >= crate::Limits::default().max_shapes_per_layer {
         return Err(crate::Error::LimitExceeded(crate::Limit::RenderGeometry));
       }
-      self.scratch.budget.shape(shape)?;
       match shape {
         Shape::Group(g) => {
           let (gm, gop) = transform_at(&g.transform, self.frame);
@@ -361,17 +360,20 @@ impl ShapeWalker<'_> {
         }
         Shape::Path(p) => {
           if let Some(data) = p.path.static_value() {
-            self.scratch.budget.path(&data, &m, self.curve_tolerance)?;
+            let reserved = self.scratch.budget.path(&data, &m, self.curve_tolerance)?;
             let closed = data.closed;
             let contour = self.scratch.take_contour();
             let contour = flatten_path_reusing(data, &m, self.curve_tolerance, contour);
+            self.scratch.budget.finish_expansion(reserved, contour.points.len());
             arena.push((contour, closed));
           } else {
             let data = p.path.eval(self.frame);
-            self.scratch.budget.path(&data, &m, self.curve_tolerance)?;
+            let reserved = self.scratch.budget.path(&data, &m, self.curve_tolerance)?;
             let closed = data.closed;
             let contour = self.scratch.take_contour();
-            arena.push((flatten_path_reusing(&data, &m, self.curve_tolerance, contour), closed));
+            let contour = flatten_path_reusing(&data, &m, self.curve_tolerance, contour);
+            self.scratch.budget.finish_expansion(reserved, contour.points.len());
+            arena.push((contour, closed));
           }
         }
         Shape::Rect(r) => {
@@ -403,9 +405,11 @@ impl ShapeWalker<'_> {
             ps.inner_roundness.eval(self.frame),
             ps.outer_roundness.eval(self.frame),
           );
-          self.scratch.budget.path(&data, &m, self.curve_tolerance)?;
+          let reserved = self.scratch.budget.path(&data, &m, self.curve_tolerance)?;
           let contour = self.scratch.take_contour();
-          arena.push((flatten_path_reusing(&data, &m, self.curve_tolerance, contour), true));
+          let contour = flatten_path_reusing(&data, &m, self.curve_tolerance, contour);
+          self.scratch.budget.finish_expansion(reserved, contour.points.len());
+          arena.push((contour, true));
         }
         Shape::RoundCorners(rc) => {
           let radius = rc.radius.eval(self.frame);

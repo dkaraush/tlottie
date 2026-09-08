@@ -383,7 +383,7 @@ impl Canvas<'_> {
     let pixels = &mut *self.pixels;
     let dirty = &mut self.dirty;
     let dirty_rows = &mut self.dirty_rows;
-    if mode_s_wins(contours, w * self.h) {
+    if self.raster_mode.unwrap_or_else(|| mode_s_wins(contours, w * self.h)) {
       // Mode S: spans feed the same gradient_row math through a
       // synthesized uniform cov row.
       drop(src_entry);
@@ -622,7 +622,7 @@ impl Canvas<'_> {
       return;
     }
     let capture = capture_enabled;
-    if mode_s_wins(contours, w * self.h) {
+    if self.raster_mode.unwrap_or_else(|| mode_s_wins(contours, w * self.h)) {
       // Mode S: spans feed the same source math through a synthesized row.
       let cells = self.cells.as_mut().expect("fresh gradient requires cell rasterizer");
       cells.reset();
