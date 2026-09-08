@@ -800,23 +800,23 @@ fn path_keyframe_values(property: &Property<PathData>) -> Vec<&PathData> {
   }
 }
 
-/// Arclength estimate for one cubic, in the Chebyshev metric the dash
-/// limits use: the mean of the chord and the control polygon (Gravesen,
-/// "Adaptive subdivision and the length and energy of Bezier curves",
-/// Comput. Geom. 8 (1997)). With zero tangents polygon == chord, so
-/// straight paths score exactly what they scored before.
+/// Upper bound on one cubic's arclength, in the Chebyshev metric the dash
+/// limits use: the control polygon. chord <= L <= polygon holds for any
+/// bezier (Gravesen, "Adaptive subdivision and the length and energy of
+/// Bezier curves", Comput. Geom. 8 (1997)); with zero tangents polygon ==
+/// chord, so straight paths score exactly what they scored before.
 ///
-/// The chord alone is useless as a bound: a segment with both endpoints on
-/// one coordinate has a zero chord and a zero bbox while its tangents still
-/// pull the real curve ~294k px out and back (bbox.tgs), which a 0.005 dash
-/// period then slices into ~1.3e9 pieces.
+/// A bound, not an estimate, on purpose: the chord measures zero for a
+/// segment with both endpoints on one coordinate while its tangents still
+/// pull the real curve ~294k px out and back (bbox.tgs), which a 0.005
+/// dash period then slices into ~1.3e9 pieces. That curve also has a cusp
+/// at t=0.5, exactly where the cheaper arclength estimates lose their
+/// guarantees, so the guard rests on the inequality instead.
 fn cubic_span(a: Vec2, out_a: Vec2, in_b: Vec2, b: Vec2) -> f32 {
   let hop = |px: f32, py: f32, qx: f32, qy: f32| (qx - px).abs().max((qy - py).abs());
   let (c0x, c0y) = (a.x + out_a.x, a.y + out_a.y);
   let (c1x, c1y) = (b.x + in_b.x, b.y + in_b.y);
-  let chord = hop(a.x, a.y, b.x, b.y);
-  let polygon = hop(a.x, a.y, c0x, c0y) + hop(c0x, c0y, c1x, c1y) + hop(c1x, c1y, b.x, b.y);
-  let span = 0.5 * (chord + polygon);
+  let span = hop(a.x, a.y, c0x, c0y) + hop(c0x, c0y, c1x, c1y) + hop(c1x, c1y, b.x, b.y);
   //NOTE: a NaN would slip through the max()/sum() comparisons downstream
   if span.is_finite() {
     span
