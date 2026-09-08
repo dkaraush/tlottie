@@ -2436,3 +2436,63 @@ fn duplicate_scalar_property_k_keyframes_stay_bounded() {
   );
   assert_lottie!(json);
 }
+
+#[test]
+fn zero_chord_dashed_bezier_stays_bounded() {
+  // bbox.tgs: 46 vertices all on [256,256] with every tangent at 140000, so
+  // chord and bbox both measure zero while the real curve is ~294k px per
+  // segment — a 0.005 dash period slices that into ~1.3e9 pieces. The
+  // keyframe hides behind a precomp with `st:-1`, current on root frame 0.
+  let vertices = (0..46).map(|_| "[256,256]").collect::<Vec<_>>().join(",");
+  let tangents = (0..46).map(|_| "[140000,140000]").collect::<Vec<_>>().join(",");
+  let json = format!(
+    r#"{{"v":"5.7.4","fr":60,"ip":0,"op":2,"w":512,"h":512,"assets":[{{"id":"c1","layers":[{{"ddd":0,"ind":1,"ty":4,"nm":"shape_layer","ip":0,"op":2,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[
+      {{"ty":"sh","ks":{{"a":1,"k":[
+        {{"t":0,"s":[{{"c":false,"v":[[256,256],[258,256]],"i":[[0,0],[0,0]],"o":[[0,0],[0,0]]}}],"i":{{"x":[0.833],"y":[0.833]}},"o":{{"x":[0.167],"y":[0.167]}}}},
+        {{"t":1,"s":[{{"c":false,"v":[{vertices}],"i":[{tangents}],"o":[{tangents}]}}]}}
+      ]}}}},
+      {{"ty":"st","c":{{"a":0,"k":[0,0,0,1]}},"o":{{"a":0,"k":100}},"w":{{"a":0,"k":2}},"lc":1,"lj":1,"d":[
+        {{"n":"d","v":{{"a":0,"k":0.005}}}},{{"n":"g","v":{{"a":0,"k":0.005}}}},{{"n":"o","v":{{"a":0,"k":0}}}}
+      ]}},
+      {{"ty":"tr","p":{{"a":0,"k":[256,256]}},"a":{{"a":0,"k":[0,0]}},"s":{{"a":0,"k":[100,100]}},"r":{{"a":0,"k":0}},"o":{{"a":0,"k":100}}}}
+    ]}}]}}]}}],"layers":[{{"ddd":0,"ind":1,"ty":0,"nm":"wrap","refId":"c1","ip":0,"op":2,"st":-1,"w":512,"h":512}}]}}"#
+  );
+  assert_lottie!(json, 512, 0, 2);
+}
+
+#[test]
+fn overshooting_easing_dashed_path_stays_bounded() {
+  // Both authored paths fit PR #8's dash estimate: 45 * 100 / 2.2 < 2048.
+  // At frame 1, x handles (0, 1) select u=0.5, but y handles (100, 100)
+  // yield progress 75.125. Tangents grow to 7512.5, so the intermediate
+  // curve exceeds the authored-keyframe estimate by over 75 times.
+  let vertices = (0..46).map(|_| "[32,32]").collect::<Vec<_>>().join(",");
+  let zero = (0..46).map(|_| "[0,0]").collect::<Vec<_>>().join(",");
+  let tangents = (0..46).map(|_| "[100,100]").collect::<Vec<_>>().join(",");
+  let json = format!(
+    r#"{{"v":"5.7.4","fr":60,"ip":0,"op":3,"w":64,"h":64,"layers":[{{"ty":4,"ind":1,"ip":0,"op":3,"ks":{{}},"shapes":[
+      {{"ty":"sh","ks":{{"a":1,"k":[
+        {{"t":0,"s":[{{"c":false,"v":[{vertices}],"i":[{zero}],"o":[{zero}]}}],"o":{{"x":0,"y":100}},"i":{{"x":1,"y":100}}}},
+        {{"t":2,"s":[{{"c":false,"v":[{vertices}],"i":[{tangents}],"o":[{tangents}]}}]}}
+      ]}}}},
+      {{"ty":"st","c":{{"k":[0,0,0,1]}},"o":{{"k":100}},"w":{{"k":2}},"lc":1,"lj":2,"d":[
+        {{"n":"d","v":{{"k":1.1}}}},{{"n":"g","v":{{"k":1.1}}}},{{"n":"o","v":{{"k":0}}}}
+      ]}}
+    ]}}]}}"#
+  );
+  assert_lottie!(json, 64, 1, 2);
+}
+
+#[test]
+fn single_vertex_closed_dashed_bezier_stays_bounded() {
+  // A closed path with one vertex still has a cubic from that vertex back
+  // to itself. PR #8's count < 2 shortcut reports zero length, although
+  // the tangents create a large out-and-back curve and millions of dashes.
+  let json = r#"{"v":"5.7.4","fr":60,"ip":0,"op":1,"w":64,"h":64,"layers":[{"ty":4,"ind":1,"ip":0,"op":1,"ks":{},"shapes":[
+    {"ty":"sh","ks":{"k":{"c":true,"v":[[32,32]],"i":[[140000,140000]],"o":[[140000,140000]]}}},
+    {"ty":"st","c":{"k":[0,0,0,1]},"o":{"k":100},"w":{"k":2},"lc":1,"lj":1,"d":[
+      {"n":"d","v":{"k":0.005}},{"n":"g","v":{"k":0.005}},{"n":"o","v":{"k":0}}
+    ]}
+  ]}]}"#;
+  assert_lottie!(json);
+}
