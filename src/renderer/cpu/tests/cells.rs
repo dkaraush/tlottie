@@ -139,3 +139,33 @@ fn differential_vs_dense() {
     }
   }
 }
+
+#[test]
+fn extreme_cell_accumulation_wraps_without_widening_storage() {
+  assert_eq!(core::mem::size_of::<Cell>(), 12);
+  let mut row = Vec::new();
+  CellRaster::bump_row(&mut row, 0, i32::MAX, i32::MAX);
+  CellRaster::bump_row(&mut row, 0, 1, 1);
+  assert_eq!(row[0].cover, i32::MIN);
+  assert_eq!(row[0].area, i32::MIN);
+
+  // Exercise both merging non-adjacent deposits and the sweep's running
+  // cover, multiply and subtract with overflow checks enabled in debug.
+  row.push(Cell {
+    x: 1,
+    cover: i32::MAX,
+    area: i32::MAX,
+  });
+  row.push(Cell { x: 0, cover: -1, area: -1 });
+  row.push(Cell { x: 3, cover: 1, area: 1 });
+  let mut raster = CellRaster::new(4, 1);
+  raster.rows[0] = row;
+  raster.min_y = 0;
+  raster.max_y = 0;
+  for rule in [FillRule::NonZero, FillRule::EvenOdd] {
+    raster.sweep_spans(rule, true, |y, x, len, _| {
+      assert_eq!(y, 0);
+      assert!(x + len <= 4);
+    });
+  }
+}

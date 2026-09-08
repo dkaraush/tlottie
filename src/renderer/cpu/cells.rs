@@ -83,8 +83,10 @@ impl CellRaster {
     // Consecutive deposits usually hit the same cell; merge in place.
     if let Some(last) = row.last_mut() {
       if last.x == ex {
-        last.cover += cover;
-        last.area += area;
+        // Extreme winding counts may corrupt coverage, but must not panic.
+        // Keep the original 12-byte cell and release-mode wrapping behavior.
+        last.cover = last.cover.wrapping_add(cover);
+        last.area = last.area.wrapping_add(area);
         return;
       }
     }
@@ -381,7 +383,7 @@ impl CellRaster {
       while let Some(&Cell { x, .. }) = row.get(i) {
         // Gap span between previous cell and this one.
         if prev_end != i32::MIN && x > prev_end && cover != 0 {
-          let cov = Self::coverage(cover * (ONE * 2), rule, antialias);
+          let cov = Self::coverage(cover.wrapping_mul(ONE * 2), rule, antialias);
           if cov != 0 {
             let x0 = prev_end.max(0) as usize;
             let x1 = (x.max(0) as usize).min(w);
@@ -397,12 +399,12 @@ impl CellRaster {
           if cx != x {
             break;
           }
-          cell_cover += cc;
-          cell_area += ca;
+          cell_cover = cell_cover.wrapping_add(cc);
+          cell_area = cell_area.wrapping_add(ca);
           i += 1;
         }
-        cover += cell_cover;
-        let area = cover * (ONE * 2) - cell_area;
+        cover = cover.wrapping_add(cell_cover);
+        let area = cover.wrapping_mul(ONE * 2).wrapping_sub(cell_area);
         if area != 0 && x >= 0 && (x as usize) < w {
           let cov = Self::coverage(area, rule, antialias);
           if cov != 0 {

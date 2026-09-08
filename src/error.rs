@@ -48,6 +48,12 @@ pub enum JsonErrorKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Limit {
+  /// Generated geometry or raster storage exceeds the per-frame budget.
+  RenderGeometry,
+  /// Cumulative evaluation, rasterization or pixel work exceeds the frame budget.
+  RenderWork,
+  /// Render surface and scratch storage exceeds the memory budget.
+  RenderMemory,
   /// Input larger than [`crate::Limits::max_input_bytes`].
   InputBytes,
   /// JSON nesting deeper than [`crate::Limits::max_nesting_depth`].

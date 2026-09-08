@@ -1,5 +1,6 @@
 //! Shared vector geometry and renderer-neutral evaluated-frame operations.
 
+pub(crate) mod budget;
 pub(crate) mod geometry;
 pub(crate) mod renderer;
 pub(crate) mod stroke;

@@ -205,6 +205,11 @@ pub enum Composite {
 
 /// Backend operations called synchronously while evaluating a frame.
 pub trait FrameRenderer {
+  /// Reports a failed backend operation. Evaluation stops at the next command.
+  fn status(&self) -> crate::Result<()> {
+    Ok(())
+  }
+
   /// Starts a transparent isolated surface.
   fn save_layer(&mut self);
 

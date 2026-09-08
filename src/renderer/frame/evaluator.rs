@@ -84,13 +84,13 @@ impl ShapeWalker<'_> {
   }
 
   #[cfg(test)]
-  pub(super) fn render_shape_jobs_cpu(&mut self, canvas: &mut Canvas<'_>, arena: &[(Contour, bool)], pending: &[PendingJob], mut record: Option<&mut Vec<ReplayJob>>) {
+  pub(super) fn render_shape_jobs_cpu(&mut self, canvas: &mut Canvas<'_>, arena: &[(Contour, bool)], pending: &[PendingJob], mut record: Option<&mut Vec<ReplayJob>>) -> Result<()> {
     // Materialize AFTER all modifiers ran, execute in reverse. Fused:
     // materialize is pure per-job (the arena is immutable once the walk
     // finished), so each job's geometry is built, drawn, and freed before
     // the next — nothing forces all jobs' contours to coexist.
     for pj in pending.iter().rev() {
-      let contours = match self.materialize(pj, arena, &|_| false) {
+      let contours = match self.materialize(pj, arena, &|_| false)? {
         DrawJob::Solid {
           key,
           contours,
@@ -133,6 +133,7 @@ impl ShapeWalker<'_> {
         self.scratch.put_pts(c.points);
       }
     }
+    Ok(())
   }
 
   /// Replays a static layer's recorded paints straight from the coverage
@@ -163,9 +164,13 @@ impl ShapeWalker<'_> {
     true
   }
 
-  pub(crate) fn materialize(&mut self, pj: &PendingJob, arena: &[(Contour, bool)], retained: &impl Fn(u128) -> bool) -> DrawJob {
+  pub(crate) fn materialize(&mut self, pj: &PendingJob, arena: &[(Contour, bool)], retained: &impl Fn(u128) -> bool) -> Result<DrawJob> {
     let slice = arena.get(pj.start..pj.end.min(arena.len())).unwrap_or(&[]);
-    match &pj.paint {
+    self.scratch.budget.work(slice.len())?;
+    for (c, _) in slice {
+      self.scratch.budget.work(c.points.len())?;
+    }
+    Ok(match &pj.paint {
       PendingPaint::Solid { rule, color, opacity } => {
         let key = self.fill_key(slice, *rule);
         let hit = retained(key);
@@ -177,8 +182,9 @@ impl ShapeWalker<'_> {
           } else {
             let mut v = Vec::with_capacity(slice.len());
             for (c, _) in slice {
+              self.scratch.budget.points(c.points.len())?;
               let copy = self.pooled_copy(c);
-              v.push(self.clip_all_owned(copy));
+              v.push(self.clip_all_owned(copy)?);
             }
             v
           },
@@ -201,8 +207,9 @@ impl ShapeWalker<'_> {
           } else {
             let mut v = Vec::with_capacity(slice.len());
             for (c, _) in slice {
+              self.scratch.budget.points(c.points.len())?;
               let copy = self.pooled_copy(c);
-              v.push(self.clip_all_owned(copy));
+              v.push(self.clip_all_owned(copy)?);
             }
             v
           },
@@ -231,7 +238,7 @@ impl ShapeWalker<'_> {
           // stroking and clipping wholesale (measured 12-13% of
           // 64px frames spent stroking geometry whose coverage
           // was already cached).
-          return match lut {
+          return Ok(match lut {
             Some((lut, _lut_id, map)) => DrawJob::Gradient {
               key: stroke_key,
               src_key: gradient_keys.unwrap_or(stroke_key),
@@ -249,7 +256,7 @@ impl ShapeWalker<'_> {
               color: color.unwrap_or(Color::BLACK),
               opacity: *opacity,
             },
-          };
+          });
         }
         let solo = slice.len() == 1 && pattern.is_empty();
         let mut contours: Vec<Contour> = Vec::new();
@@ -279,9 +286,10 @@ impl ShapeWalker<'_> {
                 &mut self.scratch.stroke_segments,
                 target,
                 solo,
-              );
+                &self.scratch.budget,
+              )?;
             } else {
-              for (piece, piece_anchors) in dash_polyline(&contour.points, &contour.anchors, *closed, pattern, *dash_offset) {
+              for (piece, piece_anchors) in crate::geometry::dash_polyline_bounded(&contour.points, &contour.anchors, *closed, pattern, *dash_offset, &self.scratch.budget)? {
                 stroke_polyline(
                   &piece,
                   &piece_anchors,
@@ -294,13 +302,14 @@ impl ShapeWalker<'_> {
                   &mut self.scratch.stroke_segments,
                   target,
                   false,
-                );
+                  &self.scratch.budget,
+                )?;
               }
             }
           }
           if !skip_clip {
             for p in pieces.drain(..) {
-              let clipped = self.clip_all_owned(p);
+              let clipped = self.clip_all_owned(p)?;
               contours.push(clipped);
             }
           }
@@ -325,7 +334,7 @@ impl ShapeWalker<'_> {
           },
         }
       }
-    }
+    })
   }
 
   /// Forward pass. Geometry goes into `arena` (device space, unclipped);
@@ -334,11 +343,16 @@ impl ShapeWalker<'_> {
   #[allow(clippy::too_many_arguments)]
   fn walk(&mut self, shapes: &[Shape], m: Mat2x3, opacity: f32, depth: usize, arena: &mut Vec<(Contour, bool)>, pending: &mut Vec<PendingJob>) -> Result<()> {
     if depth > MAX_RENDER_DEPTH {
-      return Ok(());
+      return Err(crate::Error::LimitExceeded(crate::Limit::NestingDepth));
     }
     let scope_start = arena.len();
     let jobs_start = pending.len();
+    self.scratch.budget.work(shapes.len())?;
     for shape in shapes {
+      if pending.len() >= crate::Limits::default().max_paints_per_layer || arena.len() >= crate::Limits::default().max_shapes_per_layer {
+        return Err(crate::Error::LimitExceeded(crate::Limit::RenderGeometry));
+      }
+      self.scratch.budget.shape(shape)?;
       match shape {
         Shape::Group(g) => {
           let (gm, gop) = transform_at(&g.transform, self.frame);
@@ -347,12 +361,14 @@ impl ShapeWalker<'_> {
         }
         Shape::Path(p) => {
           if let Some(data) = p.path.static_value() {
+            self.scratch.budget.path(&data, &m, self.curve_tolerance)?;
             let closed = data.closed;
             let contour = self.scratch.take_contour();
             let contour = flatten_path_reusing(data, &m, self.curve_tolerance, contour);
             arena.push((contour, closed));
           } else {
             let data = p.path.eval(self.frame);
+            self.scratch.budget.path(&data, &m, self.curve_tolerance)?;
             let closed = data.closed;
             let contour = self.scratch.take_contour();
             arena.push((flatten_path_reusing(&data, &m, self.curve_tolerance, contour), closed));
@@ -362,14 +378,20 @@ impl ShapeWalker<'_> {
           let pos = r.position.eval(self.frame);
           let size = r.size.eval(self.frame);
           let radius = r.radius.eval(self.frame);
+          self.scratch.budget.points(if radius <= 0.0 { 4 } else { 1024 })?;
           arena.push((rect_contour(pos, size, radius, r.reversed, &m, self.curve_tolerance), true));
         }
         Shape::Ellipse(e) => {
           let pos = e.position.eval(self.frame);
           let size = e.size.eval(self.frame);
+          self.scratch.budget.points(512)?;
           arena.push((ellipse_contour(pos, size, e.reversed, &m, self.curve_tolerance), true));
         }
         Shape::Polystar(ps) => {
+          let points = ps.points.eval(self.frame);
+          if !points.is_finite() || points.abs() > crate::Limits::default().max_polystar_points {
+            return Err(crate::Error::LimitExceeded(crate::Limit::PolystarPoints));
+          }
           let data = polystar_path(
             ps.star,
             ps.reversed,
@@ -381,6 +403,7 @@ impl ShapeWalker<'_> {
             ps.inner_roundness.eval(self.frame),
             ps.outer_roundness.eval(self.frame),
           );
+          self.scratch.budget.path(&data, &m, self.curve_tolerance)?;
           let contour = self.scratch.take_contour();
           arena.push((flatten_path_reusing(&data, &m, self.curve_tolerance, contour), true));
         }
@@ -391,15 +414,35 @@ impl ShapeWalker<'_> {
           if radius > 0.0 {
             if let Some(range) = arena.get_mut(scope_start..) {
               for (contour, closed) in range {
+                self.scratch.budget.points(contour.points.len().saturating_mul(4).saturating_add(4))?;
                 *contour = round_polyline_corners(contour, *closed, radius);
               }
             }
           }
         }
         Shape::Trim(tr) => {
-          self.apply_trim(tr, arena, pending, scope_start);
+          self.apply_trim(tr, arena, pending, scope_start)?;
         }
         Shape::Repeater(rp) => {
+          let copies = rp.copies.eval(self.frame);
+          if !copies.is_finite() || copies > crate::Limits::default().max_repeater_copies {
+            return Err(crate::Error::LimitExceeded(crate::Limit::RepeaterCopies));
+          }
+          let copies = copies.max(0.0) as usize;
+          let base_contours = arena.len() - scope_start;
+          let points = arena.iter().skip(scope_start).fold(0usize, |n, (c, _)| n.saturating_add(c.points.len()));
+          self.scratch.budget.points(points.saturating_mul(copies))?;
+          // Every copied arena entry also carries a fixed `Contour` footprint
+          // (two Vec headers + linearization cache, ~64 bytes = 8 point slots)
+          // even when its point list is empty (authored 0-vertex paths or
+          // trim-cleared geometry), which would otherwise let a parser-legal
+          // 10k-contour scope × 64 copies balloon the arena to tens of MB
+          // before the next check fires.
+          self.scratch.budget.points(base_contours.saturating_mul(copies).saturating_mul(8))?;
+          self.scratch.budget.work(pending.len().saturating_add(arena.len()).saturating_mul(copies))?;
+          if pending.len().saturating_mul(copies.saturating_add(1)) > crate::Limits::default().max_paints_per_layer {
+            return Err(crate::Error::LimitExceeded(crate::Limit::PaintsPerLayer));
+          }
           self.apply_repeater(rp, m, arena, pending, scope_start, jobs_start);
         }
         Shape::Fill(f) => {
@@ -435,7 +478,7 @@ impl ShapeWalker<'_> {
           let end_p = gf.end.eval(self.frame);
           let inv = m.inverse();
           let stops = gf.stops.eval(self.frame);
-          let (lut, lut_id) = self.scratch.lut_for(&stops, gf.color_count, paint_opacity);
+          let (lut, lut_id) = self.scratch.lut_for(&stops, gf.color_count, paint_opacity)?;
           let map = match gf.kind {
             GradientKind::Linear => linear_map(start_p, end_p, inv),
             GradientKind::Radial => radial_map(start_p, end_p, inv, gf.highlight_len.eval(self.frame), gf.highlight_angle.eval(self.frame)),
@@ -500,7 +543,7 @@ impl ShapeWalker<'_> {
           let end_p = gs.end.eval(self.frame);
           let inv = m.inverse();
           let stops = gs.stops.eval(self.frame);
-          let (lut, lut_id) = self.scratch.lut_for(&stops, gs.color_count, paint_opacity);
+          let (lut, lut_id) = self.scratch.lut_for(&stops, gs.color_count, paint_opacity)?;
           let map = match gs.kind {
             GradientKind::Linear => linear_map(start_p, end_p, inv),
             GradientKind::Radial => radial_map(start_p, end_p, inv, gs.highlight_len.eval(self.frame), gs.highlight_angle.eval(self.frame)),
@@ -527,6 +570,9 @@ impl ShapeWalker<'_> {
           });
         }
       }
+    }
+    if pending.len() > crate::Limits::default().max_paints_per_layer || arena.len() > crate::Limits::default().max_shapes_per_layer {
+      return Err(crate::Error::LimitExceeded(crate::Limit::RenderGeometry));
     }
     let _ = jobs_start;
     Ok(())
@@ -644,7 +690,7 @@ impl ShapeWalker<'_> {
     }
   }
 
-  fn apply_trim(&self, tr: &crate::model::Trim, arena: &mut Vec<(Contour, bool)>, pending: &mut Vec<PendingJob>, scope_start: usize) {
+  fn apply_trim(&self, tr: &crate::model::Trim, arena: &mut Vec<(Contour, bool)>, pending: &mut Vec<PendingJob>, scope_start: usize) -> Result<()> {
     let start_pct = tr.start.eval(self.frame) / 100.0;
     let end_pct = tr.end.eval(self.frame) / 100.0;
     // rlottie LOTTrimData::segment() (lottiemodel.h): offset is
@@ -658,11 +704,14 @@ impl ShapeWalker<'_> {
           c.points.clear();
         }
       }
-      return;
+      return Ok(());
     }
     if diff >= 1.0 - 1e-6 {
-      return; // full path
+      return Ok(()); // full path
     }
+    let points = arena.iter().skip(scope_start).fold(0usize, |n, (c, _)| n.saturating_add(c.points.len()));
+    self.scratch.budget.work(points.saturating_mul(4))?;
+    self.scratch.budget.points(points.saturating_mul(2).saturating_add(arena.len().saturating_mul(4)))?;
     let s = start_pct + offset;
     let e = end_pct + offset;
     let noloop = |a: f32, b: f32| (a.min(b), a.max(b));
@@ -724,14 +773,14 @@ impl ShapeWalker<'_> {
               }
             }
           }
-          i = splice_trimmed(arena, pending, i, pieces);
+          i = splice_trimmed(arena, pending, i, pieces, &self.scratch.budget)?;
         }
       }
       TrimMode::Individual => {
         let totals: Vec<f32> = arena.get(scope_start..).unwrap_or(&[]).iter().map(|(c, cl)| polyline_length(&c.points, *cl, c.inv_lin)).collect();
         let grand: f32 = totals.iter().sum();
         if grand <= 1e-6 {
-          return;
+          return Ok(());
         }
         let mut i = scope_start;
         let mut acc = 0.0f32;
@@ -758,10 +807,11 @@ impl ShapeWalker<'_> {
           }
           acc += total;
           ti += 1;
-          i = splice_trimmed(arena, pending, i, pieces);
+          i = splice_trimmed(arena, pending, i, pieces, &self.scratch.budget)?;
         }
       }
     }
+    Ok(())
   }
 
   /// True when clipping is a bit-exact no-op for this contour: its bbox
@@ -931,33 +981,33 @@ impl ShapeWalker<'_> {
   }
 
   #[cfg(test)]
-  pub(super) fn clip_all(&self, c: &Contour) -> Contour {
+  pub(super) fn clip_all(&self, c: &Contour) -> Result<Contour> {
     if self.clip_is_noop(c) {
-      return c.clone();
+      return Ok(c.clone());
     }
     let wf = self.width as f32;
     let hf = self.height as f32;
     let mut c = c.clone();
     for quad in self.clip.iter() {
-      c = clip_to_quad(&c, quad);
+      c = clip_to_quad(&c, quad, &self.scratch.budget)?;
     }
-    clip_contour(&c, wf, hf)
+    clip_contour(&c, wf, hf, &self.scratch.budget)
   }
 
   /// clip_all for OWNED temporaries (stroke pieces): moves the contour
   /// through unchanged when nothing clips — the borrowing variant clones
   /// every piece, which the profiler showed as pure allocator churn.
-  fn clip_all_owned(&self, c: Contour) -> Contour {
+  fn clip_all_owned(&self, c: Contour) -> Result<Contour> {
     if self.unbounded || self.clip_is_noop(&c) {
-      return c;
+      return Ok(c);
     }
     let wf = self.width as f32;
     let hf = self.height as f32;
     let mut c = c;
     for quad in self.clip.iter() {
-      c = clip_to_quad(&c, quad);
+      c = clip_to_quad(&c, quad, &self.scratch.budget)?;
     }
-    clip_contour(&c, wf, hf)
+    clip_contour(&c, wf, hf, &self.scratch.budget)
   }
 }
 
@@ -966,7 +1016,16 @@ impl ShapeWalker<'_> {
 /// inside every paint range that covered the original contour; recorded
 /// job indices past the insertion point are shifted to compensate.
 /// Returns the index of the next original entry.
-fn splice_trimmed(arena: &mut Vec<(Contour, bool)>, pending: &mut Vec<PendingJob>, idx: usize, mut pieces: Vec<(Vec<Vec2>, Vec<bool>)>) -> usize {
+fn splice_trimmed(
+  arena: &mut Vec<(Contour, bool)>,
+  pending: &mut Vec<PendingJob>,
+  idx: usize,
+  mut pieces: Vec<(Vec<Vec2>, Vec<bool>)>,
+  budget: &crate::renderer::frame::budget::Budget,
+) -> Result<usize> {
+  if pieces.len() > 1 {
+    budget.work(arena.len().saturating_add(pending.len()))?;
+  }
   let (first, first_anchors) = if pieces.is_empty() { (Vec::new(), Vec::new()) } else { pieces.remove(0) };
   if let Some((contour, closed)) = arena.get_mut(idx) {
     contour.points = first;
@@ -998,7 +1057,7 @@ fn splice_trimmed(arena: &mut Vec<(Contour, bool)>, pending: &mut Vec<PendingJob
       }
     }
   }
-  idx + 1 + extra
+  Ok(idx + 1 + extra)
 }
 
 /// Clones a pending paint with opacity scaled (repeater copies).

@@ -74,6 +74,16 @@ pub struct Limits {
   pub max_assets: usize,
   /// Maximum composition width/height in points, and render size in pixels.
   pub max_dimension: u32,
+  /// Maximum generated geometry points charged cumulatively per frame.
+  pub max_render_points: usize,
+  /// Maximum geometry/raster work units charged per frame.
+  pub max_render_work: usize,
+  /// Maximum weighted pixel visits for paints, masks and compositing per frame.
+  /// Solid fills cost 1 per pixel; linear, radial and focal gradients cost
+  /// 8, 16 and 32 respectively, including cached coverage replay.
+  pub max_render_pixels: usize,
+  /// Maximum canvas-dependent scratch allocation estimate, in bytes.
+  pub max_render_bytes: usize,
 }
 
 impl Default for Limits {
@@ -112,6 +122,10 @@ impl Default for Limits {
       max_repeater_product_per_group: 4096,
       max_assets: 256,
       max_dimension: 8192,
+      max_render_points: 262_144,
+      max_render_work: 4_194_304,
+      max_render_pixels: 64 * 1024 * 1024,
+      max_render_bytes: 64 * 1024 * 1024,
     }
   }
 }

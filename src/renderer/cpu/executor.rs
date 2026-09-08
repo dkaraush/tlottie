@@ -10,9 +10,7 @@ use crate::error::Error;
 use crate::error::Result;
 #[cfg(test)]
 use crate::geometry::flatten_path;
-use crate::geometry::{
-  clip_contour, clip_to_quad, dash_polyline, ellipse_contour, extract_by_length, flatten_path_reusing, polystar_path, quad_contains_box, rect_contour, round_polyline_corners, Contour,
-};
+use crate::geometry::{clip_contour, clip_to_quad, ellipse_contour, extract_by_length, flatten_path_reusing, polystar_path, quad_contains_box, rect_contour, round_polyline_corners, Contour};
 #[cfg(test)]
 use crate::limits::Limits;
 use crate::math::{Color, Mat2x3, Vec2};
@@ -40,6 +38,7 @@ pub(crate) const MAX_PRECOMP_DEPTH: usize = 16;
 /// Dropping it frees everything; it carries no per-composition state.
 #[derive(Default)]
 pub(crate) struct RenderScratch {
+  pub(crate) budget: crate::renderer::frame::budget::Budget,
   rasters: Vec<Rasterizer>,
   cells_pool: Vec<CellRaster>,
   #[cfg(test)]
@@ -134,6 +133,28 @@ const LUT_CACHE_CAP: usize = 512;
 const SCRATCH_POOL_CAP: usize = 4;
 
 impl RenderScratch {
+  pub(crate) fn trim_geometry_pools(&mut self) {
+    let mut remaining = 4usize * 1024 * 1024;
+    self.pts_pool.retain(|points| {
+      let bytes = points.capacity().saturating_mul(core::mem::size_of::<Vec2>());
+      if bytes > remaining {
+        false
+      } else {
+        remaining -= bytes;
+        true
+      }
+    });
+    self.contour_pool.retain(|contour| {
+      let bytes = contour.points.capacity().saturating_mul(core::mem::size_of::<Vec2>()).saturating_add(contour.anchors.capacity());
+      if bytes > remaining {
+        false
+      } else {
+        remaining -= bytes;
+        true
+      }
+    });
+  }
+
   pub(crate) fn take_raster(&mut self, w: usize, h: usize) -> Rasterizer {
     match self.rasters.pop() {
       Some(mut r) => {
@@ -258,9 +279,12 @@ impl RenderScratch {
 
   /// Returns the LUT plus a 64-bit id of its exact inputs (used in the
   /// gradient source-plane cache key).
-  fn lut_for(&mut self, stops: &crate::model::FloatList, color_count: usize, opacity: f32) -> (GradientLut, u64) {
+  fn lut_for(&mut self, stops: &crate::model::FloatList, color_count: usize, opacity: f32) -> Result<(GradientLut, u64)> {
     self.lut_key.clear();
-    self.lut_key.reserve(stops.0.len() + 2);
+    self
+      .lut_key
+      .try_reserve(stops.0.len().saturating_add(2))
+      .map_err(|_| crate::Error::LimitExceeded(crate::Limit::RenderMemory))?;
     self.lut_key.push(color_count as u32);
     self.lut_key.push(opacity.to_bits());
     for v in &stops.0 {
@@ -272,14 +296,16 @@ impl RenderScratch {
     }
     let id = h.finish() as u64;
     if let Some(lut) = self.lut_cache.get(self.lut_key.as_slice()) {
-      return (lut.clone(), id);
+      return Ok((lut.clone(), id));
     }
+    // Each LUT sample can scan the color and opacity stops on a cache miss.
+    self.budget.work(GRADIENT_LUT_SIZE.saturating_mul(stops.0.len().saturating_add(1)))?;
     let lut = build_gradient_lut(stops, color_count, opacity);
     if self.lut_cache.len() >= LUT_CACHE_CAP {
       self.lut_cache.clear();
     }
     self.lut_cache.insert(self.lut_key.clone(), lut.clone());
-    (lut, id)
+    Ok((lut, id))
   }
 }
 
@@ -429,7 +455,7 @@ impl RenderCtx<'_> {
           // `da` is exactly the region the modulate below reads and
           // the only region where buf_a is nonzero — bound the mask
           // build to it (byte-exact; see build_mask).
-          let maskbuf = self.build_mask(scratch, layer, m, frame, w, h, da);
+          let maskbuf = self.build_mask(scratch, layer, m, frame, w, h, da)?;
           for_rows_boxed(&mut buf_a, w, da, |y, row| {
             let lo = y * w + da.x0;
             if let Some(mask_row) = maskbuf.get(lo..lo + row.len()) {
@@ -457,7 +483,7 @@ impl RenderCtx<'_> {
             scratch.put_cells(off.cells.take().expect("matte has cell rasterizer"));
             res?;
             if !src.masks.is_empty() && !db.is_empty() {
-              let maskbuf = self.build_mask(scratch, src, sm, frame, w, h, db);
+              let maskbuf = self.build_mask(scratch, src, sm, frame, w, h, db)?;
               // Bound the modulate to `db` too — outside it
               // buf_b is 0 (modulate maps 0 → 0), so this is
               // byte-exact vs the former full-plane modulate.
@@ -548,7 +574,7 @@ impl RenderCtx<'_> {
           if admit_now || walker.scratch.jobs_seen.contains(&rkey) {
             let mut rec = Vec::new();
             let (arena, pending) = walker.walk_shapes(&layer.shapes, m, content_opacity, 0)?;
-            walker.render_shape_jobs_cpu(canvas, &arena, &pending, Some(&mut rec));
+            walker.render_shape_jobs_cpu(canvas, &arena, &pending, Some(&mut rec))?;
             if walker.scratch.jobs_cache.len() >= JOBS_CACHE_CAP {
               walker.scratch.jobs_cache.clear();
             }
@@ -559,11 +585,11 @@ impl RenderCtx<'_> {
             }
             walker.scratch.jobs_seen.insert(rkey);
             let (arena, pending) = walker.walk_shapes(&layer.shapes, m, content_opacity, 0)?;
-            walker.render_shape_jobs_cpu(canvas, &arena, &pending, None);
+            walker.render_shape_jobs_cpu(canvas, &arena, &pending, None)?;
           }
         } else {
           let (arena, pending) = walker.walk_shapes(&layer.shapes, m, content_opacity, 0)?;
-          walker.render_shape_jobs_cpu(canvas, &arena, &pending, None);
+          walker.render_shape_jobs_cpu(canvas, &arena, &pending, None)?;
         }
       }
       LayerKind::Solid => {
@@ -582,7 +608,7 @@ impl RenderCtx<'_> {
             unbounded: false,
           };
           let key = walker.fill_key(core::slice::from_ref(&(contour.clone(), true)), FillRule::NonZero);
-          let contours: Vec<Contour> = if walker.scratch.cov_cache.contains(key) { Vec::new() } else { vec![walker.clip_all(&contour)] };
+          let contours: Vec<Contour> = if walker.scratch.cov_cache.contains(key) { Vec::new() } else { vec![walker.clip_all(&contour)?] };
           canvas.fill::<false>(&mut walker.scratch.cov_cache, key, &contours, FillRule::NonZero, color, content_opacity);
         }
       }
@@ -657,7 +683,7 @@ impl RenderCtx<'_> {
   /// pixel, identically to the former full-plane loop.
   #[allow(clippy::too_many_arguments)]
   #[cfg(test)]
-  fn build_mask(&self, scratch: &mut RenderScratch, layer: &Layer, m: Mat2x3, frame: f32, w: usize, h: usize, bound: DirtyBox) -> Vec<u8> {
+  fn build_mask(&self, scratch: &mut RenderScratch, layer: &Layer, m: Mat2x3, frame: f32, w: usize, h: usize, bound: DirtyBox) -> Result<Vec<u8>> {
     let effective = |mode: u8| matches!(mode, b'a' | b's' | b'i' | b'f');
     let first_additive = layer.masks.iter().find(|mask| effective(mask.mode)).map(|mask| matches!(mask.mode, b'a' | b'f')).unwrap_or(true); // all-None: acc stays 0 → layer hidden
                                                                                                                                             // acc/tmp stay full-canvas length (indexed by y*w+x) but only `bound`
@@ -676,7 +702,7 @@ impl RenderCtx<'_> {
       let opacity = (mask.opacity.eval(frame) / 100.0).clamp(0.0, 1.0);
       let data = mask.path.eval(frame);
       let contour = flatten_path(&data, &m, self.curve_tolerance);
-      let clipped = clip_contour(&contour, w as f32, h as f32);
+      let clipped = clip_contour(&contour, w as f32, h as f32, &scratch.budget)?;
       // Clear only `bound`; the rasterizer sweep below overwrites the
       // mask's covered pixels, leaving `bound`-but-uncovered pixels at 0
       // (coverage t=0), exactly as the former `tmp.fill(0)` did there.
@@ -733,7 +759,7 @@ impl RenderCtx<'_> {
     scratch.put_u8(tmp);
     scratch.put_raster(raster);
     scratch.put_cells(cells);
-    acc
+    Ok(acc)
   }
 }
 
@@ -854,6 +880,7 @@ fn luma_premult(p: u32, order: crate::ChannelOrder) -> u32 {
 /// Composites premultiplied `src` over `dst` with a global opacity factor.
 /// Combined matrix of all ancestors of `layer` within `layers` (not
 /// including the layer itself). Cycle-safe: walks at most `layers.len()`.
+#[cfg(test)]
 pub(crate) fn parent_chain_matrix(layers: &[Layer], layer: &Layer, frame: f32) -> Mat2x3 {
   let mut chain: Vec<Mat2x3> = Vec::new();
   let mut current = layer.parent;
@@ -901,7 +928,7 @@ pub(crate) fn layer_transform_at(layer: &Layer, frame: f32) -> (Mat2x3, f32) {
 }
 
 /// Evaluates a Transform at a frame into (matrix, opacity 0..=1).
-fn transform_at(tf: &Transform, frame: f32) -> (Mat2x3, f32) {
+pub(crate) fn transform_at(tf: &Transform, frame: f32) -> (Mat2x3, f32) {
   let anchor = tf.anchor.eval(frame);
   let position = tf.position.eval(frame);
   let scale = tf.scale.eval(frame);

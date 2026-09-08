@@ -93,7 +93,11 @@ impl CPURenderer {
   }
 
   /// Renders a frame with explicit [`crate::RenderOptions`].
+  ///
+  /// Resource limits can interrupt a frame with [`crate::Error::LimitExceeded`].
+  /// Discard the partially rendered output on error; the renderer remains usable.
   pub fn render(&mut self, frame: f32, pixels: &mut [u32], width: u32, height: u32, options: crate::RenderOptions) -> Result<()> {
+    crate::renderer::frame::budget::canvas_size(width, height)?;
     if options.clear && self.comp.is_static() {
       if let Some(cached) = &self.static_bitmap {
         if cached.width == width && cached.height == height && cached.options == options {
@@ -112,6 +116,12 @@ impl CPURenderer {
     let mut walker = core::mem::take(&mut self.walker);
     let result = self.with_bitmap(pixels, width, height, options, |renderer| walker.render(&composition, frame, width, height, options, renderer));
     self.walker = walker;
+    if result.is_err() {
+      self.walker = Default::default();
+      self.state = Default::default();
+      self.static_bitmap = None;
+      self.row_bounds_pool.clear();
+    }
     if result.is_ok() && options.clear && self.comp.is_static() {
       let pixel_count = (width as usize).saturating_mul(height as usize);
       let cache_fits = pixel_count.checked_mul(core::mem::size_of::<u32>()).is_some_and(|bytes| bytes <= STATIC_BITMAP_CACHE_BYTES);
@@ -123,7 +133,16 @@ impl CPURenderer {
           width,
           height,
           options,
-          pixels: rendered.to_vec(),
+          pixels: {
+            let mut cached = Vec::new();
+            if cached.try_reserve_exact(pixel_count).is_err() {
+              // Caching is optional; the frame has already rendered.
+              self.static_bitmap = None;
+              return result;
+            }
+            cached.extend_from_slice(rendered);
+            cached
+          },
         });
       } else {
         self.static_bitmap = None;
@@ -133,7 +152,9 @@ impl CPURenderer {
   }
 
   /// Renders a frame directly into a one-byte-per-pixel alpha mask.
+  /// Discard the output on error, as with [`Self::render`].
   pub fn render_alpha8(&mut self, frame: f32, alpha: &mut [u8], width: u32, height: u32, mut options: crate::RenderOptions) -> Result<()> {
+    crate::renderer::frame::budget::canvas_size(width, height)?;
     let limits = crate::Limits::default();
     if width == 0 || height == 0 || width > limits.max_dimension || height > limits.max_dimension {
       return Err(crate::Error::InvalidLottie {
@@ -159,6 +180,9 @@ impl CPURenderer {
     // allocates or converts a color bitmap.
     if composition_uses_luma_matte(&self.comp) {
       let mut color = core::mem::take(&mut self.alpha_fallback);
+      if color.try_reserve(pixel_count.saturating_sub(color.len())).is_err() {
+        return Err(crate::Error::LimitExceeded(crate::Limit::RenderMemory));
+      }
       color.resize(pixel_count, 0);
       options.alpha_only = false;
       let result = self.render(frame, &mut color, width, height, options);
@@ -179,6 +203,12 @@ impl CPURenderer {
     let result = walker.render(&composition, frame, width, height, options, &mut backend);
     backend.finish();
     self.walker = walker;
+    if result.is_err() {
+      self.walker = Default::default();
+      self.state = Default::default();
+      self.static_bitmap = None;
+      self.row_bounds_pool.clear();
+    }
     result
   }
 }

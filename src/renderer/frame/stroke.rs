@@ -8,6 +8,8 @@
 use crate::compat::FloatExt as _;
 use crate::geometry::Contour;
 use crate::math::Vec2;
+use crate::renderer::frame::budget::Budget;
+use crate::{Error, Limit, Result};
 use alloc::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,16 +44,17 @@ const ARC_TOL: f32 = 0.05;
 /// Do not retain pathological stroke-segment buffers between calls.
 const SEGMENT_REUSE_CAP: usize = 512;
 
-struct Border {
+struct Border<'a> {
+  budget: &'a Budget,
   pts: Vec<Vec2>,
   /// FT `movable` (VFT:392-423): the last point is a straight-segment
   /// end offset that the next corner may REPLACE instead of append.
   movable: bool,
 }
 
-impl Border {
-  fn new(pts: Vec<Vec2>) -> Border {
-    Border { pts, movable: false }
+impl<'a> Border<'a> {
+  fn new(pts: Vec<Vec2>, budget: &'a Budget) -> Border<'a> {
+    Border { pts, movable: false, budget }
   }
 
   /// FT border_lineto: replace-if-movable, else append (with the 1/32px
@@ -61,7 +64,7 @@ impl Border {
   /// path let the next lineto REPLACE a point that was never emitted
   /// (measured: ate a notch wall on GameEmoji's slit glyphs, a
   /// 2,217px phantom-coverage needle).
-  fn line_to(&mut self, p: Vec2, movable: bool) {
+  fn line_to(&mut self, p: Vec2, movable: bool) -> Result<()> {
     if self.movable {
       if let Some(last) = self.pts.last_mut() {
         *last = p;
@@ -69,30 +72,35 @@ impl Border {
     } else {
       let dup = self.pts.last().is_some_and(|q| (q.x - p.x).abs() < 0.03125 && (q.y - p.y).abs() < 0.03125);
       if dup {
-        return;
+        return Ok(());
       }
+      self.budget.points(1)?;
+      self.pts.try_reserve(1).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
       self.pts.push(p);
     }
     self.movable = movable;
+    Ok(())
   }
 
   /// Polygonal arc around `center`, radius `r`, from unit vector `start`
   /// to unit vector `end` while sweeping `sweep` radians. The start point
   /// is already present, so emission starts at step 1.
-  fn arc_to(&mut self, center: Vec2, r: f32, start: Vec2, end: Vec2, sweep: f32) {
+  fn arc_to(&mut self, center: Vec2, r: f32, start: Vec2, end: Vec2, sweep: f32) -> Result<()> {
     self.movable = false;
     let step = (8.0 * ARC_TOL / r.max(1e-3)).sqrt().clamp(0.0655, 0.35);
     let steps = ((sweep.abs() / step).ceil() as usize).clamp(1, 48);
-    self.pts.reserve(steps);
+    self.budget.points(steps)?;
+    self.pts.try_reserve(steps).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
     if steps == 1 {
       self.pts.push(Vec2::new(center.x + r * end.x, center.y + r * end.y));
-      return;
+      return Ok(());
     }
     let a0 = start.y.atan2(start.x);
     for i in 1..=steps {
       let a = a0 + sweep * (i as f32 / steps as f32);
       self.pts.push(Vec2::new(center.x + r * a.cos(), center.y + r * a.sin()));
     }
+    Ok(())
   }
 }
 
@@ -133,7 +141,8 @@ pub(crate) fn stroke_outline(
   pool: &mut Vec<Vec<Vec2>>,
   segments: &mut Vec<StrokeSegment>,
   out: &mut Vec<Contour>,
-) {
+  budget: &Budget,
+) -> Result<()> {
   let ml = if miter_limit.is_finite() { miter_limit.max(1.0) } else { 4.0 };
   let anchor_at = |i: usize| anchors.get(i).copied().unwrap_or(true);
 
@@ -142,7 +151,9 @@ pub(crate) fn stroke_outline(
   let n = pts.len();
   let seg_count = if closed { n } else { n.saturating_sub(1) };
   segments.clear();
-  segments.reserve(seg_count);
+  budget.work(seg_count)?;
+  segments.try_reserve(seg_count).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
+  out.try_reserve(2).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
   let mut dropped_gap = false;
   for s in 0..seg_count {
     let Some(&p0) = pts.get(s) else { continue };
@@ -172,25 +183,25 @@ pub(crate) fn stroke_outline(
   // open end cap).
   let seam_gap = dropped_gap || segments.first().is_some_and(|s| s.gap_before);
   if segments.is_empty() {
-    return;
+    return Ok(());
   }
 
-  let mut b0 = Border::new(pool.pop().unwrap_or_default());
-  let mut b1 = Border::new(pool.pop().unwrap_or_default());
+  let mut b0 = Border::new(pool.pop().unwrap_or_default(), budget);
+  let mut b1 = Border::new(pool.pop().unwrap_or_default(), budget);
   b0.pts.clear();
   b1.pts.clear();
   let cap_pts = 2 + (core::f32::consts::PI / 0.0655) as usize;
-  b0.pts.reserve(2 * segments.len() + cap_pts + 8);
-  b1.pts.reserve(2 * segments.len() + 8);
+  b0.pts.try_reserve(2 * segments.len() + cap_pts + 8).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
+  b1.pts.try_reserve(2 * segments.len() + 8).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
 
   // Subpath start: moveto on each border (movable = false).
   let (first_d, first_p) = match segments.first() {
     Some(s) => (s.d, s.p),
-    None => return,
+    None => return Ok(()),
   };
   let n0 = Vec2::new(-first_d.y * hw, first_d.x * hw);
-  b0.pts.push(Vec2::new(first_p.x + n0.x, first_p.y + n0.y));
-  b1.pts.push(Vec2::new(first_p.x - n0.x, first_p.y - n0.y));
+  b0.line_to(Vec2::new(first_p.x + n0.x, first_p.y + n0.y), false)?;
+  b1.line_to(Vec2::new(first_p.x - n0.x, first_p.y - n0.y), false)?;
 
   let mut prev_d = first_d;
   let mut prev_len = segments.first().map_or(0.0, |s| if s.is_line { s.len } else { 0.0 });
@@ -214,14 +225,14 @@ pub(crate) fn stroke_outline(
         hw,
         join,
         ml,
-      );
+      )?;
     }
     // Segment end offsets (movable — the next inside intersection may
     // replace them).
     let q = Vec2::new(seg.p.x + seg.d.x * seg.len, seg.p.y + seg.d.y * seg.len);
     let nn = Vec2::new(-seg.d.y * hw, seg.d.x * hw);
-    b0.line_to(Vec2::new(q.x + nn.x, q.y + nn.y), true);
-    b1.line_to(Vec2::new(q.x - nn.x, q.y - nn.y), true);
+    b0.line_to(Vec2::new(q.x + nn.x, q.y + nn.y), true)?;
+    b1.line_to(Vec2::new(q.x - nn.x, q.y - nn.y), true)?;
     prev_d = seg.d;
     prev_len = if seg.is_line { seg.len } else { 0.0 };
     prev_raw = seg.len;
@@ -247,7 +258,7 @@ pub(crate) fn stroke_outline(
       hw,
       join,
       ml,
-    );
+    )?;
     ring_close(&mut b0.pts, false);
     ring_close(&mut b1.pts, true);
     // Canonical flip: FT-natural band winding is opposite the legacy
@@ -307,14 +318,16 @@ pub(crate) fn stroke_outline(
     // reversed, start cap — one closed loop.
     let last = match segments.last() {
       Some(s) => s,
-      None => return,
+      None => return Ok(()),
     };
     let end_center = Vec2::new(last.p.x + last.d.x * last.len, last.p.y + last.d.y * last.len);
     let mut loop_pts = b0.pts;
-    emit_cap(&mut loop_pts, end_center, last.d, hw, cap);
+    emit_cap(&mut loop_pts, end_center, last.d, hw, cap, budget)?;
+    budget.points(b1.pts.len())?;
+    loop_pts.try_reserve(b1.pts.len()).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
     loop_pts.extend(b1.pts.iter().rev().copied());
     pool.push(b1.pts);
-    emit_cap(&mut loop_pts, first_p, Vec2::new(-first_d.x, -first_d.y), hw, cap);
+    emit_cap(&mut loop_pts, first_p, Vec2::new(-first_d.x, -first_d.y), hw, cap, budget)?;
     // Canonical flip (see closed case).
     loop_pts.reverse();
     if loop_pts.len() >= 3 {
@@ -327,6 +340,7 @@ pub(crate) fn stroke_outline(
       pool.push(loop_pts);
     }
   }
+  Ok(())
 }
 
 /// FT process_corner (VFT:1033-1060) + inside (VFT:846-897) + outside
@@ -334,9 +348,9 @@ pub(crate) fn stroke_outline(
 /// unreachable). `d_in`/`d_out` unit; `prev_len`/`next_len` are 0 for
 /// curve chords (disables the inside intersection, VFT:861-871).
 #[allow(clippy::too_many_arguments)]
-fn process_corner(
-  b0: &mut Border,
-  b1: &mut Border,
+fn process_corner<'a>(
+  b0: &mut Border<'a>,
+  b1: &mut Border<'a>,
   p: Vec2,
   d_in: Vec2,
   d_out: Vec2,
@@ -349,11 +363,11 @@ fn process_corner(
   hw: f32,
   join: Join,
   ml: f32,
-) {
+) -> Result<()> {
   let cross = d_in.x * d_out.y - d_in.y * d_out.x;
   let dot = d_in.x * d_out.x + d_in.y * d_out.y;
   if cross.abs() < EPS_TURN && dot >= 0.0 {
-    return; // straight continuation
+    return Ok(()); // straight continuation
   }
   // Reversal: turn == +pi by convention (VFT:776, 926-928).
   let reversal = cross.abs() < EPS_TURN && dot < 0.0;
@@ -393,12 +407,12 @@ fn process_corner(
     if can_intersect {
       let k = hw / denom;
       let ip = Vec2::new(p.x + si * (n_in.x + n_out.x) * k, p.y + si * (n_in.y + n_out.y) * k);
-      bi.line_to(ip, false);
+      bi.line_to(ip, false)?;
     } else {
       // Double-back: keep incoming end offset, append outgoing start
       // offset (VFT:874-894).
       bi.movable = false;
-      bi.line_to(Vec2::new(p.x + si * n_out.x * hw, p.y + si * n_out.y * hw), false);
+      bi.line_to(Vec2::new(p.x + si * n_out.x * hw, p.y + si * n_out.y * hw), false)?;
     }
   }
 
@@ -411,9 +425,9 @@ fn process_corner(
       let denom = 1.0 + dot;
       if denom > 1e-6 {
         let k = hw / denom;
-        bo.line_to(Vec2::new(p.x + so * (n_in.x + n_out.x) * k, p.y + so * (n_in.y + n_out.y) * k), false);
+        bo.line_to(Vec2::new(p.x + so * (n_in.x + n_out.x) * k, p.y + so * (n_in.y + n_out.y) * k), false)?;
       }
-      return;
+      return Ok(());
     }
     match eff_join {
       Join::Round => {
@@ -427,7 +441,7 @@ fn process_corner(
         } else {
           cross.atan2(dot)
         };
-        bo.arc_to(p, hw, start, end, sweep);
+        bo.arc_to(p, hw, start, end, sweep)?;
       }
       Join::Bevel | Join::Miter => {
         let denom = 1.0 + dot;
@@ -440,11 +454,11 @@ fn process_corner(
           // replace-if-movable lineto is collinear-safe
           // (VFT:1004-1013 keeps `movable` set).
           let k = hw / denom;
-          bo.line_to(Vec2::new(p.x + so * (n_in.x + n_out.x) * k, p.y + so * (n_in.y + n_out.y) * k), false);
+          bo.line_to(Vec2::new(p.x + so * (n_in.x + n_out.x) * k, p.y + so * (n_in.y + n_out.y) * k), false)?;
           if next_len <= 0.0 {
             // Curve corner: FT appends the outgoing start
             // offset too (VFT:1016-1025).
-            bo.line_to(Vec2::new(p.x + so * n_out.x * hw, p.y + so * n_out.y * hw), false);
+            bo.line_to(Vec2::new(p.x + so * n_out.x * hw, p.y + so * n_out.y * hw), false)?;
           }
         } else {
           // Fixed bevel: the chord needs BOTH the incoming end
@@ -453,11 +467,12 @@ fn process_corner(
           // (VFT:957-958; replacing here ate a sliver of the
           // band — the OutlineEmoji "notch" corpus signature).
           bo.movable = false;
-          bo.line_to(Vec2::new(p.x + so * n_out.x * hw, p.y + so * n_out.y * hw), false);
+          bo.line_to(Vec2::new(p.x + so * n_out.x * hw, p.y + so * n_out.y * hw), false)?;
         }
       }
     }
   }
+  Ok(())
 }
 
 /// Signed shoelace area of a ring (inner/outer + orientation-pair
@@ -494,11 +509,13 @@ fn ring_close(pts: &mut Vec<Vec2>, reverse: bool) {
 
 /// Cap boundary from the +n side to the -n side of direction `d` at `end`
 /// (legacy cap_points semantics; round caps sagitta-bounded like joins).
-fn emit_cap(out: &mut Vec<Vec2>, end: Vec2, d: Vec2, hw: f32, cap: Cap) {
+fn emit_cap(out: &mut Vec<Vec2>, end: Vec2, d: Vec2, hw: f32, cap: Cap, budget: &Budget) -> Result<()> {
   let n = Vec2::new(-d.y * hw, d.x * hw);
   match cap {
     Cap::Butt => {}
     Cap::Square => {
+      budget.points(2)?;
+      out.try_reserve(2).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
       let e = Vec2::new(end.x + d.x * hw, end.y + d.y * hw);
       out.push(Vec2::new(e.x + n.x, e.y + n.y));
       out.push(Vec2::new(e.x - n.x, e.y - n.y));
@@ -515,13 +532,15 @@ fn emit_cap(out: &mut Vec<Vec2>, end: Vec2, d: Vec2, hw: f32, cap: Cap) {
       }
       let step = (8.0 * ARC_TOL / hw.max(1e-3)).sqrt().clamp(0.0655, 0.35);
       let steps = ((sweep.abs() / step).ceil() as usize).clamp(1, 48);
-      out.reserve(steps.saturating_sub(1));
+      budget.points(steps.saturating_sub(1))?;
+      out.try_reserve(steps.saturating_sub(1)).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
       for i in 1..steps {
         let a = a0 + sweep * (i as f32 / steps as f32);
         out.push(Vec2::new(end.x + hw * a.cos(), end.y + hw * a.sin()));
       }
     }
   }
+  Ok(())
 }
 
 #[inline]
@@ -550,15 +569,18 @@ pub(crate) fn stroke_polyline(
   segments: &mut Vec<StrokeSegment>,
   out: &mut Vec<Contour>,
   _solo: bool,
-) {
+  budget: &Budget,
+) -> Result<()> {
   if !(hw > 0.0) || !hw.is_finite() {
-    return;
+    return Ok(());
   }
 
   let mut pts = pool.pop().unwrap_or_default();
   pts.clear();
-  pts.reserve(points.len());
-  let mut anchors = Vec::with_capacity(points.len());
+  budget.points(points.len())?;
+  pts.try_reserve(points.len()).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
+  let mut anchors = Vec::new();
+  anchors.try_reserve(points.len()).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
   for (index, point) in points.iter().enumerate() {
     if !(point.x.is_finite() && point.y.is_finite()) {
       continue;
@@ -585,15 +607,16 @@ pub(crate) fn stroke_polyline(
 
   if pts.len() < 2 {
     pool.push(pts);
-    return;
+    return Ok(());
   }
 
-  stroke_outline(&pts, &anchors, closed, hw, cap, join, miter_limit, pool, segments, out);
+  stroke_outline(&pts, &anchors, closed, hw, cap, join, miter_limit, pool, segments, out, budget)?;
   if segments.capacity() > SEGMENT_REUSE_CAP {
     *segments = Vec::new();
   }
   pts.clear();
   pool.push(pts);
+  Ok(())
 }
 
 #[cfg(test)]

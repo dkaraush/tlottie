@@ -8,7 +8,20 @@ fn stroke(pts: &[(f32, f32)], closed: bool, hw: f32, cap: Cap, join: Join, ml: f
   let mut pool = Vec::new();
   let mut segments = Vec::new();
   let mut out = Vec::new();
-  stroke_outline(&v, &anchors, closed, hw, cap, join, ml, &mut pool, &mut segments, &mut out);
+  stroke_outline(
+    &v,
+    &anchors,
+    closed,
+    hw,
+    cap,
+    join,
+    ml,
+    &mut pool,
+    &mut segments,
+    &mut out,
+    &crate::renderer::frame::budget::Budget::default(),
+  )
+  .unwrap();
   out
 }
 
@@ -25,8 +38,9 @@ fn shoelace(pts: &[Vec2]) -> f32 {
 fn one_step_arc_uses_known_outgoing_normal() {
   let start = Vec2::new(1.0, 0.0);
   let end = Vec2::new(0.96, 0.28);
-  let mut border = Border::new(vec![start]);
-  border.arc_to(Vec2::new(0.0, 0.0), 1.0, start, end, 0.283_794_1);
+  let budget = crate::renderer::frame::budget::Budget::default();
+  let mut border = Border::new(vec![start], &budget);
+  border.arc_to(Vec2::new(0.0, 0.0), 1.0, start, end, 0.283_794_1).unwrap();
   assert_eq!(border.pts.len(), 2);
   assert_eq!(border.pts[1], end);
 }
@@ -92,7 +106,20 @@ fn no_panic_garbage() {
     let mut segments = Vec::new();
     let mut out = Vec::new();
     for closed in [false, true] {
-      stroke_outline(&v, &anchors, closed, 2.0, Cap::Round, Join::Round, 4.0, &mut pool, &mut segments, &mut out);
+      stroke_outline(
+        &v,
+        &anchors,
+        closed,
+        2.0,
+        Cap::Round,
+        Join::Round,
+        4.0,
+        &mut pool,
+        &mut segments,
+        &mut out,
+        &crate::renderer::frame::budget::Budget::default(),
+      )
+      .unwrap();
     }
   }
 }

@@ -13,7 +13,7 @@ use crate::geometry::{clip_contour, clip_to_quad, flatten_path, rect_contour, Co
 use crate::limits::Limits;
 use crate::math::{Color, Mat2x3, Vec2};
 use crate::model::{shapes_have_multiple_visible_paints, shapes_static, Composition, FillRule, Layer, LayerKind};
-use crate::renderer::cpu::executor::{layer_transform_at, opacity_byte, parent_chain_matrix, ClipQuad, DrawJob, GradientMapKind, PendingJob, RenderCtx, RenderScratch, ShapeWalker, MAX_PRECOMP_DEPTH};
+use crate::renderer::cpu::executor::{layer_transform_at, opacity_byte, ClipQuad, DrawJob, GradientMapKind, PendingJob, RenderCtx, RenderScratch, ShapeWalker, MAX_PRECOMP_DEPTH};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -24,6 +24,7 @@ use super::renderer::*;
 pub struct FrameWalker {
   scratch: RenderScratch,
   static_jobs: StaticJobCache,
+  pixel_costs: crate::compat::HashMap<u128, usize>,
 }
 
 const STATIC_JOB_CACHE_BYTES: usize = 1024 * 1024;
@@ -245,6 +246,9 @@ impl StaticJobCache {
     // opacity here; baked layers replay at 1.0 and keep their paint opacity.
     let alpha = if entry.apply_layer_alpha { layer_alpha } else { 1.0 };
     for job in &entry.jobs {
+      if renderer.status().is_err() {
+        break;
+      }
       job.replay(tx, ty, alpha, renderer);
     }
     #[cfg(test)]
@@ -329,7 +333,18 @@ impl FrameWalker {
   /// Evaluates `composition` at `frame_index` and synchronously streams its
   /// renderer-neutral drawing operations into `renderer`.
   pub fn render(&mut self, composition: &Composition, frame_index: f32, width: u32, height: u32, options: crate::RenderOptions, renderer: &mut impl FrameRenderer) -> Result<()> {
-    walk_frame(composition, frame_index, width, height, options, self, renderer)
+    super::budget::canvas_size(width, height)?;
+    self.scratch.budget = super::budget::Budget::default();
+    let mut guarded = super::budget::GuardedRenderer::new(renderer, width, height, core::mem::take(&mut self.pixel_costs));
+    let result = walk_frame(composition, frame_index, width, height, options, self, &mut guarded);
+    let result = result.and_then(|()| guarded.status());
+    if result.is_ok() {
+      self.pixel_costs = guarded.pixel_costs;
+      self.scratch.trim_geometry_pools();
+    } else {
+      *self = Self::default();
+    }
+    result
   }
 }
 
@@ -353,7 +368,7 @@ fn walk_frame(comp: &Composition, frame_index: f32, width: u32, height: u32, opt
   let frame = comp.in_point + frame_in_range;
   let base = Mat2x3::scale(width as f32 / comp.width.max(1) as f32, height as f32 / comp.height.max(1) as f32);
 
-  let FrameWalker { scratch, static_jobs } = walker;
+  let FrameWalker { scratch, static_jobs, .. } = walker;
   let ctx = RenderCtx {
     comp,
     continuous: frame_in_range.fract() != 0.0,
@@ -443,7 +458,15 @@ impl RenderCtx<'_> {
     renderer: &mut impl FrameRenderer,
   ) -> Result<()> {
     if precomp_depth > MAX_PRECOMP_DEPTH {
-      return Ok(());
+      return Err(Error::LimitExceeded(crate::Limit::NestingDepth));
+    }
+    renderer.status()?;
+    scratch.budget.layers(layers.len())?;
+    for layer in layers {
+      scratch.budget.transform(&layer.transform)?;
+      if let Some(tm) = &layer.time_remap {
+        scratch.budget.property(tm)?;
+      }
     }
     let mut consumed_as_matte = vec![false; layers.len()];
     for (i, l) in layers.iter().enumerate() {
@@ -454,13 +477,14 @@ impl RenderCtx<'_> {
       }
     }
     for (idx, layer) in layers.iter().enumerate().rev() {
+      renderer.status()?;
       // Match rlottie's adjacent-matte behavior: `td` alone does not hide
       // a layer. Only an actual consumer below marks it as matte-only.
       if consumed_as_matte.get(idx).copied().unwrap_or(false) || !self.layer_visible(layer, frame) {
         continue;
       }
       let (layer_m, layer_opacity) = layer_transform_at(layer, frame);
-      let m = base.concat(parent_chain_matrix(layers, layer, frame)).concat(layer_m);
+      let m = base.concat(super::budget::parent_matrix(layers, layer, frame, &scratch.budget)?).concat(layer_m);
       let combined_opacity = opacity * layer_opacity;
       let group_opacity = opacity_byte(combined_opacity);
       if group_opacity == 0 {
@@ -479,7 +503,7 @@ impl RenderCtx<'_> {
         }
         renderer.save_layer();
         let (src_m, src_opacity) = layer_transform_at(src, frame);
-        let source_matrix = base.concat(parent_chain_matrix(layers, src, frame)).concat(src_m);
+        let source_matrix = base.concat(super::budget::parent_matrix(layers, src, frame, &scratch.budget)?).concat(src_m);
         // A matte source's layer opacity applies to its flattened result, not
         // independently to every child of a precomp. Carry it into the fused
         // matte composite instead of distributing it through the source tree.
@@ -500,7 +524,7 @@ impl RenderCtx<'_> {
           false,
           renderer,
         )?;
-        self.collect_masks(width, height, src, source_matrix, frame, clip, renderer);
+        self.collect_masks(scratch, width, height, src, source_matrix, frame, clip, renderer)?;
         renderer.save_layer();
         self.collect_layer_content(
           scratch,
@@ -519,7 +543,7 @@ impl RenderCtx<'_> {
           false,
           renderer,
         )?;
-        self.collect_masks(width, height, layer, m, frame, clip, renderer);
+        self.collect_masks(scratch, width, height, layer, m, frame, clip, renderer)?;
         renderer.end_layer(Composite::Matte {
           kind,
           opacity: group_opacity as u8,
@@ -540,7 +564,12 @@ impl RenderCtx<'_> {
       // Folding it into every fill/stroke makes overlapping paints more
       // opaque than authored (notably cloud shading made from several
       // overlapping white shapes).
-      let translucent_shape = group_opacity < 255 && layer.kind == LayerKind::Shape && shapes_have_multiple_visible_paints(&layer.shapes, frame);
+      let translucent_shape = if group_opacity < 255 && layer.kind == LayerKind::Shape {
+        scratch.budget.shape_tree(&layer.shapes, 0)?;
+        shapes_have_multiple_visible_paints(&layer.shapes, frame)
+      } else {
+        false
+      };
       let isolate = !layer.masks.is_empty() || translucent_shape || (group_opacity < 255 && complex_precomp);
       if isolate {
         renderer.save_layer();
@@ -589,7 +618,7 @@ impl RenderCtx<'_> {
         renderer,
       )?;
       if !layer.masks.is_empty() {
-        self.collect_masks(width, height, layer, m, frame, clip, renderer);
+        self.collect_masks(scratch, width, height, layer, m, frame, clip, renderer)?;
       }
       if isolate {
         renderer.end_layer(Composite::Over { opacity: group_opacity as u8 });
@@ -617,6 +646,7 @@ impl RenderCtx<'_> {
     dynamic_layer: bool,
     renderer: &mut impl FrameRenderer,
   ) -> Result<()> {
+    renderer.status()?;
     if opacity_byte(content_opacity) == 0 {
       return Ok(());
     }
@@ -627,6 +657,9 @@ impl RenderCtx<'_> {
         // Retain one canonical (tx=ty=0) job list and supply the exact current
         // translation to the renderer. Clipped layers remain exact-context
         // cached because their clipped contour topology can change as they move.
+        if layer.shapes.len() > Limits::default().max_shapes_per_layer {
+          return Err(Error::LimitExceeded(crate::Limit::ShapesPerLayer));
+        }
         let layer_static = static_jobs.layer_is_static(self.comp, layer);
         // At large output sizes, processing complete off-canvas canonical
         // contours costs more than the saved walk. Keep the exact-context
@@ -667,7 +700,7 @@ impl RenderCtx<'_> {
           false
         };
         if replay_hit {
-          return Ok(());
+          return renderer.status();
         }
         // Dynamic layers rebuild and store the frozen canonical job on every miss so
         // they always emit with this frame's opacity; baked layers defer to the cap.
@@ -685,12 +718,13 @@ impl RenderCtx<'_> {
         };
         let (arena, pending) = walker.walk_shapes(&layer.shapes, m, content_opacity, 0)?;
         let mut recorded = record.then(|| Vec::with_capacity(pending.len()));
-        walker.collect_shape_jobs(&arena, &pending, renderer, recorded.as_mut(), !record);
+        walker.collect_shape_jobs(&arena, &pending, renderer, recorded.as_mut(), !record)?;
         for (contour, _) in arena {
           walker.scratch.put_contour(contour);
         }
         if let (Some(context), Some(signature), Some(jobs)) = (static_context, signature, recorded) {
           for job in &jobs {
+            renderer.status()?;
             job.replay(0.0, 0.0, if dynamic_layer { layer_alpha } else { 1.0 }, renderer);
           }
           static_jobs.insert(signature, context, jobs);
@@ -717,6 +751,7 @@ impl RenderCtx<'_> {
         let Some(ref_id) = layer.ref_id.as_deref() else {
           return Ok(());
         };
+        scratch.budget.work(self.comp.assets.len())?;
         let Some(asset) = self.comp.assets.iter().find(|a| a.id == ref_id) else {
           return Ok(());
         };
@@ -757,16 +792,27 @@ impl RenderCtx<'_> {
   }
 
   #[allow(clippy::too_many_arguments)]
-  fn collect_masks(&self, width: usize, height: usize, layer: &Layer, matrix: Mat2x3, frame: f32, clip: &ClipQuad, renderer: &mut impl FrameRenderer) {
+  fn collect_masks(&self, scratch: &mut RenderScratch, width: usize, height: usize, layer: &Layer, matrix: Mat2x3, frame: f32, clip: &ClipQuad, renderer: &mut impl FrameRenderer) -> Result<()> {
+    renderer.status()?;
+    if layer.masks.len() > Limits::default().max_masks_per_layer {
+      return Err(Error::LimitExceeded(crate::Limit::MasksPerLayer));
+    }
     let masks = layer.masks.iter().filter(|mask| matches!(mask.mode, b'a' | b's' | b'i' | b'f')).collect::<Vec<_>>();
     let count = masks.len();
     for (index, mask) in masks.into_iter().enumerate() {
+      renderer.status()?;
+      scratch.budget.path_property(&mask.path)?;
+      scratch.budget.property(&mask.opacity)?;
       let data = mask.path.eval(frame);
+      if data.vertices.len() > Limits::default().max_mask_path_points {
+        return Err(Error::LimitExceeded(crate::Limit::MaskPathPoints));
+      }
+      scratch.budget.path(&data, &matrix, self.curve_tolerance)?;
       let mut contour = flatten_path(&data, &matrix, self.curve_tolerance);
       for quad in clip {
-        contour = clip_to_quad(&contour, quad);
+        contour = clip_to_quad(&contour, quad, &scratch.budget)?;
       }
-      contour = clip_contour(&contour, width as f32, height as f32);
+      contour = clip_contour(&contour, width as f32, height as f32, &scratch.budget)?;
       let contours = core::slice::from_ref(&contour);
       renderer.apply_mask(
         Geometry::new(contours, geometry_key(contours, Rule::NonZero, width, height, false)),
@@ -777,17 +823,19 @@ impl RenderCtx<'_> {
         index + 1 == count,
       );
     }
+    renderer.status()
   }
 }
 
 impl ShapeWalker<'_> {
-  fn collect_shape_jobs(&mut self, arena: &[(Contour, bool)], pending: &[PendingJob], renderer: &mut impl FrameRenderer, mut record: Option<&mut Vec<CachedJob>>, emit: bool) {
+  fn collect_shape_jobs(&mut self, arena: &[(Contour, bool)], pending: &[PendingJob], renderer: &mut impl FrameRenderer, mut record: Option<&mut Vec<CachedJob>>, emit: bool) -> Result<()> {
     for pj in pending.iter().rev() {
+      renderer.status()?;
       // Recording must materialize complete geometry even when this renderer
       // already retains coverage. The recorded jobs are backend-independent
       // and must still render correctly after a later coverage eviction.
       let recording = record.is_some();
-      match self.materialize(pj, arena, &|key| !recording && renderer.retains_geometry(key)) {
+      match self.materialize(pj, arena, &|key| !recording && renderer.retains_geometry(key))? {
         DrawJob::Solid {
           key,
           contours,
@@ -805,6 +853,9 @@ impl ShapeWalker<'_> {
             opacity,
           };
           if let Some(record) = record.as_deref_mut() {
+            for c in geometry {
+              self.scratch.budget.points(c.points.len())?;
+            }
             record.push(CachedJob {
               key,
               contours: geometry.to_vec(),
@@ -849,6 +900,9 @@ impl ShapeWalker<'_> {
             alpha: 255,
           };
           if let Some(record) = record.as_deref_mut() {
+            for c in geometry {
+              self.scratch.budget.points(c.points.len())?;
+            }
             record.push(CachedJob {
               key,
               contours: geometry.to_vec(),
@@ -864,6 +918,7 @@ impl ShapeWalker<'_> {
         }
       }
     }
+    renderer.status()
   }
 }
 

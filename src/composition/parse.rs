@@ -26,6 +26,38 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+// Production parsing always enforces resource limits. Tests can bypass them
+// on their own thread to exercise the renderer independently, without disabling
+// the separate parser regressions or affecting concurrently running tests.
+#[inline]
+fn limits_check() -> bool {
+  #[cfg(test)]
+  {
+    TEST_LIMITS_CHECK.with(core::cell::Cell::get)
+  }
+  #[cfg(not(test))]
+  {
+    true
+  }
+}
+
+#[cfg(test)]
+std::thread_local! {
+  static TEST_LIMITS_CHECK: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_limits_check<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+  struct Reset(bool);
+  impl Drop for Reset {
+    fn drop(&mut self) {
+      TEST_LIMITS_CHECK.with(|flag| flag.set(self.0));
+    }
+  }
+  let _reset = Reset(TEST_LIMITS_CHECK.with(|flag| flag.replace(enabled)));
+  f()
+}
+
 /// Maximum nesting of `gr` shape groups (separate from raw JSON depth).
 const MAX_GROUP_DEPTH: usize = 32;
 
@@ -216,7 +248,7 @@ fn parse_color(c: &mut Cursor<'_>) -> Result<Color> {
 fn parse_f32_list(c: &mut Cursor<'_>, max_len: usize, limit: Limit) -> Result<FloatList> {
   let mut out = Vec::new();
   for_each_element(c, |c| {
-    if out.len() >= max_len {
+    if limits_check() && out.len() >= max_len {
       return Err(Error::LimitExceeded(limit));
     }
     out.push(parse_f32(c)?);
@@ -244,11 +276,11 @@ fn parse_bool(c: &mut Cursor<'_>) -> Result<bool> {
 fn parse_vec2_list(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<Vec2>> {
   let mut out = Vec::new();
   for_each_element(c, |c| {
-    if out.len() >= limits.max_path_points {
+    if limits_check() && out.len() >= limits.max_path_points {
       return Err(Error::LimitExceeded(Limit::PathPoints));
     }
     let point = parse_vec2(c)?;
-    if point.x.abs() > limits.max_path_coordinate_abs || point.y.abs() > limits.max_path_coordinate_abs {
+    if limits_check() && (point.x.abs() > limits.max_path_coordinate_abs || point.y.abs() > limits.max_path_coordinate_abs) {
       return Err(Error::LimitExceeded(Limit::PathCoordinate));
     }
     out.push(point);
@@ -336,7 +368,7 @@ struct RawKeyframe<T> {
 fn parse_keyframes<T: Lerp + PartialEq, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(c: &mut Cursor<'_>, limits: &Limits, parse_val: F) -> Result<Property<T>> {
   let mut raw: Vec<RawKeyframe<T>> = Vec::new();
   for_each_element(c, |c| {
-    if raw.len() >= limits.max_keyframes {
+    if limits_check() && raw.len() >= limits.max_keyframes {
       return Err(Error::LimitExceeded(Limit::Keyframes));
     }
     raw.push(parse_one_keyframe(c, parse_val)?);
@@ -545,63 +577,63 @@ fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
   let mut source_items = 0usize;
   for_each_element(c, |c| {
     count.items += 1;
-    if count.items > limits.max_shapes_per_layer {
+    if limits_check() && count.items > limits.max_shapes_per_layer {
       return Err(Error::LimitExceeded(Limit::ShapesPerLayer));
     }
     match parse_shape_item(c, limits, depth, count)? {
       ParsedItem::Shape(s) => {
         if is_paint(&s) {
           count.paints += 1;
-          if count.paints > limits.max_paints_per_layer {
+          if limits_check() && count.paints > limits.max_paints_per_layer {
             return Err(Error::LimitExceeded(Limit::PaintsPerLayer));
           }
           count.paint_source_items = count.paint_source_items.saturating_add(source_items);
-          if count.paint_source_items > limits.max_paint_source_items_per_layer {
+          if limits_check() && count.paint_source_items > limits.max_paint_source_items_per_layer {
             return Err(Error::LimitExceeded(Limit::PaintSourceItemsPerLayer));
           }
         }
         if is_focal_radial_gradient(&s) {
           count.focal_radial_gradients += 1;
-          if count.focal_radial_gradients > limits.max_focal_radial_gradients_per_layer {
+          if limits_check() && count.focal_radial_gradients > limits.max_focal_radial_gradients_per_layer {
             return Err(Error::LimitExceeded(Limit::FocalRadialGradientsPerLayer));
           }
         }
         if matches!(s, Shape::RoundCorners(_)) {
           count.round_corners += 1;
-          if count.round_corners > limits.max_round_corners_per_layer {
+          if limits_check() && count.round_corners > limits.max_round_corners_per_layer {
             return Err(Error::LimitExceeded(Limit::RoundCornersPerLayer));
           }
         }
         if matches!(s, Shape::Trim(_)) {
           count.trims += 1;
-          if count.trims > limits.max_trims_per_layer {
+          if limits_check() && count.trims > limits.max_trims_per_layer {
             return Err(Error::LimitExceeded(Limit::TrimsPerLayer));
           }
         }
         if let Some(copies) = repeater_copies(&s) {
           repeater_product = repeater_product.saturating_mul(copies.max(1));
-          if repeater_product > limits.max_repeater_product_per_group {
+          if limits_check() && repeater_product > limits.max_repeater_product_per_group {
             return Err(Error::LimitExceeded(Limit::RepeaterProductPerGroup));
           }
         }
         if is_dashed_stroke(&s) {
           dashed_strokes += 1;
-          if dashed_strokes > limits.max_dashed_strokes_per_group {
+          if limits_check() && dashed_strokes > limits.max_dashed_strokes_per_group {
             return Err(Error::LimitExceeded(Limit::DashedStrokesPerGroup));
           }
-          if is_round_join_dashed_stroke(&s) && max_dashed_source_segment > limits.max_dashed_path_segment_span {
+          if limits_check() && is_round_join_dashed_stroke(&s) && max_dashed_source_segment > limits.max_dashed_path_segment_span {
             return Err(Error::LimitExceeded(Limit::DashedPathSegment));
           }
           if let Some(pieces) = dash_piece_estimate(&s, dashed_source_len) {
             dashed_piece_estimate = dashed_piece_estimate.saturating_add(pieces);
-            if dashed_piece_estimate > limits.max_dashed_piece_estimate_per_group {
+            if limits_check() && dashed_piece_estimate > limits.max_dashed_piece_estimate_per_group {
               return Err(Error::LimitExceeded(Limit::DashedPiecesPerGroup));
             }
           }
         }
         if matches!(s, Shape::GradientStroke(_)) {
           gradient_strokes += 1;
-          if gradient_strokes > limits.max_gradient_strokes_per_group {
+          if limits_check() && gradient_strokes > limits.max_gradient_strokes_per_group {
             return Err(Error::LimitExceeded(Limit::GradientStrokesPerGroup));
           }
         }
@@ -634,8 +666,8 @@ fn is_geometry_source(shape: &Shape) -> bool {
 
 fn is_focal_radial_gradient(shape: &Shape) -> bool {
   match shape {
-    Shape::GradientFill(fill) => fill.kind == GradientKind::Radial && fill.highlight_len.eval(0.0).abs() > 0.001,
-    Shape::GradientStroke(stroke) => stroke.kind == GradientKind::Radial && stroke.highlight_len.eval(0.0).abs() > 0.001,
+    Shape::GradientFill(fill) => fill.kind == GradientKind::Radial && property_max_abs_f32(&fill.highlight_len).is_some_and(|value| value > 0.001),
+    Shape::GradientStroke(stroke) => stroke.kind == GradientKind::Radial && property_max_abs_f32(&stroke.highlight_len).is_some_and(|value| value > 0.001),
     _ => false,
   }
 }
@@ -1286,7 +1318,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
         }
       };
       let points = prop_scalar_req(pt_pos, 5.0)?;
-      if points.eval(0.0).abs() > limits.max_polystar_points {
+      if limits_check() && property_max_abs_f32(&points).is_some_and(|value| value > limits.max_polystar_points) {
         return Err(Error::LimitExceeded(Limit::PolystarPoints));
       }
       Ok(ParsedItem::Shape(Shape::Polystar(Box::new(PolystarShape {
@@ -1307,7 +1339,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
         Some(pos) => parse_property(&mut c.fork_at(pos), limits, parse_scalar)?,
         None => Property::Static(1.0),
       };
-      if property_max_abs_f32(&copies).is_some_and(|copies| copies > limits.max_repeater_copies) {
+      if limits_check() && property_max_abs_f32(&copies).is_some_and(|copies| copies > limits.max_repeater_copies) {
         return Err(Error::LimitExceeded(Limit::RepeaterCopies));
       }
       let offset = prop_scalar(c, o_pos, 0.0)?;
@@ -1349,7 +1381,7 @@ fn parse_dashes(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<DashElement>>
       Ok(())
     })?;
     if let (b'd' | b'g' | b'o', Some(pos)) = (kind, v_pos) {
-      if out.len() >= limits.max_dash_elements {
+      if limits_check() && out.len() >= limits.max_dash_elements {
         return Err(Error::LimitExceeded(Limit::DashElements));
       }
       let value = parse_property(&mut c.fork_at(pos), limits, parse_scalar)?;
@@ -1535,7 +1567,7 @@ fn parse_layer(
   }
   if kind == LayerKind::Shape && paint_count > 0 {
     *total_painted_shape_layers += 1;
-    if *total_painted_shape_layers > limits.max_painted_shape_layers {
+    if limits_check() && *total_painted_shape_layers > limits.max_painted_shape_layers {
       return Err(Error::LimitExceeded(Limit::PaintedShapeLayers));
     }
   }
@@ -1551,7 +1583,7 @@ fn parse_layer(
     _ => Vec::new(),
   };
   *total_masks = total_masks.saturating_add(masks.len());
-  if *total_masks > limits.max_masks {
+  if limits_check() && *total_masks > limits.max_masks {
     return Err(Error::LimitExceeded(Limit::Masks));
   }
   let solid = match (kind, solid_color) {
@@ -1560,7 +1592,7 @@ fn parse_layer(
   };
   if solid.is_some() {
     *total_solid_layers += 1;
-    if *total_solid_layers > limits.max_solid_layers {
+    if limits_check() && *total_solid_layers > limits.max_solid_layers {
       return Err(Error::LimitExceeded(Limit::SolidLayers));
     }
   }
@@ -1620,7 +1652,7 @@ struct FitzEntry {
 
 fn parse_fitz_entries(c: &mut Cursor<'_>, entries: &mut Vec<FitzEntry>, limits: &Limits) -> Result<()> {
   for_each_element(c, |c| {
-    if entries.len() >= limits.max_fitz_entries {
+    if limits_check() && entries.len() >= limits.max_fitz_entries {
       return Err(Error::LimitExceeded(Limit::FitzEntries));
     }
     let mut entry = FitzEntry { original: 0, replacements: [0; 5] };
@@ -1777,10 +1809,10 @@ impl ExpansionCost {
   }
 
   fn validate(&self, limits: &Limits) -> Result<()> {
-    if self.layers > limits.max_precomp_expansion {
+    if limits_check() && self.layers > limits.max_precomp_expansion {
       return Err(Error::LimitExceeded(Limit::PrecompExpansion));
     }
-    if self.focal_radial_gradients > limits.max_focal_radial_gradient_expansion {
+    if limits_check() && self.focal_radial_gradients > limits.max_focal_radial_gradient_expansion {
       return Err(Error::LimitExceeded(Limit::FocalRadialGradientExpansion));
     }
     Ok(())
@@ -1869,7 +1901,7 @@ fn validate_layer_parent_chains(layers: &[Layer], limits: &Limits) -> Result<()>
   let mut total_depth = 0usize;
   for slot in 0..layers.len() {
     total_depth = total_depth.saturating_add(parent_chain_depth(slot, layers, &lookup, &mut depths, &mut visiting, limits)?);
-    if total_depth > limits.max_parent_chain_total_depth {
+    if limits_check() && total_depth > limits.max_parent_chain_total_depth {
       return Err(Error::LimitExceeded(Limit::ParentChainTotalDepth));
     }
   }
@@ -1938,7 +1970,7 @@ fn parse_layer_list(
   let mut layers = Vec::new();
   for_each_element(c, |c| {
     *total_layers += 1;
-    if *total_layers > limits.max_layers {
+    if limits_check() && *total_layers > limits.max_layers {
       return Err(Error::LimitExceeded(Limit::Layers));
     }
     layers.push(parse_layer(c, limits, replacements, total_masks, total_painted_shape_layers, total_solid_layers)?);
@@ -1995,7 +2027,7 @@ fn parse_repeater_transform(c: &mut Cursor<'_>, limits: &Limits) -> Result<(Tran
 fn parse_masks(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<Mask>> {
   let mut out = Vec::new();
   for_each_element(c, |c| {
-    if out.len() >= limits.max_masks_per_layer {
+    if limits_check() && out.len() >= limits.max_masks_per_layer {
       return Err(Error::LimitExceeded(Limit::MasksPerLayer));
     }
     let mut mode = b'a';
@@ -2026,7 +2058,7 @@ fn parse_masks(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<Mask>> {
       return Ok(());
     }
     let path = parse_property(&mut c.fork_at(pt_pos), limits, |c| parse_path_value(c, limits))?;
-    if path_property_exceeds_points(&path, limits.max_mask_path_points) {
+    if limits_check() && path_property_exceeds_points(&path, limits.max_mask_path_points) {
       return Err(Error::LimitExceeded(Limit::MaskPathPoints));
     }
     let opacity = match o_pos {
@@ -2089,7 +2121,7 @@ fn parse_asset(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOptions) -> Result<Composition> {
-  if bytes.len() > limits.max_input_bytes {
+  if limits_check() && bytes.len() > limits.max_input_bytes {
     return Err(Error::LimitExceeded(Limit::InputBytes));
   }
 
@@ -2118,7 +2150,7 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
       }
       b"assets" => {
         for_each_element(c, |c| {
-          if assets.len() >= limits.max_assets {
+          if limits_check() && assets.len() >= limits.max_assets {
             return Err(Error::LimitExceeded(Limit::Assets));
           }
           if let Some(asset) = parse_asset(c, limits, &options.layer_color_replacements, &mut total_layers, &mut total_masks, &mut total_painted_shape_layers, &mut total_solid_layers)? {
@@ -2150,7 +2182,8 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
   let in_point = in_point.ok_or_else(|| missing("missing in point (ip)"))?;
   let out_point = out_point.ok_or_else(|| missing("missing out point (op)"))?;
 
-  let max_dim = f64::from(limits.max_dimension);
+  let max_dim = if limits_check() { limits.max_dimension } else { u32::MAX };
+  let max_dim = f64::from(max_dim);
   if !(1.0..=max_dim).contains(&width) || !(1.0..=max_dim).contains(&height) {
     return Err(Error::LimitExceeded(Limit::CompositionSize));
   }

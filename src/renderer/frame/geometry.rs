@@ -52,7 +52,7 @@ pub(crate) fn seg_len_rlottie(dx: f32, dy: f32) -> f32 {
   }
 }
 
-fn flatten_cubic(out: &mut Vec<Vec2>, anchors: &mut Vec<bool>, p0: Vec2, c1: Vec2, c2: Vec2, p1: Vec2, tolerance: f32) {
+pub(crate) fn cubic_segments(p0: Vec2, c1: Vec2, c2: Vec2, p1: Vec2, tolerance: f32) -> usize {
   // Error-bounded uniform flattening: for n segments the max deviation is
   // <= 3/4 * M / n^2 where M is the largest second-difference norm of the
   // control polygon (measured 0.74·M/n²; the oft-quoted 3/16 bound is for
@@ -63,7 +63,11 @@ fn flatten_cubic(out: &mut Vec<Vec2>, anchors: &mut Vec<bool>, p0: Vec2, c1: Vec
   let d2b = ((c1.x - 2.0 * c2.x + p1.x).abs()).max((c1.y - 2.0 * c2.y + p1.y).abs());
   let m_norm = d2a.max(d2b);
   let coefficient = 0.75 / tolerance.clamp(0.01, 4.0);
-  let n = ((m_norm * coefficient).sqrt().ceil() as usize).clamp(2, MAX_SEGS);
+  ((m_norm * coefficient).sqrt().ceil() as usize).clamp(2, MAX_SEGS)
+}
+
+fn flatten_cubic(out: &mut Vec<Vec2>, anchors: &mut Vec<bool>, p0: Vec2, c1: Vec2, c2: Vec2, p1: Vec2, tolerance: f32) {
+  let n = cubic_segments(p0, c1, c2, p1, tolerance);
   let step = 1.0 / n as f32;
   let mut t = step;
   for _ in 0..n.saturating_sub(1) {
@@ -302,18 +306,17 @@ pub(crate) fn quad_contains_box(quad: &[Vec2; 4], x0: f32, y0: f32, x1: f32, y1:
   true
 }
 
-pub(crate) fn clip_to_quad(c: &Contour, quad: &[Vec2; 4]) -> Contour {
+pub(crate) fn clip_to_quad(c: &Contour, quad: &[Vec2; 4], budget: &crate::renderer::frame::budget::Budget) -> crate::Result<Contour> {
   // Orientation of the quad decides which side is "inside".
   let area = (quad[1].x - quad[0].x) * (quad[2].y - quad[0].y) - (quad[2].x - quad[0].x) * (quad[1].y - quad[0].y);
   let sign = if area >= 0.0 { 1.0f32 } else { -1.0f32 };
-  let mut pts = c.points.clone();
+  budget.points(c.points.len())?;
+  let mut pts = Vec::new();
+  pts.try_reserve_exact(c.points.len()).map_err(|_| crate::Error::LimitExceeded(crate::Limit::RenderMemory))?;
+  pts.extend_from_slice(&c.points);
   for e in 0..4usize {
     if pts.len() < 3 {
-      return Contour {
-        points: Vec::new(),
-        anchors: Vec::new(),
-        inv_lin: None,
-      };
+      return Ok(Contour::default());
     }
     let a = match quad.get(e) {
       Some(p) => *p,
@@ -335,7 +338,14 @@ pub(crate) fn clip_to_quad(c: &Contour, quad: &[Vec2; 4]) -> Contour {
       let t = (ex * (a.y - p.y) - ey * (a.x - p.x)) / denom;
       Vec2::new(p.x + dpx * t.clamp(0.0, 1.0), p.y + dpy * t.clamp(0.0, 1.0))
     };
-    let mut out: Vec<Vec2> = Vec::with_capacity(pts.len() + 4);
+    budget.work(pts.len())?;
+    if pts.iter().all(&inside) {
+      continue;
+    }
+    let maximum = pts.len().saturating_mul(2);
+    budget.points(maximum)?;
+    let mut out: Vec<Vec2> = Vec::new();
+    out.try_reserve_exact(maximum).map_err(|_| crate::Error::LimitExceeded(crate::Limit::RenderMemory))?;
     for (i, cur) in pts.iter().enumerate() {
       let prev = match i.checked_sub(1).and_then(|j| pts.get(j)).or_else(|| pts.last()) {
         Some(p) => p,
@@ -354,24 +364,23 @@ pub(crate) fn clip_to_quad(c: &Contour, quad: &[Vec2; 4]) -> Contour {
     }
     pts = out;
   }
-  Contour {
+  Ok(Contour {
     points: pts,
     anchors: Vec::new(),
     inv_lin: None,
-  }
+  })
 }
 
 /// Sutherland–Hodgman clip of a polygon to the rect [0,w]×[0,h].
 /// Keeps winding; coverage outside the viewport is discarded exactly.
-pub(crate) fn clip_contour(c: &Contour, w: f32, h: f32) -> Contour {
-  let mut pts = c.points.clone();
+pub(crate) fn clip_contour(c: &Contour, w: f32, h: f32, budget: &crate::renderer::frame::budget::Budget) -> crate::Result<Contour> {
+  budget.points(c.points.len())?;
+  let mut pts = Vec::new();
+  pts.try_reserve_exact(c.points.len()).map_err(|_| crate::Error::LimitExceeded(crate::Limit::RenderMemory))?;
+  pts.extend_from_slice(&c.points);
   for edge in 0..4u8 {
     if pts.len() < 3 {
-      return Contour {
-        points: Vec::new(),
-        anchors: Vec::new(),
-        inv_lin: None,
-      };
+      return Ok(Contour::default());
     }
     let inside = |p: &Vec2| -> bool {
       match edge {
@@ -396,7 +405,14 @@ pub(crate) fn clip_contour(c: &Contour, w: f32, h: f32) -> Contour {
         Vec2::new(a.x + (b.x - a.x) * t, bound_x)
       }
     };
-    let mut out: Vec<Vec2> = Vec::with_capacity(pts.len() + 4);
+    budget.work(pts.len())?;
+    if pts.iter().all(&inside) {
+      continue;
+    }
+    let maximum = pts.len().saturating_mul(2);
+    budget.points(maximum)?;
+    let mut out: Vec<Vec2> = Vec::new();
+    out.try_reserve_exact(maximum).map_err(|_| crate::Error::LimitExceeded(crate::Limit::RenderMemory))?;
     for (i, cur) in pts.iter().enumerate() {
       let prev = match i.checked_sub(1).and_then(|j| pts.get(j)) {
         Some(p) => p,
@@ -418,11 +434,11 @@ pub(crate) fn clip_contour(c: &Contour, w: f32, h: f32) -> Contour {
     }
     pts = out;
   }
-  Contour {
+  Ok(Contour {
     points: pts,
     anchors: Vec::new(),
     inv_lin: None,
-  }
+  })
 }
 
 /// Extracts the sub-polyline covering arclength range [l0, l1] of a contour.
@@ -648,10 +664,31 @@ mod round_corners_tests;
 
 /// Splits a polyline into dash sub-polylines. `pattern` is (dash, gap)
 /// lengths already resolved; `offset` shifts the pattern start.
+#[cfg(test)]
 pub(crate) fn dash_polyline(points: &[Vec2], anchors: &[bool], closed: bool, pattern: &[f32], offset: f32) -> Vec<(Vec<Vec2>, Vec<bool>)> {
   let mut d = VDasher::new(points, anchors, closed, pattern, offset);
   d.run();
   d.out
+}
+
+/// Renderer entry: account for dash iterations before they scan or allocate.
+#[cfg(feature = "cpu")]
+pub(crate) fn dash_polyline_bounded<'a>(
+  points: &'a [Vec2],
+  anchors: &'a [bool],
+  closed: bool,
+  pattern: &[f32],
+  offset: f32,
+  budget: &'a crate::renderer::frame::budget::Budget,
+) -> crate::Result<Vec<(Vec<Vec2>, Vec<bool>)>> {
+  budget.work(points.len())?;
+  let mut d = VDasher::new(points, anchors, closed, pattern, offset);
+  d.budget = Some(budget);
+  d.run();
+  match d.error {
+    Some(error) => Err(error),
+    None => Ok(d.out),
+  }
 }
 
 /// Faithful port of rlottie's VDasher (vdasher.cpp) operating over the
@@ -667,6 +704,10 @@ pub(crate) fn dash_polyline(points: &[Vec2], anchors: &[bool], closed: bool, pat
 /// and snaps the phase — visible as fused dashes at a path's tail
 /// (DuckEmoji chain).
 struct VDasher<'a> {
+  #[cfg(feature = "cpu")]
+  budget: Option<&'a crate::renderer::frame::budget::Budget>,
+  #[cfg(feature = "cpu")]
+  error: Option<crate::Error>,
   points: &'a [Vec2],
   anchors: &'a [bool],
   /// pattern as (length, gap) pairs
@@ -698,6 +739,10 @@ impl<'a> VDasher<'a> {
       }
     }
     VDasher {
+      #[cfg(feature = "cpu")]
+      budget: None,
+      #[cfg(feature = "cpu")]
+      error: None,
       points,
       anchors,
       pairs,
@@ -869,6 +914,13 @@ impl<'a> VDasher<'a> {
       self.add_span(&collect(0.0, elem_len));
     } else {
       while remaining > self.current_length {
+        #[cfg(feature = "cpu")]
+        if let Some(budget) = self.budget {
+          if let Err(error) = budget.work(verts.len().saturating_add(self.pairs.len())).and_then(|()| budget.points(4)) {
+            self.error = Some(error);
+            return;
+          }
+        }
         remaining -= self.current_length;
         let target = local + self.current_length;
         self.add_span(&collect(local, target));
@@ -930,6 +982,10 @@ impl<'a> VDasher<'a> {
     self.move_to();
 
     for w in bounds.windows(2) {
+      #[cfg(feature = "cpu")]
+      if self.error.is_some() {
+        return;
+      }
       let (Some(&a), Some(&b)) = (w.first(), w.get(1)) else {
         continue;
       };

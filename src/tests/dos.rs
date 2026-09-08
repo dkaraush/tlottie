@@ -26,6 +26,9 @@ use std::time::{Duration, Instant};
 
 use crate::{CPURenderer, Composition, Error, Limits, RenderOptions};
 
+// Keep renderer regressions independent of parser resource checks.
+const LIMITS_CHECK: bool = false;
+
 const FRAME_TIME_BUDGET: Duration = Duration::from_millis(1_500);
 const MEM_BUDGET: usize = 32 << 20;
 
@@ -114,6 +117,9 @@ macro_rules! assert_lottie {
     assert_lottie!($json, $size, $frame_start, $frame_end, $options, false);
   };
   ($json: expr, $size: expr, $frame_start: expr, $frame_end: expr, $options: expr, $expect_error: expr) => {
+    assert_lottie!($json, $size, $frame_start, $frame_end, $options, $expect_error, false);
+  };
+  ($json: expr, $size: expr, $frame_start: expr, $frame_end: expr, $options: expr, $expect_error: expr, $parser_only: expr) => {
     let json = $json;
     let size: u32 = $size;
     let frame_start: u32 = $frame_start;
@@ -123,11 +129,18 @@ macro_rules! assert_lottie {
     let budget = (frame_end - frame_start) * FRAME_TIME_BUDGET;
     let counter = Arc::new(AtomicUsize::new(0));
     let worker_counter = Arc::clone(&counter);
+    let phase = Arc::new(AtomicUsize::new(0));
+    let worker_phase = Arc::clone(&phase);
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
       WORKER_BYTES.with(|slot| slot.set(Arc::as_ptr(&worker_counter)));
       let result = (|| -> Result<(), Error> {
-        let composition = Composition::parse(json.as_bytes(), &Limits::default())?;
+        let parsed = crate::composition::parse::with_limits_check($parser_only || LIMITS_CHECK, || Composition::parse(json.as_bytes(), &Limits::default()));
+        if $parser_only {
+          assert!(matches!(parsed, Err(Error::LimitExceeded(_))), "parser regression must be rejected before rendering");
+        }
+        let composition = parsed?;
+        worker_phase.store(1, Ordering::Relaxed);
         let mut cpu = CPURenderer::new(composition);
         if options.alpha_only {
           let mut alpha = vec![0u8; (size * size).try_into().unwrap()];
@@ -152,9 +165,10 @@ macro_rules! assert_lottie {
         Err(TryRecvError::Disconnected) => panic!("render worker vanished before reporting"),
         Err(TryRecvError::Empty) => {}
       }
+      let phase = if phase.load(Ordering::Relaxed) == 0 { "parsing" } else { "rendering" };
       let used = counter.load(Ordering::Relaxed);
-      assert!(used <= MEM_BUDGET, "render allocated {used} bytes, over the {MEM_BUDGET}-byte budget");
-      assert!(start.elapsed() <= budget, "render did not finish within the frame budget");
+      assert!(used <= MEM_BUDGET, "{phase} allocated {used} bytes, over the {MEM_BUDGET}-byte budget");
+      assert!(start.elapsed() <= budget, "{phase} did not finish within the frame budget");
       thread::sleep(Duration::from_millis(1));
     };
     if expect_error {
@@ -162,6 +176,15 @@ macro_rules! assert_lottie {
     } else {
       assert!(rendered.is_ok() || matches!(rendered, Err(Error::LimitExceeded(_))), "{rendered:?}");
     }
+  };
+}
+
+// These cases exhaust memory while constructing the model, before a renderer
+// exists. Keep parser coverage explicit rather than claiming a renderer guard
+// fixed them. All other DoS cases use LIMITS_CHECK above.
+macro_rules! assert_parser_lottie {
+  ($json: expr) => {
+    assert_lottie!($json, 64, 0, 1, RenderOptions::default(), true, true);
   };
 }
 
@@ -655,6 +678,30 @@ fn luma_matte_pairs_json(pairs_count: usize, size: usize) -> String {
   format!(r#"{{"v":"5.5.0","w":{size},"h":{size},"fr":60,"ip":0,"op":60,"layers":[{layers}]}}"#)
 }
 
+fn zero_point_repeater_arena_json(paths: usize) -> String {
+  let mut items = String::new();
+  for _ in 0..paths {
+    items.push_str(r#"{"ty":"sh","ks":{"a":0,"k":{"c":true,"v":[]}}},"#);
+  }
+  format!(
+    r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"fl","c":{{"a":0,"k":[1,0,0]}},"o":{{"a":0,"k":100}}}},{items}{{"ty":"rp","c":{{"a":0,"k":64}},"o":{{"a":0,"k":0}},"tr":{{"p":{{"a":0,"k":[0.01,0.01]}}}}}},{{"ty":"tr"}}]}}]}}]}}"#
+  )
+}
+
+fn trim_cleared_repeater_arena_json(rects: usize) -> String {
+  let mut items = String::new();
+  for i in 0..rects {
+    items.push_str(&format!(
+      r#"{{"ty":"rc","p":{{"a":0,"k":[{},{}]}},"s":{{"a":0,"k":[1,1]}},"r":{{"a":0,"k":0}}}},"#,
+      i % 64,
+      (i / 64) % 64
+    ));
+  }
+  format!(
+    r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{items}{{"ty":"fl","c":{{"a":0,"k":[1,0,0]}},"o":{{"a":0,"k":100}}}},{{"ty":"tm","s":{{"a":0,"k":0}},"e":{{"a":0,"k":0}},"o":{{"a":0,"k":0}},"m":1}},{{"ty":"rp","c":{{"a":0,"k":64}},"o":{{"a":0,"k":0}},"tr":{{"p":{{"a":0,"k":[0.01,0.01]}}}}}},{{"ty":"tr"}}]}}]}}]}}"#
+  )
+}
+
 fn unsorted_scalar_keyframes_json(count: usize, value: &str) -> String {
   let mut kfs = format!(r#"{{"t":-1,"s":[{value}]}},{{"t":0,"s":[{value}]}}"#);
   for _ in 0..count {
@@ -1097,7 +1144,7 @@ fn keyframe_value_inheritance_stays_bounded() {
   let json = format!(
     r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"sh","ks":{{"a":1,"k":[{kfs}]}}}},{{"ty":"fl","c":{{"a":0,"k":[1,0,0]}},"o":{{"a":0,"k":100}}}},{{"ty":"tr"}}]}}]}}]}}"#
   );
-  assert_lottie!(json);
+  assert_parser_lottie!(json);
 }
 
 #[test]
@@ -1172,7 +1219,7 @@ fn gradient_keyframe_value_inheritance_stays_bounded() {
   let json = format!(
     r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"rc","p":{{"a":0,"k":[32,32]}},"s":{{"a":0,"k":[64,64]}},"r":{{"a":0,"k":0}}}},{{"ty":"gf","s":{{"a":0,"k":[0,0]}},"e":{{"a":0,"k":[64,64]}},"g":{{"p":2,"k":{{"a":1,"k":[{kfs}]}}}},"o":{{"a":0,"k":100}}}},{{"ty":"tr"}}]}}]}}]}}"#
   );
-  assert_lottie!(json);
+  assert_parser_lottie!(json);
 }
 
 #[test]
@@ -1191,7 +1238,7 @@ fn oversized_static_gradient_stop_table_stays_bounded() {
   let json = format!(
     r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"rc","p":{{"a":0,"k":[32,32]}},"s":{{"a":0,"k":[64,64]}},"r":{{"a":0,"k":0}}}},{{"ty":"gf","s":{{"a":0,"k":[0,0]}},"e":{{"a":0,"k":[64,64]}},"g":{{"p":2,"k":{{"a":0,"k":[{stops}]}}}},"o":{{"a":0,"k":100}}}},{{"ty":"tr"}}]}}]}}]}}"#
   );
-  assert_lottie!(json);
+  assert_parser_lottie!(json);
 }
 
 #[test]
@@ -1331,7 +1378,7 @@ fn static_path_tangent_padding_stays_bounded() {
   let json = format!(
     r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"sh","ks":{{"a":0,"k":{{"c":true,"v":[{verts}]}}}}}},{{"ty":"fl","c":{{"a":0,"k":[1,0,0]}},"o":{{"a":0,"k":100}}}},{{"ty":"tr"}}]}}]}}]}}"#
   );
-  assert_lottie!(json);
+  assert_parser_lottie!(json);
 }
 
 #[test]
@@ -1484,7 +1531,7 @@ fn many_minimal_masks_stay_bounded() {
   // Mask count has no explicit default limit. Even one-point masks can balloon
   // parser/model memory when a hostile layer carries a very long masks array.
   let json = many_minimal_masks_json(120_000);
-  assert_lottie!(json);
+  assert_parser_lottie!(json);
 }
 
 #[test]
@@ -1760,7 +1807,7 @@ fn gradient_stroke_static_stop_table_stays_bounded() {
   let json = format!(
     r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"sh","ks":{{"a":0,"k":{{"c":false,"v":[[0,32],[64,32]],"i":[],"o":[]}}}}}},{{"ty":"gs","s":{{"a":0,"k":[0,0]}},"e":{{"a":0,"k":[64,64]}},"g":{{"p":2,"k":{{"a":0,"k":[{stops}]}}}},"w":{{"a":0,"k":1}},"o":{{"a":0,"k":100}}}},{{"ty":"tr"}}]}}]}}]}}"#
   );
-  assert_lottie!(json);
+  assert_parser_lottie!(json);
 }
 
 #[test]
@@ -2495,4 +2542,325 @@ fn single_vertex_closed_dashed_bezier_stays_bounded() {
     ]}
   ]}]}"#;
   assert_lottie!(json);
+}
+
+#[test]
+fn renderer_rejects_generated_work_after_successful_parse() {
+  // Parsing MUST succeed with its resource checks bypassed. A parser error
+  // cannot satisfy these renderer-specific assertions.
+  for (case, (json, frame)) in [
+    (animated_repeater_product_json().to_string(), 1.0),
+    (dense_in_bounds_raster_edge_storm_json(), 0.0),
+    (many_fills_over_large_path_json(), 0.0),
+    (curve_flattening_json(Limits::default().max_path_points + 1), 0.0),
+    (gradient_opacity_stop_lut_json(Limits::default().max_gradient_stop_values + 1), 0.0),
+    (inverted_difference_masks_json(Limits::default().max_masks_per_layer + 1), 0.0),
+    (trim_cleared_repeater_arena_json(9_990), 0.0),
+  ]
+  .into_iter()
+  .enumerate()
+  {
+    let composition = crate::composition::parse::with_limits_check(false, || Composition::parse(json.as_bytes(), &Limits::default())).unwrap();
+    let mut renderer = CPURenderer::new(composition);
+    let mut rgba = vec![0; 64 * 64];
+    let mut alpha = vec![0; 64 * 64];
+    assert!(
+      matches!(renderer.render(frame, &mut rgba, 64, 64, RenderOptions::default()), Err(Error::LimitExceeded(_))),
+      "case {case}"
+    );
+    assert!(
+      matches!(renderer.render_alpha8(frame, &mut alpha, 64, 64, RenderOptions::default()), Err(Error::LimitExceeded(_))),
+      "case {case}"
+    );
+  }
+}
+
+#[test]
+fn renderer_recovers_after_mid_frame_dash_limit() {
+  let json = animated_tiny_dash_period_json().replace("0.0011", "0.02");
+  let composition = crate::composition::parse::with_limits_check(false, || Composition::parse(json.as_bytes(), &Limits::default())).unwrap();
+  let mut renderer = CPURenderer::new(composition);
+  let mut rgba = vec![0; 64 * 64];
+  renderer.render(0.0, &mut rgba, 64, 64, RenderOptions::default()).unwrap();
+  let expected = rgba.clone();
+  for _ in 0..3 {
+    assert!(matches!(renderer.render(1.0, &mut rgba, 64, 64, RenderOptions::default()), Err(Error::LimitExceeded(_))));
+    renderer.render(0.0, &mut rgba, 64, 64, RenderOptions::default()).unwrap();
+    assert_eq!(rgba, expected);
+  }
+  let mut alpha = vec![0; 64 * 64];
+  renderer.render_alpha8(0.0, &mut alpha, 64, 64, RenderOptions::default()).unwrap();
+  let expected = alpha.clone();
+  assert!(matches!(renderer.render_alpha8(1.0, &mut alpha, 64, 64, RenderOptions::default()), Err(Error::LimitExceeded(_))));
+  renderer.render_alpha8(0.0, &mut alpha, 64, 64, RenderOptions::default()).unwrap();
+  assert_eq!(alpha, expected);
+}
+
+#[test]
+fn renderer_rejects_large_canvas_before_allocating_fallback() {
+  // Luma matte forces Alpha8 through the RGBA fallback. Even a tiny output
+  // slice must not cause that fallback to allocate an enormous surface first.
+  let json = luma_matte_pairs_json(1, 64);
+  let composition = Composition::parse(json.as_bytes(), &Limits::default()).unwrap();
+  let mut renderer = CPURenderer::new(composition);
+  assert_eq!(
+    renderer.render(0.0, &mut [], 8192, 8192, RenderOptions::default()),
+    Err(Error::LimitExceeded(crate::Limit::RenderMemory))
+  );
+  assert_eq!(
+    renderer.render_alpha8(0.0, &mut [], 8192, 8192, RenderOptions::default()),
+    Err(Error::LimitExceeded(crate::Limit::RenderMemory))
+  );
+}
+
+// Regression inputs from https://github.com/dkaraush/tlottie/pull/11.
+// Fixtures are unchanged; assertions exercise renderer budgets in both output
+// formats, including frame 1 for animated attacks, after successful parsing
+// with parser resource checks disabled. Safe completion or LimitExceeded is valid.
+
+#[test]
+fn pr11_nested_compounding_repeaters_stay_bounded() {
+  let json = r#"{
+    "v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,
+    "layers":[{"ty":4,"ind":1,"ip":0,"op":60,"st":0,"ks":{},"shapes":[
+      {"ty":"gr","it":[
+        {"ty":"rc","p":{"a":0,"k":[32,32]},"s":{"a":0,"k":[8,8]},"r":{"a":0,"k":0}},
+        {"ty":"rp","c":{"a":0,"k":64},"o":{"a":0,"k":0},"tr":{"p":{"a":0,"k":[1,0]}}},
+        {"ty":"gr","it":[
+          {"ty":"rp","c":{"a":0,"k":64},"o":{"a":0,"k":0},"tr":{"p":{"a":0,"k":[0,1]}}},
+          {"ty":"gr","it":[
+            {"ty":"rp","c":{"a":0,"k":64},"o":{"a":0,"k":0},"tr":{"p":{"a":0,"k":[1,1]}}},
+            {"ty":"tr"}
+          ]},
+          {"ty":"tr"}
+        ]},
+        {"ty":"fl","c":{"a":0,"k":[1,0,0]},"o":{"a":0,"k":100}},
+        {"ty":"tr"}
+      ]}
+    ]}]
+  }"#;
+  crate::composition::parse::with_limits_check(false, || Composition::parse(json.as_bytes(), &Limits::default())).unwrap();
+  assert_lottie!(json.clone(), 64, 0, 2);
+  assert_lottie!(
+    json,
+    64,
+    0,
+    2,
+    RenderOptions {
+      alpha_only: true,
+      ..RenderOptions::default()
+    }
+  );
+}
+
+#[test]
+fn pr11_repeater_multiplied_dashed_stroke_stays_bounded() {
+  let json = r#"{
+    "v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,
+    "layers":[{"ty":4,"ind":1,"ip":0,"op":60,"st":0,"ks":{},"shapes":[
+      {"ty":"gr","it":[
+        {"ty":"rc","p":{"a":0,"k":[32,32]},"s":{"a":0,"k":[50,50]},"r":{"a":0,"k":0}},
+        {"ty":"st","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"w":{"a":0,"k":2},"lc":1,"lj":1,"d":[
+          {"n":"d","v":{"a":0,"k":1}},{"n":"g","v":{"a":0,"k":1}}
+        ]},
+        {"ty":"rp","c":{"a":0,"k":64},"o":{"a":0,"k":0},"tr":{"p":{"a":0,"k":[1,0]}}},
+        {"ty":"tr"}
+      ]}
+    ]}]
+  }"#;
+  crate::composition::parse::with_limits_check(false, || Composition::parse(json.as_bytes(), &Limits::default())).unwrap();
+  assert_lottie!(json.clone(), 64, 0, 2);
+  assert_lottie!(
+    json,
+    64,
+    0,
+    2,
+    RenderOptions {
+      alpha_only: true,
+      ..RenderOptions::default()
+    }
+  );
+}
+
+#[test]
+fn pr11_nested_group_repeater_multiplied_dash_stays_bounded() {
+  let json = r#"{
+    "v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,
+    "layers":[{"ty":4,"ind":1,"ip":0,"op":60,"st":0,"ks":{},"shapes":[
+      {"ty":"gr","it":[
+        {"ty":"gr","it":[
+          {"ty":"rc","p":{"a":0,"k":[32,32]},"s":{"a":0,"k":[50,50]},"r":{"a":0,"k":0}},
+          {"ty":"st","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"w":{"a":0,"k":2},"lc":1,"lj":1,"d":[
+            {"n":"d","v":{"a":0,"k":1}},{"n":"g","v":{"a":0,"k":1}}
+          ]},
+          {"ty":"tr"}
+        ]},
+        {"ty":"rp","c":{"a":0,"k":64},"o":{"a":0,"k":0},"tr":{"p":{"a":0,"k":[1,0]}}},
+        {"ty":"tr"}
+      ]}
+    ]}]
+  }"#;
+  crate::composition::parse::with_limits_check(false, || Composition::parse(json.as_bytes(), &Limits::default())).unwrap();
+  assert_lottie!(json.clone(), 64, 0, 2);
+  assert_lottie!(
+    json,
+    64,
+    0,
+    2,
+    RenderOptions {
+      alpha_only: true,
+      ..RenderOptions::default()
+    }
+  );
+}
+
+#[test]
+fn pr11_animated_polystar_points_stays_bounded() {
+  let json = r#"{
+    "v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,
+    "layers":[{"ty":4,"ind":1,"ip":0,"op":60,"st":0,"ks":{},"shapes":[
+      {"ty":"gr","it":[
+        {"ty":"sr","sy":1,"pt":{"a":1,"k":[{"t":0,"s":[5]},{"t":1,"s":[1e38]}]},"p":{"a":0,"k":[32,32]},"r":{"a":0,"k":0},"ir":{"a":0,"k":10},"or":{"a":0,"k":20},"is":{"a":0,"k":0},"os":{"a":0,"k":0}},
+        {"ty":"fl","c":{"a":0,"k":[1,0,0]},"o":{"a":0,"k":100}},
+        {"ty":"tr"}
+      ]}
+    ]}]
+  }"#;
+  crate::composition::parse::with_limits_check(false, || Composition::parse(json.as_bytes(), &Limits::default())).unwrap();
+  assert_lottie!(json.clone(), 64, 0, 2);
+  assert_lottie!(
+    json,
+    64,
+    0,
+    2,
+    RenderOptions {
+      alpha_only: true,
+      ..RenderOptions::default()
+    }
+  );
+}
+
+#[test]
+fn pr11_dashed_polystar_tiny_period_stays_bounded() {
+  let json = r#"{
+    "v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,
+    "layers":[{"ty":4,"ind":1,"ip":0,"op":60,"st":0,"ks":{},"shapes":[
+      {"ty":"gr","it":[
+        {"ty":"sr","sy":1,"pt":{"a":0,"k":5},"p":{"a":0,"k":[32,32]},"r":{"a":0,"k":0},"ir":{"a":0,"k":500},"or":{"a":0,"k":1000},"is":{"a":0,"k":0},"os":{"a":0,"k":0}},
+        {"ty":"st","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"w":{"a":0,"k":2},"lc":1,"lj":1,"d":[
+          {"n":"d","v":{"a":0,"k":0.01}},{"n":"g","v":{"a":0,"k":0.01}}
+        ]},
+        {"ty":"tr"}
+      ]}
+    ]}]
+  }"#;
+  crate::composition::parse::with_limits_check(false, || Composition::parse(json.as_bytes(), &Limits::default())).unwrap();
+  assert_lottie!(json.clone(), 64, 0, 2);
+  assert_lottie!(
+    json,
+    64,
+    0,
+    2,
+    RenderOptions {
+      alpha_only: true,
+      ..RenderOptions::default()
+    }
+  );
+}
+
+#[test]
+fn pr11_dashed_rect_tiny_period_stays_bounded() {
+  let json = r#"{
+    "v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,
+    "layers":[{"ty":4,"ind":1,"ip":0,"op":60,"st":0,"ks":{},"shapes":[
+      {"ty":"gr","it":[
+        {"ty":"rc","p":{"a":0,"k":[32,32]},"s":{"a":0,"k":[1000,1000]},"r":{"a":0,"k":0}},
+        {"ty":"st","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"w":{"a":0,"k":2},"lc":1,"lj":1,"d":[
+          {"n":"d","v":{"a":0,"k":0.01}},{"n":"g","v":{"a":0,"k":0.01}}
+        ]},
+        {"ty":"tr"}
+      ]}
+    ]}]
+  }"#;
+  crate::composition::parse::with_limits_check(false, || Composition::parse(json.as_bytes(), &Limits::default())).unwrap();
+  assert_lottie!(json.clone(), 64, 0, 2);
+  assert_lottie!(
+    json,
+    64,
+    0,
+    2,
+    RenderOptions {
+      alpha_only: true,
+      ..RenderOptions::default()
+    }
+  );
+}
+
+#[test]
+fn pr11_animated_focal_radial_gradient_stays_bounded() {
+  let mut shapes = String::new();
+  for _ in 0..161 {
+    shapes.push_str(r#"{"ty":"gf","t":2,"s":{"a":0,"k":[0,0]},"e":{"a":0,"k":[10,10]},"g":{"p":2,"k":{"a":0,"k":[0,1,0,0,1,0,1,0]}},"h":{"a":1,"k":[{"t":0,"s":[0]},{"t":1,"s":[100]}]},"a":{"a":0,"k":0},"o":{"a":0,"k":100}},"#);
+  }
+  let json = format!(
+    r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":1,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"rc","p":{{"a":0,"k":[32,32]}},"s":{{"a":0,"k":[10,10]}},"r":{{"a":0,"k":0}}}},{shapes}{{"ty":"tr"}}]}}]}}]}}"#
+  );
+  crate::composition::parse::with_limits_check(false, || Composition::parse(json.as_bytes(), &Limits::default())).unwrap();
+  assert_lottie!(json.clone(), 64, 0, 2);
+  assert_lottie!(
+    json,
+    64,
+    0,
+    2,
+    RenderOptions {
+      alpha_only: true,
+      ..RenderOptions::default()
+    }
+  );
+}
+
+#[test]
+fn repeater_over_zero_point_geometry_stays_bounded() {
+  // Parser-legal file: a fill placed BEFORE 9,990 empty paths keeps the
+  // paint source-item accounting at zero, item count stays under
+  // max_shapes_per_layer, and a single 64-copy repeater is far below the
+  // product caps. Because the duplicated contours carry no points, the
+  // point-weighted repeater charges are zero, yet `apply_repeater` still
+  // duplicates every arena entry: ~640k fixed-size `Contour` records
+  // (~50 MB with Vec growth) were materialized before the next entry-count
+  // check could fire. The arena-entry charge must stop it within the budget.
+  let json = zero_point_repeater_arena_json(9_990);
+  assert!(Composition::parse(json.as_bytes(), &Limits::default()).is_ok());
+  assert_lottie!(json.clone());
+  assert_lottie!(
+    json,
+    64,
+    0,
+    1,
+    RenderOptions {
+      alpha_only: true,
+      ..RenderOptions::default()
+    }
+  );
+}
+
+#[test]
+fn repeater_over_trim_cleared_geometry_stays_bounded() {
+  // Same entry-count explosion without the empty-path trick: a full-width
+  // trim (s == e) clears the points of 9,990 rect contours, so the paint
+  // source items are behind the fill (parser needs a bypass) and the
+  // repeater's `points x copies` charge sees zero again. Must be rejected
+  // by the renderer before the arena duplicates.
+  assert_lottie!(trim_cleared_repeater_arena_json(9_990), 64, 0, 1, RenderOptions::default(), true);
+  assert_lottie!(
+    trim_cleared_repeater_arena_json(9_990),
+    64,
+    0,
+    1,
+    RenderOptions {
+      alpha_only: true,
+      ..RenderOptions::default()
+    },
+    true
+  );
 }

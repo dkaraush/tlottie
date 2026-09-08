@@ -334,3 +334,28 @@ fn static_content_with_a_visibility_transition_keeps_declared_frames() {
   assert!(!comp.is_static());
   assert_eq!(comp.frame_count(), 30);
 }
+#[test]
+fn polystar_limit_checks_later_values_and_explicit_ends() {
+  for keyframes in [r#"[{"t":0,"s":[5]},{"t":1,"s":[129]}]"#, r#"[{"t":0,"s":[5],"e":[129]},{"t":1,"s":[5]}]"#] {
+    let json = alloc::format!(r#"{{"w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ip":0,"op":60,"shapes":[{{"ty":"sr","p":{{"k":[32,32]}},"pt":{{"a":1,"k":{keyframes}}}}}]}}]}}"#);
+    assert!(matches!(Composition::parse(json.as_bytes(), &Limits::default()), Err(Error::LimitExceeded(Limit::PolystarPoints))));
+    assert!(with_limits_check(false, || Composition::parse(json.as_bytes(), &Limits::default())).is_ok());
+  }
+}
+
+#[test]
+fn focal_gradient_limit_checks_fill_and_stroke_timelines() {
+  for kind in ["gf", "gs"] {
+    for keyframes in [r#"[{"t":0,"s":[0]},{"t":1,"s":[100]}]"#, r#"[{"t":0,"s":[0],"e":[100]},{"t":1,"s":[0]}]"#] {
+      let json = alloc::format!(
+        r#"{{"w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ip":0,"op":60,"shapes":[{{"ty":"{kind}","t":2,"s":{{"k":[0,0]}},"e":{{"k":[64,64]}},"w":{{"k":2}},"g":{{"p":2,"k":{{"k":[0,1,0,0,1,0,0,1]}}}},"h":{{"a":1,"k":{keyframes}}}}}]}}]}}"#
+      );
+      let limits = Limits {
+        max_focal_radial_gradients_per_layer: 0,
+        ..Limits::default()
+      };
+      assert!(matches!(Composition::parse(json.as_bytes(), &limits), Err(Error::LimitExceeded(Limit::FocalRadialGradientsPerLayer))));
+      assert!(with_limits_check(false, || Composition::parse(json.as_bytes(), &limits)).is_ok());
+    }
+  }
+}
