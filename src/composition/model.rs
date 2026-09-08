@@ -14,6 +14,10 @@ use alloc::vec::Vec;
 pub(crate) struct FloatList(pub Vec<f32>);
 
 impl Lerp for FloatList {
+  fn clone_heap_bytes(&self) -> usize {
+    self.0.len().saturating_mul(core::mem::size_of::<f32>())
+  }
+
   fn lerp(&self, other: &Self, t: f32) -> Self {
     if self.0.len() != other.0.len() {
       return self.clone();
@@ -504,6 +508,15 @@ pub(crate) struct PathData {
 }
 
 impl Lerp for PathData {
+  fn clone_heap_bytes(&self) -> usize {
+    self
+      .vertices
+      .len()
+      .saturating_add(self.in_tangents.len())
+      .saturating_add(self.out_tangents.len())
+      .saturating_mul(core::mem::size_of::<Vec2>())
+  }
+
   fn lerp(&self, other: &Self, t: f32) -> Self {
     // Topology must match to interpolate; otherwise hold the start value
     // (same behavior as rlottie for mismatched path keyframes).

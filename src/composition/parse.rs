@@ -59,7 +59,7 @@ pub(crate) fn with_limits_check<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
 }
 
 /// Maximum nesting of `gr` shape groups (separate from raw JSON depth).
-const MAX_GROUP_DEPTH: usize = 32;
+pub(crate) const MAX_GROUP_DEPTH: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Object / array walking helpers
@@ -76,12 +76,21 @@ fn json_err(c: &Cursor<'_>, kind: JsonErrorKind) -> Error {
 /// Iterates fields of a JSON object. The callback must consume each value
 /// (parse it or `skip_value`).
 fn for_each_field<'a>(c: &mut Cursor<'a>, mut f: impl FnMut(&mut Cursor<'a>, &'a [u8]) -> Result<()>) -> Result<()> {
+  for_each_field_until(c, |c, key| {
+    f(c, key)?;
+    Ok(false)
+  })?;
+  Ok(())
+}
+
+/// A true callback result suspends the object before consuming its value.
+fn for_each_field_until<'a>(c: &mut Cursor<'a>, mut f: impl FnMut(&mut Cursor<'a>, &'a [u8]) -> Result<bool>) -> Result<bool> {
   c.skip_ws();
   c.expect(b'{')?;
   c.skip_ws();
   if c.peek() == Some(b'}') {
     c.bump();
-    return Ok(());
+    return Ok(false);
   }
   loop {
     c.skip_ws();
@@ -89,11 +98,13 @@ fn for_each_field<'a>(c: &mut Cursor<'a>, mut f: impl FnMut(&mut Cursor<'a>, &'a
     c.skip_ws();
     c.expect(b':')?;
     c.skip_ws();
-    f(c, key)?;
+    if f(c, key)? {
+      return Ok(true);
+    }
     c.skip_ws();
     match c.bump() {
       Some(b',') => {}
-      Some(b'}') => return Ok(()),
+      Some(b'}') => return Ok(false),
       Some(b) => return Err(json_err(c, JsonErrorKind::UnexpectedByte(b))),
       None => return Err(json_err(c, JsonErrorKind::UnexpectedEof)),
     }
@@ -382,7 +393,14 @@ fn parse_keyframes<T: Lerp + PartialEq, F: Fn(&mut Cursor<'_>) -> Result<T> + Co
     let value = match rk.value {
       Some(v) => v,
       None => match kfs.last() {
-        Some(prev) => prev.end.clone().unwrap_or_else(|| prev.value.clone()),
+        Some(prev) => {
+          let inherited = prev.end.as_ref().unwrap_or(&prev.value);
+          // This allocation amplification is independent of the authored
+          // keyframe/point caps. Charge before cloning, even when those
+          // structural checks are disabled.
+          c.charge_inherited_keyframe_bytes(inherited.clone_heap_bytes(), limits.max_inherited_keyframe_bytes)?;
+          inherited.clone()
+        }
         None => return Err(invalid(c, "first keyframe has no value")),
       },
     };
@@ -549,6 +567,7 @@ fn parse_position(c: &mut Cursor<'_>, limits: &Limits) -> Result<Position> {
 enum ParsedItem {
   Shape(Shape),
   GroupTransform(Transform),
+  Group { pos: usize, inline: bool },
   Ignored,
 }
 
@@ -562,98 +581,195 @@ struct ShapeCounts {
   trims: usize,
 }
 
+/// Per-group state lives on a heap stack, so accepted group depth does not
+/// multiply the large stack frames used to decode individual shape properties.
+struct ShapeList {
+  shapes: Vec<Shape>,
+  transform: Option<Transform>,
+  dashed_strokes: usize,
+  gradient_strokes: usize,
+  max_dashed_source_segment: f32,
+  dashed_source_len: f32,
+  dashed_piece_estimate: usize,
+  repeater_product: usize,
+  source_items: usize,
+  first: bool,
+}
+
+impl Default for ShapeList {
+  fn default() -> Self {
+    Self {
+      shapes: Vec::new(),
+      transform: None,
+      dashed_strokes: 0,
+      gradient_strokes: 0,
+      max_dashed_source_segment: 0.0,
+      dashed_source_len: 0.0,
+      dashed_piece_estimate: 0,
+      repeater_product: 1,
+      source_items: 0,
+      first: true,
+    }
+  }
+}
+
+impl ShapeList {
+  fn push(&mut self, s: Shape, limits: &Limits, count: &mut ShapeCounts) -> Result<()> {
+    if is_paint(&s) {
+      count.paints += 1;
+      if limits_check() && count.paints > limits.max_paints_per_layer {
+        return Err(Error::LimitExceeded(Limit::PaintsPerLayer));
+      }
+      count.paint_source_items = count.paint_source_items.saturating_add(self.source_items);
+      if limits_check() && count.paint_source_items > limits.max_paint_source_items_per_layer {
+        return Err(Error::LimitExceeded(Limit::PaintSourceItemsPerLayer));
+      }
+    }
+    if is_focal_radial_gradient(&s) {
+      count.focal_radial_gradients += 1;
+      if limits_check() && count.focal_radial_gradients > limits.max_focal_radial_gradients_per_layer {
+        return Err(Error::LimitExceeded(Limit::FocalRadialGradientsPerLayer));
+      }
+    }
+    if matches!(s, Shape::RoundCorners(_)) {
+      count.round_corners += 1;
+      if limits_check() && count.round_corners > limits.max_round_corners_per_layer {
+        return Err(Error::LimitExceeded(Limit::RoundCornersPerLayer));
+      }
+    }
+    if matches!(s, Shape::Trim(_)) {
+      count.trims += 1;
+      if limits_check() && count.trims > limits.max_trims_per_layer {
+        return Err(Error::LimitExceeded(Limit::TrimsPerLayer));
+      }
+    }
+    if let Some(copies) = repeater_copies(&s) {
+      self.repeater_product = self.repeater_product.saturating_mul(copies.max(1));
+      if limits_check() && self.repeater_product > limits.max_repeater_product_per_group {
+        return Err(Error::LimitExceeded(Limit::RepeaterProductPerGroup));
+      }
+    }
+    if is_dashed_stroke(&s) {
+      self.dashed_strokes += 1;
+      if limits_check() && self.dashed_strokes > limits.max_dashed_strokes_per_group {
+        return Err(Error::LimitExceeded(Limit::DashedStrokesPerGroup));
+      }
+      if limits_check() && is_round_join_dashed_stroke(&s) && self.max_dashed_source_segment > limits.max_dashed_path_segment_span {
+        return Err(Error::LimitExceeded(Limit::DashedPathSegment));
+      }
+      if let Some(pieces) = dash_piece_estimate(&s, self.dashed_source_len) {
+        self.dashed_piece_estimate = self.dashed_piece_estimate.saturating_add(pieces);
+        if limits_check() && self.dashed_piece_estimate > limits.max_dashed_piece_estimate_per_group {
+          return Err(Error::LimitExceeded(Limit::DashedPiecesPerGroup));
+        }
+      }
+    }
+    if matches!(s, Shape::GradientStroke(_)) {
+      self.gradient_strokes += 1;
+      if limits_check() && self.gradient_strokes > limits.max_gradient_strokes_per_group {
+        return Err(Error::LimitExceeded(Limit::GradientStrokesPerGroup));
+      }
+    }
+    let (segment_span, path_span) = path_span_metrics(&s);
+    self.max_dashed_source_segment = self.max_dashed_source_segment.max(segment_span);
+    self.dashed_source_len += path_span;
+    if is_geometry_source(&s) {
+      self.source_items += 1;
+    }
+    if self.shapes.last().is_some_and(|previous| redundant_opaque_gradient_fill(previous, &s)) {
+      return Ok(());
+    }
+    self.shapes.push(s);
+    Ok(())
+  }
+}
+
 fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &mut ShapeCounts) -> Result<(Vec<Shape>, Option<Transform>)> {
   if depth > MAX_GROUP_DEPTH {
     return Err(Error::LimitExceeded(Limit::NestingDepth));
   }
-  let mut shapes = Vec::new();
-  let mut transform: Option<Transform> = None;
-  let mut dashed_strokes = 0usize;
-  let mut gradient_strokes = 0usize;
-  let mut max_dashed_source_segment = 0.0f32;
-  let mut dashed_source_len = 0.0f32;
-  let mut dashed_piece_estimate = 0usize;
-  let mut repeater_product = 1usize;
-  let mut source_items = 0usize;
-  for_each_element(c, |c| {
+  let mut parents = Vec::new();
+  let mut list = ShapeList::default();
+  c.skip_ws();
+  c.expect(b'[')?;
+  loop {
+    c.skip_ws();
+    let done = if list.first {
+      if c.peek() == Some(b']') {
+        c.bump();
+        true
+      } else {
+        false
+      }
+    } else {
+      match c.bump() {
+        Some(b',') => false,
+        Some(b']') => true,
+        Some(b) => return Err(json_err(c, JsonErrorKind::UnexpectedByte(b))),
+        None => return Err(json_err(c, JsonErrorKind::UnexpectedEof)),
+      }
+    };
+    if done {
+      let Some((cursor, parent)) = parents.pop() else {
+        return Ok((list.shapes, list.transform));
+      };
+      let group = Shape::Group(Box::new(Group {
+        transform: list.transform.unwrap_or_else(Transform::identity),
+        shapes: list.shapes,
+      }));
+      if let Some(cursor) = cursor {
+        *c = cursor;
+      } else {
+        // `ty:gr` was already known when `it` began. Its children were read
+        // directly; finish the enclosing object without rescanning the array.
+        // Group metadata (including `hd`) does not affect its rendering.
+        loop {
+          c.skip_ws();
+          match c.bump() {
+            Some(b'}') => break,
+            Some(b',') => {
+              c.skip_ws();
+              c.read_string_bytes()?;
+              c.skip_ws();
+              c.expect(b':')?;
+              c.skip_value()?;
+            }
+            Some(b) => return Err(json_err(c, JsonErrorKind::UnexpectedByte(b))),
+            None => return Err(json_err(c, JsonErrorKind::UnexpectedEof)),
+          }
+        }
+      }
+      list = parent;
+      list.push(group, limits, count)?;
+      continue;
+    }
+    list.first = false;
+    c.skip_ws();
     count.items += 1;
     if limits_check() && count.items > limits.max_shapes_per_layer {
       return Err(Error::LimitExceeded(Limit::ShapesPerLayer));
     }
-    match parse_shape_item(c, limits, depth, count)? {
-      ParsedItem::Shape(s) => {
-        if is_paint(&s) {
-          count.paints += 1;
-          if limits_check() && count.paints > limits.max_paints_per_layer {
-            return Err(Error::LimitExceeded(Limit::PaintsPerLayer));
-          }
-          count.paint_source_items = count.paint_source_items.saturating_add(source_items);
-          if limits_check() && count.paint_source_items > limits.max_paint_source_items_per_layer {
-            return Err(Error::LimitExceeded(Limit::PaintSourceItemsPerLayer));
-          }
+    match parse_shape_item(c, limits)? {
+      ParsedItem::Group { pos, inline } => {
+        if depth + parents.len() + 1 > MAX_GROUP_DEPTH {
+          return Err(Error::LimitExceeded(Limit::NestingDepth));
         }
-        if is_focal_radial_gradient(&s) {
-          count.focal_radial_gradients += 1;
-          if limits_check() && count.focal_radial_gradients > limits.max_focal_radial_gradients_per_layer {
-            return Err(Error::LimitExceeded(Limit::FocalRadialGradientsPerLayer));
-          }
-        }
-        if matches!(s, Shape::RoundCorners(_)) {
-          count.round_corners += 1;
-          if limits_check() && count.round_corners > limits.max_round_corners_per_layer {
-            return Err(Error::LimitExceeded(Limit::RoundCornersPerLayer));
-          }
-        }
-        if matches!(s, Shape::Trim(_)) {
-          count.trims += 1;
-          if limits_check() && count.trims > limits.max_trims_per_layer {
-            return Err(Error::LimitExceeded(Limit::TrimsPerLayer));
-          }
-        }
-        if let Some(copies) = repeater_copies(&s) {
-          repeater_product = repeater_product.saturating_mul(copies.max(1));
-          if limits_check() && repeater_product > limits.max_repeater_product_per_group {
-            return Err(Error::LimitExceeded(Limit::RepeaterProductPerGroup));
-          }
-        }
-        if is_dashed_stroke(&s) {
-          dashed_strokes += 1;
-          if limits_check() && dashed_strokes > limits.max_dashed_strokes_per_group {
-            return Err(Error::LimitExceeded(Limit::DashedStrokesPerGroup));
-          }
-          if limits_check() && is_round_join_dashed_stroke(&s) && max_dashed_source_segment > limits.max_dashed_path_segment_span {
-            return Err(Error::LimitExceeded(Limit::DashedPathSegment));
-          }
-          if let Some(pieces) = dash_piece_estimate(&s, dashed_source_len) {
-            dashed_piece_estimate = dashed_piece_estimate.saturating_add(pieces);
-            if limits_check() && dashed_piece_estimate > limits.max_dashed_piece_estimate_per_group {
-              return Err(Error::LimitExceeded(Limit::DashedPiecesPerGroup));
-            }
-          }
-        }
-        if matches!(s, Shape::GradientStroke(_)) {
-          gradient_strokes += 1;
-          if limits_check() && gradient_strokes > limits.max_gradient_strokes_per_group {
-            return Err(Error::LimitExceeded(Limit::GradientStrokesPerGroup));
-          }
-        }
-        let (segment_span, path_span) = path_span_metrics(&s);
-        max_dashed_source_segment = max_dashed_source_segment.max(segment_span);
-        dashed_source_len += path_span;
-        if is_geometry_source(&s) {
-          source_items += 1;
-        }
-        if shapes.last().is_some_and(|previous| redundant_opaque_gradient_fill(previous, &s)) {
-          return Ok(());
-        }
-        shapes.push(s);
+        let parent = if inline {
+          None
+        } else {
+          let child = c.fork_at(pos);
+          Some(core::mem::replace(c, child))
+        };
+        parents.push((parent, list));
+        list = ShapeList::default();
+        c.skip_ws();
+        c.expect(b'[')?;
       }
-      ParsedItem::GroupTransform(t) => transform = Some(t),
+      ParsedItem::Shape(s) => list.push(s, limits, count)?,
+      ParsedItem::GroupTransform(t) => list.transform = Some(t),
       ParsedItem::Ignored => {}
     }
-    Ok(())
-  })?;
-  Ok((shapes, transform))
+  }
 }
 
 fn is_paint(shape: &Shape) -> bool {
@@ -893,12 +1009,11 @@ fn path_span_metrics(shape: &Shape) -> (f32, f32) {
   (max, total)
 }
 
-fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &mut ShapeCounts) -> Result<ParsedItem> {
+fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
   // Record positions of every field we might need, dispatch after `ty` is known.
   let mut ty: Option<[u8; 2]> = None;
   let mut hidden = false;
   let mut it_pos: Option<usize> = None;
-  let mut parsed_group: Option<(Vec<Shape>, Option<Transform>)> = None;
   let mut ks_pos: Option<usize> = None;
   let mut parsed_path: Option<Property<PathData>> = None;
   let mut p_pos: Option<usize> = None;
@@ -929,7 +1044,9 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
   let mut miter_limit = 0.0f32;
   let obj_start = c.pos();
 
-  parse_object_once!(c, |c, key| {
+  let mut seen = SeenFields::default();
+  let inline_group = for_each_field_until(c, |c, key| {
+    match_once!(seen, key, {
     b"t" => {
       grad_type = parse_f32(c)?;
     }
@@ -954,13 +1071,9 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
       hidden = parse_bool(c)?;
     }
     b"it" => {
-      if ty == Some(*b"gr") {
-        parsed_group = Some(parse_shape_list(c, limits, depth + 1, count)?);
-        it_pos = None;
-      } else {
-        it_pos = Some(c.pos());
-        c.skip_value()?;
-      }
+      it_pos = Some(c.pos());
+      if ty == Some(*b"gr") { return Ok(true); }
+      c.skip_value()?;
     }
     b"ks" => {
       if ty == Some(*b"sh") {
@@ -1055,6 +1168,8 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
       }
     }
     _ => { c.skip_value()? },
+    });
+    Ok(false)
   })?;
 
   let Some(ty) = ty else {
@@ -1085,23 +1200,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
   let direction_reversed = |c: &Cursor<'_>, pos: Option<usize>| -> bool { pos.is_some_and(|p| parse_f32(&mut c.fork_at(p)).unwrap_or(1.0) == 3.0) };
 
   match &ty {
-    b"gr" => {
-      if let Some((shapes, transform)) = parsed_group {
-        return Ok(ParsedItem::Shape(Shape::Group(Box::new(Group {
-          transform: transform.unwrap_or_else(Transform::identity),
-          shapes,
-        }))));
-      }
-      let Some(it_pos) = it_pos else {
-        return Ok(ParsedItem::Ignored); // empty group
-      };
-      let mut ic = c.fork_at(it_pos);
-      let (shapes, transform) = parse_shape_list(&mut ic, limits, depth + 1, count)?;
-      Ok(ParsedItem::Shape(Shape::Group(Box::new(Group {
-        transform: transform.unwrap_or_else(Transform::identity),
-        shapes,
-      }))))
-    }
+    b"gr" => Ok(it_pos.map_or(ParsedItem::Ignored, |pos| ParsedItem::Group { pos, inline: inline_group })),
     b"sh" => {
       let path = match parsed_path {
         Some(path) => path,

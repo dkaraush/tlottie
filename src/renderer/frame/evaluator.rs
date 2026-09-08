@@ -752,6 +752,9 @@ impl ShapeWalker<'_> {
           };
           let closed = *closed;
           let total = polyline_length(&contour.points, closed, contour.inv_lin);
+          if !total.is_finite() {
+            return Err(crate::Error::LimitExceeded(crate::Limit::PathCoordinate));
+          }
           if closed && range_count == 2 {
             // Closed path: the wrapped window is one continuous
             // piece across the seam; extract_by_length wraps.
@@ -783,6 +786,11 @@ impl ShapeWalker<'_> {
       TrimMode::Individual => {
         let totals: Vec<f32> = arena.get(scope_start..).unwrap_or(&[]).iter().map(|(c, cl)| polyline_length(&c.points, *cl, c.inv_lin)).collect();
         let grand: f32 = totals.iter().sum();
+        // Lengths are non-negative: a finite sum also guarantees every
+        // contour length is finite before it becomes a clamp bound.
+        if !grand.is_finite() {
+          return Err(crate::Error::LimitExceeded(crate::Limit::PathCoordinate));
+        }
         if grand <= 1e-6 {
           return Ok(());
         }

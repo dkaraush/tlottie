@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::composition::parse::MAX_GROUP_DEPTH;
 use crate::{CPURenderer, Composition, Error, Limits, RenderOptions};
 
 // Keep renderer regressions independent of parser resource checks.
@@ -825,6 +826,14 @@ fn layer_shapes_before_ty_delayed_dispatch_json(items_count: usize, junk_fields:
   format!(r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"shapes":[{shapes}],"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}}}}]}}"#)
 }
 
+fn nested_shape_groups_json(depth: usize) -> String {
+  let mut group = r#"{"ty":"fl","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100}}"#.to_string();
+  for _ in 0..depth {
+    group = format!(r#"{{"ty":"gr","it":[{group}]}}"#);
+  }
+  format!(r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{group}]}}]}}"#)
+}
+
 fn many_minimal_masks_json(masks_count: usize) -> String {
   let mut masks = String::new();
   for i in 0..masks_count {
@@ -1148,6 +1157,43 @@ fn keyframe_value_inheritance_stays_bounded() {
 }
 
 #[test]
+fn shape_group_nesting_at_the_parser_limit_stays_on_the_worker_stack() {
+  // `MAX_GROUP_DEPTH` is 32, so 24 nested shape groups are accepted input.
+  // The recursive parser's debug frames are large enough to overflow the
+  // default 2 MiB test-worker stack at this depth, aborting the whole process.
+  let mut item = r#"{"ty":"fl","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100}}"#.to_string();
+  for _ in 0..24 {
+    item = format!(r#"{{"ty":"gr","it":[{item}]}}"#);
+  }
+  let json = format!(r#"{{"fr":30,"ip":0,"op":60,"w":64,"h":64,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{item}]}}]}}"#);
+  let _ = Composition::parse(json.as_bytes(), &Limits::default());
+}
+
+#[test]
+fn keyframe_path_inheritance_within_limits_stays_bounded() {
+  // `max_keyframes` and `max_path_points` bound only one axis each. A first
+  // path at the point cap, followed by value-less keyframes just below the
+  // keyframe cap, makes every inherited keyframe deep-clone that whole path.
+  // The file is legal and parse succeeds, but the model peaks far above the
+  // memory budget before any rendering starts.
+  let mut verts = String::new();
+  for i in 0..Limits::default().max_path_points {
+    if i > 0 {
+      verts.push(',');
+    }
+    verts.push_str(&format!("[{},{}]", i % 60, (i / 60) % 60));
+  }
+  let mut kfs = format!(r#"{{"t":0,"s":[{{"c":true,"v":[{verts}],"i":[],"o":[]}}]}}"#);
+  for t in 1..Limits::default().max_keyframes {
+    kfs.push_str(&format!(r#",{{"t":{t}}}"#));
+  }
+  let json = format!(
+    r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"sh","ks":{{"a":1,"k":[{kfs}]}}}},{{"ty":"fl","c":{{"a":0,"k":[1,0,0]}},"o":{{"a":0,"k":100}}}},{{"ty":"tr"}}]}}]}}]}}"#
+  );
+  assert_lottie!(json);
+}
+
+#[test]
 fn repeater_amplifies_large_geometry_stays_bounded() {
   // A single, ordinary Repeater (`rp`, 64 copies, the clamp ceiling) applied
   // to a LARGE authored path. `apply_repeater` clones the base scope's geometry
@@ -1287,6 +1333,36 @@ fn asset_layers_delayed_dispatch_stays_bounded() {
   // max-legal layer-list variant live for untrusted precomp JSON.
   let json = asset_layers_delayed_dispatch_json(4095, 300);
   assert_lottie!(json);
+}
+
+#[test]
+fn nested_shape_groups_stay_on_the_thread_stack() {
+  // Parse-time ABORT (not a budget breach): the `gr` -> `it` -> `gr` walk
+  // (parse_shape_list -> parse_shape_item -> for_each_field -> `it` arm ->
+  // parse_shape_list(depth+1)) costs ~88 KiB of thread stack per group level
+  // in debug builds (~9 KiB in release), while MAX_GROUP_DEPTH=32 is accepted
+  // unconditionally and only 33+ returns Err(LimitExceeded(NestingDepth)). So
+  // a few hundred bytes of legal JSON abort the whole process with "has
+  // overflowed its stack" whenever the caller's stack is smaller than the
+  // recursion: 24 nested groups die on the 2 MiB std::thread::spawn default
+  // (debug), and 32 die on the 128 KiB musl default (release). A DoS budget
+  // can never catch this: a stack overflow is an unconditional SIGSEGV->abort,
+  // not a panic. Nesting must therefore be bounded by a guard on actual stack
+  // cost (or the walk made iterative), so parsing legal max-depth input on a
+  // small-stack thread must TERMINATE, with Ok or a clean LimitExceeded.
+  for depth in [24, MAX_GROUP_DEPTH] {
+    let json = nested_shape_groups_json(depth);
+    let worker = thread::Builder::new()
+      .stack_size(128 << 10)
+      .spawn(move || Composition::parse(json.as_bytes(), &Limits::default()).map(|_| ()))
+      .unwrap();
+    let parsed = worker.join().unwrap_or_else(|_| panic!("depth {depth}: parse worker panicked"));
+    assert!(matches!(parsed, Ok(()) | Err(Error::LimitExceeded(_))), "depth {depth}: {parsed:?}");
+  }
+  // The pre-existing structural guard must keep rejecting over-deep input
+  // cleanly (this one already holds; the fix must not lose it).
+  let over = Composition::parse(nested_shape_groups_json(MAX_GROUP_DEPTH + 1).as_bytes(), &Limits::default());
+  assert!(matches!(over, Err(Error::LimitExceeded(crate::Limit::NestingDepth))), "{over:?}");
 }
 
 #[test]
@@ -1497,6 +1573,15 @@ fn repeated_individual_trims_over_large_paths_stay_bounded() {
   let json = format!(
     r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":0,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{path_items},{trims}{{"ty":"fl","c":{{"a":0,"k":[1,0,0]}},"o":{{"a":0,"k":100}}}},{{"ty":"tr"}}]}}]}}]}}"#
   );
+  assert_lottie!(json);
+}
+
+#[test]
+fn individual_trim_over_overflowed_scale_stays_bounded() {
+  // A layer scale large enough to overflow f32 maps the geometry to infinities.
+  // `inf * 0` and `inf - inf` then make an individual trim's measured length
+  // NaN; `f32::clamp` panics on NaN bounds instead of returning a limit error.
+  let json = r#"{"fr":30,"ip":0,"op":12,"w":64,"h":64,"layers":[{"ty":4,"ks":{"s":{"a":0,"k":[1e40,1e40]}},"shapes":[{"ty":"el","p":{"a":0,"k":[0,0]},"s":{"a":0,"k":[10,10]}},{"ty":"tm","s":{"a":0,"k":0},"e":{"a":0,"k":50},"m":2}]}]}"#;
   assert_lottie!(json);
 }
 
@@ -2281,6 +2366,32 @@ fn matte_reuses_masked_precomp_stays_bounded() {
 }
 
 #[test]
+fn nested_track_matte_target_surfaces_stay_bounded() {
+  // A track-matte consumer that is itself a precomp keeps both its matte-source
+  // and target surfaces live while it descends into the child asset. Fifteen
+  // nested precomp mattes therefore hold 32 full 511x511 RGBA canvases at once.
+  let source = r#"{"ty":4,"ind":10,"ip":0,"op":60,"st":0,"ks":{},"shapes":[{"ty":"gr","it":[{"ty":"rc","p":{"a":0,"k":[256,256]},"s":{"a":0,"k":[511,511]},"r":{"a":0,"k":0}},{"ty":"fl","c":{"a":0,"k":[0,1,0]},"o":{"a":0,"k":100}},{"ty":"tr"}]}]}"#;
+  let mut assets = String::new();
+  for i in 0..15 {
+    if i > 0 {
+      assets.push(',');
+    }
+    let child = if i + 1 < 15 { format!("a{}", i + 1) } else { "leaf".to_string() };
+    assets.push_str(&format!(
+      r#"{{"id":"a{i}","layers":[{source},{{"ty":0,"ind":11,"refId":"{child}","tt":1,"ip":0,"op":60,"st":0,"ks":{{}}}}]}}"#
+    ));
+  }
+  assets.push_str(&format!(r#",{{"id":"leaf","layers":[{source}]}}"#));
+  let json = format!(r#"{{"v":"5.7.4","fr":60,"ip":0,"op":60,"w":511,"h":511,"layers":[{source},{{"ty":0,"ind":1,"refId":"a0","tt":1,"ip":0,"op":60,"st":0,"ks":{{}}}}],"assets":[{assets}]}}"#);
+  // Sweep both sides of the depth/canvas-size boundary, including a second
+  // frame with retained scratch/cache allocations. Stay below the 512px
+  // mapped-surface threshold so the accounting allocator sees every plane.
+  for size in [448, 480, 485, 486, 500, 511] {
+    assert_lottie!(json.clone(), size, 0, 2);
+  }
+}
+
+#[test]
 fn rounded_polystar_many_fills_repeater_stays_bounded() {
   // Rounded polystars are generated geometry, not JSON-authored path points.
   // Combining one with many paints and max-legal repeater copies covers the
@@ -2863,4 +2974,41 @@ fn repeater_over_trim_cleared_geometry_stays_bounded() {
     },
     true
   );
+}
+
+#[test]
+fn renderer_recovers_after_non_finite_trim_length() {
+  // Finite authored scales can overflow during evaluation too. Exercise
+  // both trim modes and output formats, without relying on parser rejection.
+  for scale in ["1e40", "3e38"] {
+    for mode in [1, 2] {
+      let json = format!(
+        r#"{{"fr":30,"ip":0,"op":3,"w":64,"h":64,"layers":[{{"ty":4,"ks":{{"s":{{"k":[{{"t":0,"s":[100,100],"h":1}},{{"t":1,"s":[{scale},{scale}],"h":1}},{{"t":2,"s":[100,100]}}]}}}},"shapes":[{{"ty":"el","p":{{"k":[16,16]}},"s":{{"k":[10,10]}}}},{{"ty":"tm","s":{{"k":0}},"e":{{"k":50}},"m":{mode}}},{{"ty":"fl","c":{{"k":[1,0,0]}},"o":{{"k":100}}}}]}}]}}"#
+      );
+      let comp = crate::composition::parse::with_limits_check(false, || Composition::parse(json.as_bytes(), &Limits::default())).unwrap();
+      let mut renderer = CPURenderer::new(comp);
+      let mut rgba = vec![0; 64 * 64];
+      renderer.render(0.0, &mut rgba, 64, 64, RenderOptions::default()).unwrap();
+      let expected = rgba.clone();
+      assert!(expected.iter().any(|&pixel| pixel != 0));
+      let result = renderer.render(1.0, &mut rgba, 64, 64, RenderOptions::default());
+      assert!(
+        result == Err(Error::LimitExceeded(crate::Limit::PathCoordinate)) || (scale == "3e38" && result.is_ok()),
+        "scale={scale}, mode={mode}: {result:?}"
+      );
+      renderer.render(2.0, &mut rgba, 64, 64, RenderOptions::default()).unwrap();
+      assert_eq!(rgba, expected);
+      let mut alpha = vec![0; 64 * 64];
+      renderer.render_alpha8(0.0, &mut alpha, 64, 64, RenderOptions::default()).unwrap();
+      let expected = alpha.clone();
+      assert!(expected.iter().any(|&pixel| pixel != 0));
+      let result = renderer.render_alpha8(1.0, &mut alpha, 64, 64, RenderOptions::default());
+      assert!(
+        result == Err(Error::LimitExceeded(crate::Limit::PathCoordinate)) || (scale == "3e38" && result.is_ok()),
+        "scale={scale}, mode={mode}: {result:?}"
+      );
+      renderer.render_alpha8(2.0, &mut alpha, 64, 64, RenderOptions::default()).unwrap();
+      assert_eq!(alpha, expected);
+    }
+  }
 }

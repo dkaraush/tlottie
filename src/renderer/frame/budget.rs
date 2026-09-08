@@ -107,6 +107,7 @@ pub(crate) struct GuardedRenderer<'a, R> {
   height: usize,
   depth: usize,
   pixels: Cell<usize>,
+  pixel_limit: usize,
   budget: Budget,
   error: Option<Error>,
   pub(crate) pixel_costs: crate::compat::HashMap<u128, DrawCost>,
@@ -119,6 +120,9 @@ impl<'a, R: FrameRenderer> GuardedRenderer<'a, R> {
       height: height as usize,
       depth: 0,
       pixels: Cell::new(0),
+      // Pixel work grows with output area even for the same authored scene.
+      // Keep the small-canvas floor while allowing proportional raster work.
+      pixel_limit: ((Limits::default().max_render_pixels as u64).saturating_mul((width as u64 * height as u64).max(64 * 64)) / (64 * 64)).min(usize::MAX as u64) as usize,
       budget: Budget::default(),
       error: None,
       pixel_costs,
@@ -137,12 +141,7 @@ impl<'a, R: FrameRenderer> GuardedRenderer<'a, R> {
     }
   }
   fn pixels(&self, times: usize) -> Result<()> {
-    Budget::charge(
-      &self.pixels,
-      self.width.saturating_mul(self.height).saturating_mul(times),
-      Limits::default().max_render_pixels,
-      Limit::RenderWork,
-    )
+    Budget::charge(&self.pixels, self.width.saturating_mul(self.height).saturating_mul(times), self.pixel_limit, Limit::RenderWork)
   }
   fn geometry(&mut self, geometry: &mut Geometry<'_>, pixel_weight: usize) -> Result<()> {
     let translation = geometry.raw_translation();
@@ -152,7 +151,7 @@ impl<'a, R: FrameRenderer> GuardedRenderer<'a, R> {
     if let Some(cost) = self.pixel_costs.get(&geometry.cache_key) {
       self.budget.work(cost.work)?;
       geometry.raster_mode = Some(cost.sparse);
-      return Budget::charge(&self.pixels, cost.pixels.saturating_mul(pixel_weight), Limits::default().max_render_pixels, Limit::RenderWork);
+      return Budget::charge(&self.pixels, cost.pixels.saturating_mul(pixel_weight), self.pixel_limit, Limit::RenderWork);
     }
     let metrics = crate::geometry::RasterMetrics::new(geometry.raw_contours());
     if !metrics.perim.is_finite() {
@@ -192,7 +191,7 @@ impl<'a, R: FrameRenderer> GuardedRenderer<'a, R> {
       // bounding-box charge across frames; on a miss charge the full canvas.
       self.width.saturating_mul(self.height)
     };
-    Budget::charge(&self.pixels, pixels.saturating_mul(pixel_weight), Limits::default().max_render_pixels, Limit::RenderWork)
+    Budget::charge(&self.pixels, pixels.saturating_mul(pixel_weight), self.pixel_limit, Limit::RenderWork)
   }
 }
 impl<R: FrameRenderer> FrameRenderer for GuardedRenderer<'_, R> {
@@ -416,18 +415,18 @@ mod tests {
   #[test]
   fn cached_geometry_still_consumes_pixel_budget() {
     let mut sink = Sink::default();
-    let mut guarded = GuardedRenderer::new(&mut sink, 1024, 1024, Default::default());
+    let mut guarded = GuardedRenderer::new(&mut sink, 128, 128, Default::default());
     let paint = Paint::Solid(SolidPaint {
       rule: Rule::NonZero,
       rgba: u32::MAX,
       color: crate::math::Color::BLACK,
       opacity: 1.0,
     });
-    for _ in 0..100 {
+    for _ in 0..16385 {
       guarded.draw(Geometry::new(&[], 1), paint);
     }
     assert_eq!(guarded.status(), Err(Error::LimitExceeded(Limit::RenderWork)));
-    assert_eq!(sink.draws, 64);
+    assert_eq!(sink.draws, 16384);
   }
 
   #[test]
@@ -437,11 +436,11 @@ mod tests {
     // The first frame caches coverage with a cheap paint. A later frame can
     // reuse those points with a different (or newly focal) animated gradient.
     let contours = [Contour {
-      points: alloc::vec![Vec2::new(0.0, 0.0), Vec2::new(1024.0, 0.0), Vec2::new(1024.0, 1024.0), Vec2::new(0.0, 1024.0)],
+      points: alloc::vec![Vec2::new(0.0, 0.0), Vec2::new(128.0, 0.0), Vec2::new(128.0, 128.0), Vec2::new(0.0, 128.0)],
       ..Contour::default()
     }];
     let mut sink = Sink::default();
-    let mut guarded = GuardedRenderer::new(&mut sink, 1024, 1024, Default::default());
+    let mut guarded = GuardedRenderer::new(&mut sink, 128, 128, Default::default());
     guarded.draw(
       Geometry::new(&contours, 1),
       Paint::Solid(SolidPaint {
@@ -462,9 +461,9 @@ mod tests {
           dy: 1.0,
           inv_len_sq: 0.5,
         },
-        8,
+        2048,
       ),
-      (GradientKind::Radial { sx: 0.0, sy: 0.0, inv_r: 1.0 }, 4),
+      (GradientKind::Radial { sx: 0.0, sy: 0.0, inv_r: 1.0 }, 1024),
       (
         GradientKind::Focal {
           fx: 0.0,
@@ -474,7 +473,7 @@ mod tests {
           a: 1.0,
           r: 1.0,
         },
-        2,
+        512,
       ),
     ] {
       let gradient = GradientPaint {
@@ -493,8 +492,8 @@ mod tests {
         alpha: 255,
       };
       let mut sink = Sink::default();
-      let mut guarded = GuardedRenderer::new(&mut sink, 1024, 1024, costs.clone());
-      for _ in 0..10 {
+      let mut guarded = GuardedRenderer::new(&mut sink, 128, 128, costs.clone());
+      for _ in 0..=expected_draws {
         guarded.draw(Geometry::new(&[], 1), Paint::Gradient(&gradient));
       }
       assert_eq!(guarded.status(), Err(Error::LimitExceeded(Limit::RenderWork)));

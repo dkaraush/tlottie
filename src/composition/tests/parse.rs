@@ -359,3 +359,84 @@ fn focal_gradient_limit_checks_fill_and_stroke_timelines() {
     }
   }
 }
+
+#[test]
+fn inherited_keyframe_heap_budget_is_cumulative_and_preserves_end_values() {
+  // A missing start inherits the explicit segment end, then that same value
+  // propagates to the next missing start. Check paths and gradient tables.
+  for json in [r#"[{"t":0,"s":[1,2],"e":[3,4]},{"t":1},{"t":2}]"#, r#"[{"t":0,"s":[1,2]},{"t":1},{"t":2}]"#] {
+    let limits = Limits {
+      max_inherited_keyframe_bytes: 16,
+      ..Limits::default()
+    };
+    let mut c = Cursor::new(json.as_bytes(), 128);
+    let prop = parse_keyframes(&mut c, &limits, |c| parse_f32_list(c, limits.max_gradient_stop_values, Limit::GradientStopValues)).unwrap();
+    let expected = if json.contains("\"e\"") { 3.0 } else { 1.0 };
+    assert_eq!(prop.eval(2.0).0[0], expected);
+    // A fork and another property share the same composition-wide counter.
+    let mut fork = c.fork_at(0);
+    assert!(matches!(
+      parse_keyframes(&mut fork, &limits, |c| parse_f32_list(c, limits.max_gradient_stop_values, Limit::GradientStopValues)),
+      Err(Error::LimitExceeded(Limit::InheritedKeyframeBytes))
+    ));
+    let limits = Limits {
+      max_inherited_keyframe_bytes: 15,
+      ..limits
+    };
+    assert!(matches!(
+      parse_keyframes(&mut Cursor::new(json.as_bytes(), 128), &limits, |c| parse_f32_list(
+        c,
+        limits.max_gradient_stop_values,
+        Limit::GradientStopValues
+      )),
+      Err(Error::LimitExceeded(Limit::InheritedKeyframeBytes))
+    ));
+  }
+}
+
+#[test]
+fn inherited_path_budget_charges_padded_tangents_before_cloning() {
+  let json = br#"[{"t":0,"s":[{"v":[[1,2],[3,4]],"i":[],"o":[]}]},{"t":1}]"#;
+  for (maximum, succeeds) in [(48, true), (47, false)] {
+    let limits = Limits {
+      max_inherited_keyframe_bytes: maximum,
+      ..Limits::default()
+    };
+    let result = with_limits_check(false, || parse_keyframes(&mut Cursor::new(json, 128), &limits, |c| parse_path_value(c, &limits)));
+    assert_eq!(result.is_ok(), succeeds);
+    if !succeeds {
+      assert!(matches!(result, Err(Error::LimitExceeded(Limit::InheritedKeyframeBytes))));
+    }
+  }
+}
+
+#[test]
+fn group_walk_preserves_siblings_transforms_and_shared_limits() {
+  // Exercise both field orders and resume the parent after the child list.
+  for group in [
+    r#"{"ty":"gr","it":[{"ty":"tr","p":{"k":[3,4]}},{"ty":"gr","it":[{"ty":"rc","p":{"k":[5,6]},"s":{"k":[7,8]}}]},{"ty":"el","p":{"k":[9,10]},"s":{"k":[11,12]}}]}"#,
+    r#"{"it":[{"ty":"tr","p":{"k":[3,4]}},{"it":[{"ty":"rc","p":{"k":[5,6]},"s":{"k":[7,8]}}],"ty":"gr"},{"ty":"el","p":{"k":[9,10]},"s":{"k":[11,12]}}],"ty":"gr"}"#,
+  ] {
+    let json = alloc::format!(r#"[{group},{{"ty":"fl","c":{{"k":[1,0,0,1]}}}}]"#);
+    let mut counts = ShapeCounts::default();
+    let limits = Limits::default();
+    let (shapes, _) = parse_shape_list(&mut Cursor::new(json.as_bytes(), 128), &limits, 0, &mut counts).unwrap();
+    assert_eq!(counts.items, 6);
+    assert_eq!(counts.paints, 1);
+    assert_eq!(counts.paint_source_items, 1);
+    let Shape::Group(group) = &shapes[0] else { panic!("expected group") };
+    assert_eq!(group.transform.position.eval(0.0), Vec2::new(3.0, 4.0));
+    assert!(matches!(&group.shapes[..], [Shape::Group(_), Shape::Ellipse(_)]));
+    let Shape::Group(child) = &group.shapes[0] else { panic!("expected child group") };
+    assert!(matches!(&child.shapes[..], [Shape::Rect(_)]));
+    assert!(matches!(shapes[1], Shape::Fill(_)));
+    let limits = Limits { max_shapes_per_layer: 5, ..limits };
+    assert!(matches!(
+      parse_shape_list(&mut Cursor::new(json.as_bytes(), 128), &limits, 0, &mut ShapeCounts::default()),
+      Err(Error::LimitExceeded(Limit::ShapesPerLayer))
+    ));
+  }
+  for json in [br#"[{"ty":"gr","it":[]},]"#.as_slice(), br#"[{"ty":"gr","it":[,]}]"#] {
+    assert!(parse_shape_list(&mut Cursor::new(json, 128), &Limits::default(), 0, &mut ShapeCounts::default()).is_err());
+  }
+}

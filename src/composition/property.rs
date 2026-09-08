@@ -120,6 +120,11 @@ pub(crate) enum Property<T> {
 
 /// Types that can be interpolated between keyframes.
 pub(crate) trait Lerp: Clone {
+  /// Heap storage allocated by cloning this value (scalar values allocate none).
+  fn clone_heap_bytes(&self) -> usize {
+    0
+  }
+
   fn lerp(&self, other: &Self, t: f32) -> Self;
 
   /// Interpolation honoring spatial tangents; only meaningful for Vec2

@@ -15,12 +15,18 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use core::cell::{Cell, RefCell};
 
+#[derive(Default)]
+struct ParseState {
+  easing_cache: RefCell<HashMap<String, [f32; 4]>>,
+  saw_animated: Cell<bool>,
+  inherited_keyframe_bytes: Cell<usize>,
+}
+
 pub(crate) struct Cursor<'a> {
   bytes: &'a [u8],
   pos: usize,
   max_depth: usize,
-  easing_cache: Rc<RefCell<HashMap<String, [f32; 4]>>>,
-  saw_animated_property: Rc<Cell<bool>>,
+  state: Rc<ParseState>,
 }
 
 impl<'a> Cursor<'a> {
@@ -29,8 +35,7 @@ impl<'a> Cursor<'a> {
       bytes,
       pos: 0,
       max_depth,
-      easing_cache: Rc::new(RefCell::new(HashMap::new())),
-      saw_animated_property: Rc::new(Cell::new(false)),
+      state: Rc::new(ParseState::default()),
     }
   }
 
@@ -46,17 +51,29 @@ impl<'a> Cursor<'a> {
       bytes: self.bytes,
       pos,
       max_depth: self.max_depth,
-      easing_cache: Rc::clone(&self.easing_cache),
-      saw_animated_property: Rc::clone(&self.saw_animated_property),
+      state: Rc::clone(&self.state),
     }
   }
 
+  /// Forks share the charge so many small properties cannot evade the cap.
+  pub fn charge_inherited_keyframe_bytes(&self, bytes: usize, maximum: usize) -> Result<()> {
+    if bytes == 0 {
+      return Ok(());
+    }
+    let used = self.state.inherited_keyframe_bytes.get();
+    if bytes > maximum.saturating_sub(used) {
+      return Err(Error::LimitExceeded(Limit::InheritedKeyframeBytes));
+    }
+    self.state.inherited_keyframe_bytes.set(used + bytes);
+    Ok(())
+  }
+
   pub fn mark_animated_property(&self) {
-    self.saw_animated_property.set(true);
+    self.state.saw_animated.set(true);
   }
 
   pub fn properties_are_static(&self) -> bool {
-    !self.saw_animated_property.get()
+    !self.state.saw_animated.get()
   }
 
   /// Matches the per-composition interpolator cache used by rlottie and
@@ -64,7 +81,7 @@ impl<'a> Cursor<'a> {
   /// their two-decimal cache key.
   pub fn intern_easing(&self, controls: [f32; 4]) -> [f32; 4] {
     let key = format!("{:.2}_{:.2}_{:.2}_{:.2}", controls[0], controls[1], controls[2], controls[3]);
-    let mut cache = self.easing_cache.borrow_mut();
+    let mut cache = self.state.easing_cache.borrow_mut();
     if let Some(easing) = cache.get(&key) {
       return *easing;
     }

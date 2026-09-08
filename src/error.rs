@@ -76,6 +76,8 @@ pub enum Limit {
   SolidLayers,
   /// More keyframes on one property than [`crate::Limits::max_keyframes`].
   Keyframes,
+  /// Inherited values exceed [`crate::Limits::max_inherited_keyframe_bytes`].
+  InheritedKeyframeBytes,
   /// More points in one path than [`crate::Limits::max_path_points`].
   PathPoints,
   /// A path coordinate exceeded [`crate::Limits::max_path_coordinate_abs`].
