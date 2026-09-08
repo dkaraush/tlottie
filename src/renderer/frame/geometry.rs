@@ -680,6 +680,7 @@ struct VDasher<'a> {
 }
 
 const VDASH_EPS: f32 = 1e-3;
+const MAX_DASH_PIECES: usize = 4096;
 
 impl<'a> VDasher<'a> {
   fn new(points: &'a [Vec2], anchors: &'a [bool], _closed: bool, pattern: &[f32], offset: f32) -> Self {
@@ -790,6 +791,9 @@ impl<'a> VDasher<'a> {
       return;
     }
     if self.start_new_segment {
+      if self.out.len() >= MAX_DASH_PIECES {
+        return;
+      }
       let mut piece = (Vec::new(), Vec::new());
       for &(p, a) in span {
         piece.0.push(p);
@@ -869,6 +873,9 @@ impl<'a> VDasher<'a> {
       self.add_span(&collect(0.0, elem_len));
     } else {
       while remaining > self.current_length {
+        if self.out.len() >= MAX_DASH_PIECES {
+          return;
+        }
         remaining -= self.current_length;
         let target = local + self.current_length;
         self.add_span(&collect(local, target));
@@ -930,6 +937,9 @@ impl<'a> VDasher<'a> {
     self.move_to();
 
     for w in bounds.windows(2) {
+      if self.out.len() >= MAX_DASH_PIECES {
+        break;
+      }
       let (Some(&a), Some(&b)) = (w.first(), w.get(1)) else {
         continue;
       };

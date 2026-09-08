@@ -1,7 +1,11 @@
 //! Shape evaluation shared by the frame walker and CPU test oracle.
 
 use super::*;
+use crate::error::{Error, Limit};
 use alloc::vec::Vec;
+
+const MAX_FRAME_ARENA_CONTOURS: usize = 16_384;
+const MAX_FRAME_PENDING_JOBS: usize = 16_384;
 
 pub(crate) struct ShapeWalker<'a> {
   pub(crate) scratch: &'a mut RenderScratch,
@@ -336,6 +340,9 @@ impl ShapeWalker<'_> {
     if depth > MAX_RENDER_DEPTH {
       return Ok(());
     }
+    if arena.len() > MAX_FRAME_ARENA_CONTOURS || pending.len() > MAX_FRAME_PENDING_JOBS {
+      return Err(Error::LimitExceeded(Limit::RepeaterProductPerGroup));
+    }
     let scope_start = arena.len();
     let jobs_start = pending.len();
     for shape in shapes {
@@ -400,7 +407,7 @@ impl ShapeWalker<'_> {
           self.apply_trim(tr, arena, pending, scope_start);
         }
         Shape::Repeater(rp) => {
-          self.apply_repeater(rp, m, arena, pending, scope_start, jobs_start);
+          self.apply_repeater(rp, m, arena, pending, scope_start, jobs_start)?;
         }
         Shape::Fill(f) => {
           let color = self.color_override.unwrap_or_else(|| f.color.eval(self.frame));
@@ -571,10 +578,10 @@ impl ShapeWalker<'_> {
 
   /// Repeater: replaces this scope's geometry with transformed copies and
   /// duplicates this scope's earlier paints per copy.
-  fn apply_repeater(&self, rp: &crate::model::Repeater, m: Mat2x3, arena: &mut Vec<(Contour, bool)>, pending: &mut Vec<PendingJob>, scope_start: usize, jobs_start: usize) {
+  fn apply_repeater(&self, rp: &crate::model::Repeater, m: Mat2x3, arena: &mut Vec<(Contour, bool)>, pending: &mut Vec<PendingJob>, scope_start: usize, jobs_start: usize) -> Result<()> {
     let copies = rp.copies.eval(self.frame).clamp(0.0, 64.0) as usize;
     if copies <= 1 {
-      return;
+      return Ok(());
     }
     let offset = rp.offset.eval(self.frame);
     let so = (rp.start_opacity.eval(self.frame) / 100.0).clamp(0.0, 1.0);
@@ -592,7 +599,13 @@ impl ShapeWalker<'_> {
     let base_end = arena.len();
     let base_len = base_end - scope_start;
     let prior_jobs: Vec<(usize, usize, usize)> = pending.iter().enumerate().skip(jobs_start).map(|(i, pj)| (i, pj.start, pj.end)).collect();
+    if arena.len() > MAX_FRAME_ARENA_CONTOURS || pending.len() > MAX_FRAME_PENDING_JOBS {
+      return Err(Error::LimitExceeded(Limit::RepeaterProductPerGroup));
+    }
     for i in 0..copies {
+      if arena.len() + base_len > MAX_FRAME_ARENA_CONTOURS || pending.len() + prior_jobs.len() > MAX_FRAME_PENDING_JOBS {
+        return Err(Error::LimitExceeded(Limit::RepeaterProductPerGroup));
+      }
       let mult = offset + i as f32;
       let t_local = Mat2x3::translate(rp_pos.x * mult, rp_pos.y * mult)
         .concat(Mat2x3::translate(rp_anchor.x, rp_anchor.y))
@@ -642,6 +655,7 @@ impl ShapeWalker<'_> {
     for pj in pending.iter_mut().skip(jobs_start).take(prior_jobs.len()) {
       pj.end = pj.start; // empty range
     }
+    Ok(())
   }
 
   fn apply_trim(&self, tr: &crate::model::Trim, arena: &mut Vec<(Contour, bool)>, pending: &mut Vec<PendingJob>, scope_start: usize) {
@@ -972,6 +986,10 @@ fn splice_trimmed(arena: &mut Vec<(Contour, bool)>, pending: &mut Vec<PendingJob
     contour.points = first;
     contour.anchors = first_anchors;
     *closed = false;
+  }
+  if arena.len() + pieces.len() > MAX_FRAME_ARENA_CONTOURS {
+    let keep = MAX_FRAME_ARENA_CONTOURS.saturating_sub(arena.len());
+    pieces.truncate(keep);
   }
   let extra = pieces.len();
   for (k, (pts, anc)) in pieces.into_iter().enumerate() {

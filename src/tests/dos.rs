@@ -2496,3 +2496,139 @@ fn single_vertex_closed_dashed_bezier_stays_bounded() {
   ]}]}"#;
   assert_lottie!(json);
 }
+
+#[test]
+fn nested_compounding_repeaters_are_rejected() {
+  let json = r#"{
+    "v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,
+    "layers":[{"ty":4,"ind":1,"ip":0,"op":60,"st":0,"ks":{},"shapes":[
+      {"ty":"gr","it":[
+        {"ty":"rc","p":{"a":0,"k":[32,32]},"s":{"a":0,"k":[8,8]},"r":{"a":0,"k":0}},
+        {"ty":"rp","c":{"a":0,"k":64},"o":{"a":0,"k":0},"tr":{"p":{"a":0,"k":[1,0]}}},
+        {"ty":"gr","it":[
+          {"ty":"rp","c":{"a":0,"k":64},"o":{"a":0,"k":0},"tr":{"p":{"a":0,"k":[0,1]}}},
+          {"ty":"gr","it":[
+            {"ty":"rp","c":{"a":0,"k":64},"o":{"a":0,"k":0},"tr":{"p":{"a":0,"k":[1,1]}}},
+            {"ty":"tr"}
+          ]},
+          {"ty":"tr"}
+        ]},
+        {"ty":"fl","c":{"a":0,"k":[1,0,0]},"o":{"a":0,"k":100}},
+        {"ty":"tr"}
+      ]}
+    ]}]
+  }"#;
+  let parsed = Composition::parse(json.as_bytes(), &Limits::default());
+  assert!(matches!(parsed, Err(Error::LimitExceeded(crate::error::Limit::RepeaterProductPerGroup))));
+  assert_lottie!(json);
+}
+
+#[test]
+fn repeater_multiplied_dashed_stroke_is_rejected() {
+  let json = r#"{
+    "v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,
+    "layers":[{"ty":4,"ind":1,"ip":0,"op":60,"st":0,"ks":{},"shapes":[
+      {"ty":"gr","it":[
+        {"ty":"rc","p":{"a":0,"k":[32,32]},"s":{"a":0,"k":[50,50]},"r":{"a":0,"k":0}},
+        {"ty":"st","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"w":{"a":0,"k":2},"lc":1,"lj":1,"d":[
+          {"n":"d","v":{"a":0,"k":1}},{"n":"g","v":{"a":0,"k":1}}
+        ]},
+        {"ty":"rp","c":{"a":0,"k":64},"o":{"a":0,"k":0},"tr":{"p":{"a":0,"k":[1,0]}}},
+        {"ty":"tr"}
+      ]}
+    ]}]
+  }"#;
+  let parsed = Composition::parse(json.as_bytes(), &Limits::default());
+  assert!(matches!(parsed, Err(Error::LimitExceeded(crate::error::Limit::DashedPiecesPerGroup))));
+  assert_lottie!(json);
+}
+
+#[test]
+fn nested_group_repeater_multiplied_dash_is_rejected() {
+  let json = r#"{
+    "v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,
+    "layers":[{"ty":4,"ind":1,"ip":0,"op":60,"st":0,"ks":{},"shapes":[
+      {"ty":"gr","it":[
+        {"ty":"gr","it":[
+          {"ty":"rc","p":{"a":0,"k":[32,32]},"s":{"a":0,"k":[50,50]},"r":{"a":0,"k":0}},
+          {"ty":"st","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"w":{"a":0,"k":2},"lc":1,"lj":1,"d":[
+            {"n":"d","v":{"a":0,"k":1}},{"n":"g","v":{"a":0,"k":1}}
+          ]},
+          {"ty":"tr"}
+        ]},
+        {"ty":"rp","c":{"a":0,"k":64},"o":{"a":0,"k":0},"tr":{"p":{"a":0,"k":[1,0]}}},
+        {"ty":"tr"}
+      ]}
+    ]}]
+  }"#;
+  let parsed = Composition::parse(json.as_bytes(), &Limits::default());
+  assert!(matches!(parsed, Err(Error::LimitExceeded(crate::error::Limit::DashedPiecesPerGroup))));
+  assert_lottie!(json);
+}
+
+#[test]
+fn animated_polystar_points_stays_bounded() {
+  let json = r#"{
+    "v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,
+    "layers":[{"ty":4,"ind":1,"ip":0,"op":60,"st":0,"ks":{},"shapes":[
+      {"ty":"gr","it":[
+        {"ty":"sr","sy":1,"pt":{"a":1,"k":[{"t":0,"s":[5]},{"t":1,"s":[1e38]}]},"p":{"a":0,"k":[32,32]},"r":{"a":0,"k":0},"ir":{"a":0,"k":10},"or":{"a":0,"k":20},"is":{"a":0,"k":0},"os":{"a":0,"k":0}},
+        {"ty":"fl","c":{"a":0,"k":[1,0,0]},"o":{"a":0,"k":100}},
+        {"ty":"tr"}
+      ]}
+    ]}]
+  }"#;
+  let parsed = Composition::parse(json.as_bytes(), &Limits::default());
+  assert!(matches!(parsed, Err(Error::LimitExceeded(crate::error::Limit::PolystarPoints))));
+  assert_lottie!(json);
+}
+
+#[test]
+fn dashed_polystar_tiny_period_is_rejected() {
+  let json = r#"{
+    "v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,
+    "layers":[{"ty":4,"ind":1,"ip":0,"op":60,"st":0,"ks":{},"shapes":[
+      {"ty":"gr","it":[
+        {"ty":"sr","sy":1,"pt":{"a":0,"k":5},"p":{"a":0,"k":[32,32]},"r":{"a":0,"k":0},"ir":{"a":0,"k":500},"or":{"a":0,"k":1000},"is":{"a":0,"k":0},"os":{"a":0,"k":0}},
+        {"ty":"st","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"w":{"a":0,"k":2},"lc":1,"lj":1,"d":[
+          {"n":"d","v":{"a":0,"k":0.01}},{"n":"g","v":{"a":0,"k":0.01}}
+        ]},
+        {"ty":"tr"}
+      ]}
+    ]}]
+  }"#;
+  let parsed = Composition::parse(json.as_bytes(), &Limits::default());
+  assert!(matches!(parsed, Err(Error::LimitExceeded(crate::error::Limit::DashedPiecesPerGroup))));
+  assert_lottie!(json);
+}
+
+#[test]
+fn dashed_rect_tiny_period_is_rejected() {
+  let json = r#"{
+    "v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,
+    "layers":[{"ty":4,"ind":1,"ip":0,"op":60,"st":0,"ks":{},"shapes":[
+      {"ty":"gr","it":[
+        {"ty":"rc","p":{"a":0,"k":[32,32]},"s":{"a":0,"k":[1000,1000]},"r":{"a":0,"k":0}},
+        {"ty":"st","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"w":{"a":0,"k":2},"lc":1,"lj":1,"d":[
+          {"n":"d","v":{"a":0,"k":0.01}},{"n":"g","v":{"a":0,"k":0.01}}
+        ]},
+        {"ty":"tr"}
+      ]}
+    ]}]
+  }"#;
+  let parsed = Composition::parse(json.as_bytes(), &Limits::default());
+  assert!(matches!(parsed, Err(Error::LimitExceeded(crate::error::Limit::DashedPiecesPerGroup))));
+  assert_lottie!(json);
+}
+
+#[test]
+fn animated_focal_radial_gradient_is_counted() {
+  let mut shapes = String::new();
+  for _ in 0..161 {
+    shapes.push_str(r#"{"ty":"gf","t":2,"s":{"a":0,"k":[0,0]},"e":{"a":0,"k":[10,10]},"g":{"p":2,"k":{"a":0,"k":[0,1,0,0,1,0,1,0]}},"h":{"a":1,"k":[{"t":0,"s":[0]},{"t":1,"s":[100]}]},"a":{"a":0,"k":0},"o":{"a":0,"k":100}},"#);
+  }
+  let json = format!(r#"{{"v":"5.5.0","w":64,"h":64,"fr":60,"ip":0,"op":60,"layers":[{{"ty":4,"ind":1,"ip":0,"op":60,"st":0,"ks":{{}},"shapes":[{{"ty":"gr","it":[{{"ty":"rc","p":{{"a":0,"k":[32,32]}},"s":{{"a":0,"k":[10,10]}},"r":{{"a":0,"k":0}}}},{shapes}{{"ty":"tr"}}]}}]}}]}}"#);
+  let parsed = Composition::parse(json.as_bytes(), &Limits::default());
+  assert!(matches!(parsed, Err(Error::LimitExceeded(crate::error::Limit::FocalRadialGradientsPerLayer))));
+  assert_lottie!(json);
+}

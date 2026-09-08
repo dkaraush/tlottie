@@ -515,7 +515,7 @@ fn parse_position(c: &mut Cursor<'_>, limits: &Limits) -> Result<Position> {
 // ---------------------------------------------------------------------------
 
 enum ParsedItem {
-  Shape(Shape),
+  Shape(Shape, Option<GroupMetrics>),
   GroupTransform(Transform),
   Ignored,
 }
@@ -528,9 +528,18 @@ struct ShapeCounts {
   focal_radial_gradients: usize,
   round_corners: usize,
   trims: usize,
+  dashed_pieces: usize,
 }
 
-fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &mut ShapeCounts) -> Result<(Vec<Shape>, Option<Transform>)> {
+#[derive(Debug, Clone, Copy, Default)]
+struct GroupMetrics {
+  max_segment_span: f32,
+  total_span: f32,
+  repeater_product: usize,
+  dashed_piece_estimate: usize,
+}
+
+fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &mut ShapeCounts) -> Result<(Vec<Shape>, Option<Transform>, GroupMetrics)> {
   if depth > MAX_GROUP_DEPTH {
     return Err(Error::LimitExceeded(Limit::NestingDepth));
   }
@@ -542,6 +551,7 @@ fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
   let mut dashed_source_len = 0.0f32;
   let mut dashed_piece_estimate = 0usize;
   let mut repeater_product = 1usize;
+  let mut max_child_repeater_product = 1usize;
   let mut source_items = 0usize;
   for_each_element(c, |c| {
     count.items += 1;
@@ -549,7 +559,7 @@ fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
       return Err(Error::LimitExceeded(Limit::ShapesPerLayer));
     }
     match parse_shape_item(c, limits, depth, count)? {
-      ParsedItem::Shape(s) => {
+      ParsedItem::Shape(s, child_metrics) => {
         if is_paint(&s) {
           count.paints += 1;
           if count.paints > limits.max_paints_per_layer {
@@ -579,10 +589,20 @@ fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
           }
         }
         if let Some(copies) = repeater_copies(&s) {
-          repeater_product = repeater_product.saturating_mul(copies.max(1));
+          let copies = copies.max(1);
+          repeater_product = repeater_product.saturating_mul(copies);
           if repeater_product > limits.max_repeater_product_per_group {
             return Err(Error::LimitExceeded(Limit::RepeaterProductPerGroup));
           }
+          max_child_repeater_product = max_child_repeater_product.saturating_mul(copies);
+          if max_child_repeater_product > limits.max_repeater_product_per_group {
+            return Err(Error::LimitExceeded(Limit::RepeaterProductPerGroup));
+          }
+          dashed_piece_estimate = dashed_piece_estimate.saturating_mul(copies);
+          if dashed_piece_estimate > limits.max_dashed_piece_estimate_per_group {
+            return Err(Error::LimitExceeded(Limit::DashedPiecesPerGroup));
+          }
+          dashed_source_len = (dashed_source_len * copies as f32).min(f32::MAX);
         }
         if is_dashed_stroke(&s) {
           dashed_strokes += 1;
@@ -597,6 +617,10 @@ fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
             if dashed_piece_estimate > limits.max_dashed_piece_estimate_per_group {
               return Err(Error::LimitExceeded(Limit::DashedPiecesPerGroup));
             }
+            count.dashed_pieces = count.dashed_pieces.saturating_add(pieces);
+            if count.dashed_pieces > limits.max_dashed_piece_estimate_per_group.saturating_mul(4) {
+              return Err(Error::LimitExceeded(Limit::DashedPiecesPerGroup));
+            }
           }
         }
         if matches!(s, Shape::GradientStroke(_)) {
@@ -605,9 +629,24 @@ fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
             return Err(Error::LimitExceeded(Limit::GradientStrokesPerGroup));
           }
         }
-        let (segment_span, path_span) = path_span_metrics(&s);
-        max_dashed_source_segment = max_dashed_source_segment.max(segment_span);
-        dashed_source_len += path_span;
+        if let Some(m) = child_metrics {
+          max_dashed_source_segment = max_dashed_source_segment.max(m.max_segment_span);
+          dashed_source_len = (dashed_source_len + m.total_span * repeater_product as f32).min(f32::MAX);
+          let child_rp = m.repeater_product.saturating_mul(repeater_product);
+          max_child_repeater_product = max_child_repeater_product.max(child_rp);
+          if max_child_repeater_product > limits.max_repeater_product_per_group {
+            return Err(Error::LimitExceeded(Limit::RepeaterProductPerGroup));
+          }
+          let child_dashes = m.dashed_piece_estimate.saturating_mul(repeater_product);
+          dashed_piece_estimate = dashed_piece_estimate.saturating_add(child_dashes);
+          if dashed_piece_estimate > limits.max_dashed_piece_estimate_per_group {
+            return Err(Error::LimitExceeded(Limit::DashedPiecesPerGroup));
+          }
+        } else {
+          let (segment_span, path_span) = shape_span_metrics(&s);
+          max_dashed_source_segment = max_dashed_source_segment.max(segment_span);
+          dashed_source_len = (dashed_source_len + path_span).min(f32::MAX);
+        }
         if is_geometry_source(&s) {
           source_items += 1;
         }
@@ -621,7 +660,13 @@ fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
     }
     Ok(())
   })?;
-  Ok((shapes, transform))
+  let metrics = GroupMetrics {
+    max_segment_span: max_dashed_source_segment,
+    total_span: dashed_source_len,
+    repeater_product: max_child_repeater_product.max(repeater_product),
+    dashed_piece_estimate,
+  };
+  Ok((shapes, transform, metrics))
 }
 
 fn is_paint(shape: &Shape) -> bool {
@@ -634,8 +679,8 @@ fn is_geometry_source(shape: &Shape) -> bool {
 
 fn is_focal_radial_gradient(shape: &Shape) -> bool {
   match shape {
-    Shape::GradientFill(fill) => fill.kind == GradientKind::Radial && fill.highlight_len.eval(0.0).abs() > 0.001,
-    Shape::GradientStroke(stroke) => stroke.kind == GradientKind::Radial && stroke.highlight_len.eval(0.0).abs() > 0.001,
+    Shape::GradientFill(fill) => fill.kind == GradientKind::Radial && property_max_abs_f32(&fill.highlight_len).is_some_and(|l| l > 0.001),
+    Shape::GradientStroke(stroke) => stroke.kind == GradientKind::Radial && property_max_abs_f32(&stroke.highlight_len).is_some_and(|l| l > 0.001),
     _ => false,
   }
 }
@@ -761,23 +806,49 @@ fn property_min_abs_f32(property: &Property<f32>) -> Option<f32> {
 }
 
 fn property_max_abs_f32(property: &Property<f32>) -> Option<f32> {
-  let finite_abs = |value: f32| value.is_finite().then_some(value.abs());
+  let to_magnitude = |value: f32| if value.is_finite() { Some(value.abs()) } else { Some(f32::MAX) };
   match property {
-    Property::Static(value) => finite_abs(*value),
+    Property::Static(value) => to_magnitude(*value),
     Property::Animated(timeline) => {
-      let mut max = finite_abs(timeline.first.value);
-      if let Some(value) = timeline.first.end.and_then(finite_abs) {
+      let mut max = to_magnitude(timeline.first.value);
+      if let Some(value) = timeline.first.end.and_then(to_magnitude) {
         max = Some(max.map_or(value, |current| current.max(value)));
       }
       for keyframe in &timeline.rest {
-        if let Some(value) = finite_abs(keyframe.value) {
+        if let Some(value) = to_magnitude(keyframe.value) {
           max = Some(max.map_or(value, |current| current.max(value)));
         }
-        if let Some(value) = keyframe.end.and_then(finite_abs) {
+        if let Some(value) = keyframe.end.and_then(to_magnitude) {
           max = Some(max.map_or(value, |current| current.max(value)));
         }
       }
       max
+    }
+  }
+}
+
+fn property_max_abs_vec2(property: &Property<Vec2>) -> Option<Vec2> {
+  let to_magnitude = |v: Vec2| {
+    Vec2::new(
+      if v.x.is_finite() { v.x.abs() } else { f32::MAX },
+      if v.y.is_finite() { v.y.abs() } else { f32::MAX },
+    )
+  };
+  match property {
+    Property::Static(value) => Some(to_magnitude(*value)),
+    Property::Animated(timeline) => {
+      let mut max = to_magnitude(timeline.first.value);
+      if let Some(value) = timeline.first.end.map(to_magnitude) {
+        max = Vec2::new(max.x.max(value.x), max.y.max(value.y));
+      }
+      for keyframe in &timeline.rest {
+        let value = to_magnitude(keyframe.value);
+        max = Vec2::new(max.x.max(value.x), max.y.max(value.y));
+        if let Some(value) = keyframe.end.map(to_magnitude) {
+          max = Vec2::new(max.x.max(value.x), max.y.max(value.y));
+        }
+      }
+      Some(max)
     }
   }
 }
@@ -845,20 +916,41 @@ fn path_data_span(data: &PathData) -> (f32, f32) {
   (max, sum)
 }
 
-/// `(longest segment, total length)` over the path timeline. Totals are
+/// `(longest segment, total length)` over the shape timeline. Totals are
 /// maxed across keyframes, not summed: the dasher only sees one frame.
-fn path_span_metrics(shape: &Shape) -> (f32, f32) {
-  let Shape::Path(path) = shape else {
-    return (0.0, 0.0);
-  };
-  let mut max = 0.0f32;
-  let mut total = 0.0f32;
-  for data in path_keyframe_values(&path.path) {
-    let (segment_max, segment_sum) = path_data_span(data);
-    max = max.max(segment_max);
-    total = total.max(segment_sum);
+fn shape_span_metrics(shape: &Shape) -> (f32, f32) {
+  match shape {
+    Shape::Path(path) => {
+      let mut max = 0.0f32;
+      let mut total = 0.0f32;
+      for data in path_keyframe_values(&path.path) {
+        let (segment_max, segment_sum) = path_data_span(data);
+        max = max.max(segment_max);
+        total = total.max(segment_sum);
+      }
+      (max, total)
+    }
+    Shape::Rect(rect) => {
+      let size = property_max_abs_vec2(&rect.size).unwrap_or(Vec2::new(0.0, 0.0));
+      let (w, h) = (size.x, size.y);
+      (w.max(h), 2.0 * (w + h))
+    }
+    Shape::Ellipse(ellipse) => {
+      let size = property_max_abs_vec2(&ellipse.size).unwrap_or(Vec2::new(0.0, 0.0));
+      let (w, h) = (size.x, size.y);
+      (w.max(h), 2.0 * (w + h))
+    }
+    Shape::Polystar(ps) => {
+      let points = property_max_abs_f32(&ps.points).unwrap_or(5.0).clamp(2.0, 256.0);
+      let r_out = property_max_abs_f32(&ps.outer_radius).unwrap_or(0.0);
+      let r_in = property_max_abs_f32(&ps.inner_radius).unwrap_or(0.0);
+      let r = r_out.max(r_in);
+      let n = if ps.star { points * 2.0 } else { points };
+      let segment_max = 4.0 * r;
+      (segment_max, n * segment_max)
+    }
+    _ => (0.0, 0.0),
   }
-  (max, total)
 }
 
 fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &mut ShapeCounts) -> Result<ParsedItem> {
@@ -866,7 +958,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
   let mut ty: Option<[u8; 2]> = None;
   let mut hidden = false;
   let mut it_pos: Option<usize> = None;
-  let mut parsed_group: Option<(Vec<Shape>, Option<Transform>)> = None;
+  let mut parsed_group: Option<(Vec<Shape>, Option<Transform>, GroupMetrics)> = None;
   let mut ks_pos: Option<usize> = None;
   let mut parsed_path: Option<Property<PathData>> = None;
   let mut p_pos: Option<usize> = None;
@@ -1054,21 +1146,27 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
 
   match &ty {
     b"gr" => {
-      if let Some((shapes, transform)) = parsed_group {
-        return Ok(ParsedItem::Shape(Shape::Group(Box::new(Group {
-          transform: transform.unwrap_or_else(Transform::identity),
-          shapes,
-        }))));
+      if let Some((shapes, transform, metrics)) = parsed_group {
+        return Ok(ParsedItem::Shape(
+          Shape::Group(Box::new(Group {
+            transform: transform.unwrap_or_else(Transform::identity),
+            shapes,
+          })),
+          Some(metrics),
+        ));
       }
       let Some(it_pos) = it_pos else {
         return Ok(ParsedItem::Ignored); // empty group
       };
       let mut ic = c.fork_at(it_pos);
-      let (shapes, transform) = parse_shape_list(&mut ic, limits, depth + 1, count)?;
-      Ok(ParsedItem::Shape(Shape::Group(Box::new(Group {
-        transform: transform.unwrap_or_else(Transform::identity),
-        shapes,
-      }))))
+      let (shapes, transform, metrics) = parse_shape_list(&mut ic, limits, depth + 1, count)?;
+      Ok(ParsedItem::Shape(
+        Shape::Group(Box::new(Group {
+          transform: transform.unwrap_or_else(Transform::identity),
+          shapes,
+        })),
+        Some(metrics),
+      ))
     }
     b"sh" => {
       let path = match parsed_path {
@@ -1081,19 +1179,37 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
           parse_property(&mut c.fork_at(ks_pos), limits, |c| parse_path_value(c, limits))?
         }
       };
-      Ok(ParsedItem::Shape(Shape::Path(PathShape { path })))
+      Ok(ParsedItem::Shape(Shape::Path(PathShape { path }), None))
     }
-    b"rc" => Ok(ParsedItem::Shape(Shape::Rect(RectShape {
-      position: prop_vec2(c, p_pos, "rect missing p")?,
-      size: prop_vec2(c, s_pos, "rect missing s")?,
-      radius: prop_scalar(c, r_pos, 0.0)?,
-      reversed: direction_reversed(c, d_pos),
-    }))),
-    b"el" => Ok(ParsedItem::Shape(Shape::Ellipse(EllipseShape {
-      position: prop_vec2(c, p_pos, "ellipse missing p")?,
-      size: prop_vec2(c, s_pos, "ellipse missing s")?,
-      reversed: direction_reversed(c, d_pos),
-    }))),
+    b"rc" => {
+      let size = prop_vec2(c, s_pos, "rect missing s")?;
+      if property_max_abs_vec2(&size).is_some_and(|s| s.x > limits.max_path_coordinate_abs || s.y > limits.max_path_coordinate_abs) {
+        return Err(Error::LimitExceeded(Limit::PathCoordinate));
+      }
+      Ok(ParsedItem::Shape(
+        Shape::Rect(RectShape {
+          position: prop_vec2(c, p_pos, "rect missing p")?,
+          size,
+          radius: prop_scalar(c, r_pos, 0.0)?,
+          reversed: direction_reversed(c, d_pos),
+        }),
+        None,
+      ))
+    }
+    b"el" => {
+      let size = prop_vec2(c, s_pos, "ellipse missing s")?;
+      if property_max_abs_vec2(&size).is_some_and(|s| s.x > limits.max_path_coordinate_abs || s.y > limits.max_path_coordinate_abs) {
+        return Err(Error::LimitExceeded(Limit::PathCoordinate));
+      }
+      Ok(ParsedItem::Shape(
+        Shape::Ellipse(EllipseShape {
+          position: prop_vec2(c, p_pos, "ellipse missing p")?,
+          size,
+          reversed: direction_reversed(c, d_pos),
+        }),
+        None,
+      ))
+    }
     b"fl" => {
       let c_pos = c_pos.ok_or(Error::InvalidLottie {
         offset: obj_start,
@@ -1112,7 +1228,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
         }
         None => FillRule::NonZero,
       };
-      Ok(ParsedItem::Shape(Shape::Fill(Fill { color, opacity, rule })))
+      Ok(ParsedItem::Shape(Shape::Fill(Fill { color, opacity, rule }), None))
     }
     b"tr" => {
       // Group transform: rebuild from recorded field positions.
@@ -1161,15 +1277,18 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
         Some(pos) => parse_dashes(&mut c.fork_at(pos), limits)?,
         None => Vec::new(),
       };
-      Ok(ParsedItem::Shape(Shape::Stroke(Box::new(Stroke {
-        color,
-        opacity,
-        width,
-        cap,
-        join,
-        miter_limit,
-        dashes,
-      }))))
+      Ok(ParsedItem::Shape(
+        Shape::Stroke(Box::new(Stroke {
+          color,
+          opacity,
+          width,
+          cap,
+          join,
+          miter_limit,
+          dashes,
+        })),
+        None,
+      ))
     }
     b"gf" => {
       let s_pos_ = s_pos.ok_or(Error::InvalidLottie {
@@ -1201,17 +1320,20 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
       let kind = if grad_type as i64 == 2 { GradientKind::Radial } else { GradientKind::Linear };
       let highlight_len = prop_scalar(c, h_pos, 0.0)?;
       let highlight_angle = prop_scalar(c, a_pos, 0.0)?;
-      Ok(ParsedItem::Shape(Shape::GradientFill(Box::new(GradientFill {
-        kind,
-        start,
-        end,
-        highlight_len,
-        highlight_angle,
-        stops,
-        color_count,
-        opacity,
-        rule,
-      }))))
+      Ok(ParsedItem::Shape(
+        Shape::GradientFill(Box::new(GradientFill {
+          kind,
+          start,
+          end,
+          highlight_len,
+          highlight_angle,
+          stops,
+          color_count,
+          opacity,
+          rule,
+        })),
+        None,
+      ))
     }
     b"tm" => {
       let start = prop_scalar(c, s_pos, 0.0)?;
@@ -1221,7 +1343,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
       };
       let offset = prop_scalar(c, o_pos, 0.0)?;
       let mode = if trim_mode as i64 == 2 { TrimMode::Individual } else { TrimMode::Simultaneous };
-      Ok(ParsedItem::Shape(Shape::Trim(Box::new(Trim { start, end, offset, mode }))))
+      Ok(ParsedItem::Shape(Shape::Trim(Box::new(Trim { start, end, offset, mode })), None))
     }
     b"gs" => {
       let s_pos_ = s_pos.ok_or(Error::InvalidLottie {
@@ -1262,21 +1384,24 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
       let kind = if grad_type as i64 == 2 { GradientKind::Radial } else { GradientKind::Linear };
       let highlight_len = prop_scalar(c, h_pos, 0.0)?;
       let highlight_angle = prop_scalar(c, a_pos, 0.0)?;
-      Ok(ParsedItem::Shape(Shape::GradientStroke(Box::new(GradientStroke {
-        kind,
-        start,
-        end,
-        highlight_len,
-        highlight_angle,
-        stops,
-        color_count,
-        opacity,
-        width,
-        cap,
-        join,
-        miter_limit: miter_limit.max(1.0),
-        dashes,
-      }))))
+      Ok(ParsedItem::Shape(
+        Shape::GradientStroke(Box::new(GradientStroke {
+          kind,
+          start,
+          end,
+          highlight_len,
+          highlight_angle,
+          stops,
+          color_count,
+          opacity,
+          width,
+          cap,
+          join,
+          miter_limit: miter_limit.max(1.0),
+          dashes,
+        })),
+        None,
+      ))
     }
     b"sr" => {
       let prop_scalar_req = |pos: Option<usize>, default: f32| -> Result<Property<f32>> {
@@ -1286,22 +1411,32 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
         }
       };
       let points = prop_scalar_req(pt_pos, 5.0)?;
-      if points.eval(0.0).abs() > limits.max_polystar_points {
+      if property_max_abs_f32(&points).is_some_and(|p| p > limits.max_polystar_points) {
         return Err(Error::LimitExceeded(Limit::PolystarPoints));
       }
-      Ok(ParsedItem::Shape(Shape::Polystar(Box::new(PolystarShape {
-        star: star_type as i64 != 2,
-        reversed: direction_reversed(c, d_pos),
-        points,
-        position: prop_vec2(c, p_pos, "polystar missing p")?,
-        rotation: prop_scalar_req(r_pos, 0.0)?,
-        inner_radius: prop_scalar_req(ir_pos, 0.0)?,
-        outer_radius: prop_scalar_req(or_pos, 0.0)?,
-        inner_roundness: prop_scalar_req(is_pos, 0.0)?,
-        outer_roundness: prop_scalar_req(os_pos, 0.0)?,
-      }))))
+      let inner_radius = prop_scalar_req(ir_pos, 0.0)?;
+      let outer_radius = prop_scalar_req(or_pos, 0.0)?;
+      if property_max_abs_f32(&inner_radius).is_some_and(|r| r > limits.max_path_coordinate_abs)
+        || property_max_abs_f32(&outer_radius).is_some_and(|r| r > limits.max_path_coordinate_abs)
+      {
+        return Err(Error::LimitExceeded(Limit::PathCoordinate));
+      }
+      Ok(ParsedItem::Shape(
+        Shape::Polystar(Box::new(PolystarShape {
+          star: star_type as i64 != 2,
+          reversed: direction_reversed(c, d_pos),
+          points,
+          position: prop_vec2(c, p_pos, "polystar missing p")?,
+          rotation: prop_scalar_req(r_pos, 0.0)?,
+          inner_radius,
+          outer_radius,
+          inner_roundness: prop_scalar_req(is_pos, 0.0)?,
+          outer_roundness: prop_scalar_req(os_pos, 0.0)?,
+        })),
+        None,
+      ))
     }
-    b"rd" => Ok(ParsedItem::Shape(Shape::RoundCorners(Box::new(RoundCorners { radius: prop_scalar(c, r_pos, 0.0)? })))),
+    b"rd" => Ok(ParsedItem::Shape(Shape::RoundCorners(Box::new(RoundCorners { radius: prop_scalar(c, r_pos, 0.0)? })), None)),
     b"rp" => {
       let copies = match c_pos {
         Some(pos) => parse_property(&mut c.fork_at(pos), limits, parse_scalar)?,
@@ -1315,13 +1450,16 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
         Some(pos) => parse_repeater_transform(&mut c.fork_at(pos), limits)?,
         None => (Transform::identity(), Property::Static(100.0), Property::Static(100.0)),
       };
-      Ok(ParsedItem::Shape(Shape::Repeater(Box::new(Repeater {
-        copies,
-        offset,
-        transform,
-        start_opacity,
-        end_opacity,
-      }))))
+      Ok(ParsedItem::Shape(
+        Shape::Repeater(Box::new(Repeater {
+          copies,
+          offset,
+          transform,
+          start_opacity,
+          end_opacity,
+        })),
+        None,
+      ))
     }
     // rp/mm/... : later phases.
     _ => Ok(ParsedItem::Ignored),
@@ -1505,7 +1643,7 @@ fn parse_layer(
       b"shapes" => {
         if ty == 4 {
           let mut count = ShapeCounts::default();
-          let (list, _) = parse_shape_list(c, limits, 0, &mut count)?;
+          let (list, _, _) = parse_shape_list(c, limits, 0, &mut count)?;
           paint_count = count.paints;
           parsed_shapes = Some(list);
           shapes_pos = None;
@@ -1528,7 +1666,7 @@ fn parse_layer(
   if kind == LayerKind::Shape && shapes_pos.is_some() {
     if let Some(pos) = shapes_pos {
       let mut count = ShapeCounts::default();
-      let (list, _) = parse_shape_list(&mut c.fork_at(pos), limits, 0, &mut count)?;
+      let (list, _, _) = parse_shape_list(&mut c.fork_at(pos), limits, 0, &mut count)?;
       paint_count = count.paints;
       shapes = list;
     }
