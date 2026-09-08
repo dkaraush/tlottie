@@ -828,7 +828,8 @@ fn cubic_span(a: Vec2, out_a: Vec2, in_b: Vec2, b: Vec2) -> f32 {
 /// `(longest segment, total length)` of one path keyframe.
 fn path_data_span(data: &PathData) -> (f32, f32) {
   let count = data.vertices.len();
-  if count < 2 {
+  // A closed single-vertex path still has a cubic back to itself.
+  if count == 0 {
     return (0.0, 0.0);
   }
   let at = |list: &[Vec2], i: usize| list.get(i).copied().unwrap_or(Vec2::new(0.0, 0.0));
