@@ -78,6 +78,10 @@ pub enum Limit {
   Keyframes,
   /// Inherited values exceed [`crate::Limits::max_inherited_keyframe_bytes`].
   InheritedKeyframeBytes,
+  /// Cumulative parser allocations exceed the configured limit.
+  ParseMemory,
+  /// Cumulative parser token/scan work exceeds the configured limit.
+  ParseWork,
   /// More points in one path than [`crate::Limits::max_path_points`].
   PathPoints,
   /// A path coordinate exceeded [`crate::Limits::max_path_coordinate_abs`].

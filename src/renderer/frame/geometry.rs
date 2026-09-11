@@ -105,8 +105,10 @@ pub(crate) fn flatten_path_reusing(data: &PathData, m: &Mat2x3, tolerance: f32, 
   contour.points.clear();
   contour.anchors.clear();
   contour.inv_lin = None;
-  contour.points.reserve(n * 4);
-  contour.anchors.reserve(n * 4);
+  // Straight paths need one point per vertex, plus the closing endpoint.
+  // Curves grow on demand under the flattener preflight budget.
+  contour.points.reserve_exact(n.saturating_add(1));
+  contour.anchors.reserve_exact(n.saturating_add(1));
   if n == 0 {
     return contour;
   }
@@ -841,6 +843,15 @@ impl<'a> VDasher<'a> {
     if self.discard || span.is_empty() {
       return;
     }
+    #[cfg(feature = "cpu")]
+    if let Some(budget) = self.budget {
+      // Charge the output on both dash branches. A whole-element dash may
+      // skip the split loop, but still allocates points and two Vec headers.
+      if let Err(error) = budget.dash_output(span.len(), self.start_new_segment) {
+        self.error = Some(error);
+        return;
+      }
+    }
     if self.start_new_segment {
       let mut piece = (Vec::new(), Vec::new());
       for &(p, a) in span {
@@ -936,6 +947,10 @@ impl<'a> VDasher<'a> {
         }
       }
       while remaining > self.current_length {
+        #[cfg(feature = "cpu")]
+        if self.error.is_some() {
+          return;
+        }
         remaining -= self.current_length;
         let target = local + self.current_length;
         self.add_span(&collect(local, target));
@@ -971,6 +986,13 @@ impl<'a> VDasher<'a> {
       return;
     }
     if no_length || no_gap {
+      #[cfg(feature = "cpu")]
+      if let Some(budget) = self.budget {
+        if let Err(error) = budget.dash_output(self.points.len(), true) {
+          self.error = Some(error);
+          return;
+        }
+      }
       let mut piece = (Vec::new(), Vec::new());
       for (i, p) in self.points.iter().enumerate() {
         piece.0.push(*p);

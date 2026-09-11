@@ -20,6 +20,11 @@ struct ParseState {
   easing_cache: RefCell<HashMap<String, [f32; 4]>>,
   saw_animated: Cell<bool>,
   inherited_keyframe_bytes: Cell<usize>,
+  allocated_bytes: Cell<usize>,
+  work: Cell<usize>,
+  max_bytes: Cell<usize>,
+  max_work: Cell<usize>,
+  failed: Cell<Option<Limit>>,
 }
 
 pub(crate) struct Cursor<'a> {
@@ -35,7 +40,11 @@ impl<'a> Cursor<'a> {
       bytes,
       pos: 0,
       max_depth,
-      state: Rc::new(ParseState::default()),
+      state: Rc::new(ParseState {
+        max_bytes: Cell::new(crate::Limits::default().max_parse_bytes),
+        max_work: Cell::new(crate::Limits::default().max_parse_work),
+        ..ParseState::default()
+      }),
     }
   }
 
@@ -64,8 +73,70 @@ impl<'a> Cursor<'a> {
     if bytes > maximum.saturating_sub(used) {
       return Err(Error::LimitExceeded(Limit::InheritedKeyframeBytes));
     }
+    self.allocate(bytes)?;
     self.state.inherited_keyframe_bytes.set(used + bytes);
     Ok(())
+  }
+
+  pub fn status(&self) -> Result<()> {
+    self.state.failed.get().map_or(Ok(()), |limit| Err(Error::LimitExceeded(limit)))
+  }
+
+  pub fn resource_limits(&self, limits: &crate::Limits) {
+    self.state.max_bytes.set(limits.max_parse_bytes);
+    self.state.max_work.set(limits.max_parse_work);
+  }
+
+  pub fn allocate(&self, bytes: usize) -> Result<()> {
+    self.status()?;
+    let used = self.state.allocated_bytes.get();
+    if bytes > self.state.max_bytes.get().saturating_sub(used) {
+      self.state.failed.set(Some(Limit::ParseMemory));
+      return Err(Error::LimitExceeded(Limit::ParseMemory));
+    }
+    self.state.allocated_bytes.set(used + bytes);
+    Ok(())
+  }
+
+  pub fn work(&self, amount: usize) -> Result<()> {
+    self.status()?;
+    let used = self.state.work.get();
+    if amount > self.state.max_work.get().saturating_sub(used) {
+      self.state.failed.set(Some(Limit::ParseWork));
+      return Err(Error::LimitExceeded(Limit::ParseWork));
+    }
+    self.state.work.set(used + amount);
+    Ok(())
+  }
+
+  pub fn reserve<T>(&self, values: &mut alloc::vec::Vec<T>, additional: usize) -> Result<()> {
+    let required = values.len().saturating_add(additional);
+    if required > values.capacity() {
+      let capacity = required.max(values.capacity().saturating_mul(2)).max(4);
+      self.allocate(capacity.saturating_sub(values.capacity()).saturating_mul(core::mem::size_of::<T>()))?;
+      values.try_reserve_exact(capacity - values.len()).map_err(|_| Error::LimitExceeded(Limit::ParseMemory))?;
+    }
+    Ok(())
+  }
+
+  pub fn alloc_box<T>(&self, value: T) -> Result<alloc::boxed::Box<T>> {
+    self.allocate(core::mem::size_of::<T>())?;
+    Ok(alloc::boxed::Box::new(value))
+  }
+
+  pub fn owned_string(&self, bytes: &[u8]) -> Result<String> {
+    // UTF-8 replacement can expand each byte to three; allow 2x Vec growth.
+    let text = match core::str::from_utf8(bytes) {
+      Ok(text) => {
+        self.allocate(bytes.len())?;
+        String::from(text)
+      }
+      Err(_) => {
+        self.allocate(bytes.len().saturating_mul(6))?;
+        String::from_utf8_lossy(bytes).into_owned()
+      }
+    };
+    Ok(text)
   }
 
   pub fn mark_animated_property(&self) {
@@ -79,14 +150,16 @@ impl<'a> Cursor<'a> {
   /// Matches the per-composition interpolator cache used by rlottie and
   /// ThorVG. Nearby curves share the first exact controls registered under
   /// their two-decimal cache key.
-  pub fn intern_easing(&self, controls: [f32; 4]) -> [f32; 4] {
+  pub fn intern_easing(&self, controls: [f32; 4]) -> Result<[f32; 4]> {
     let key = format!("{:.2}_{:.2}_{:.2}_{:.2}", controls[0], controls[1], controls[2], controls[3]);
     let mut cache = self.state.easing_cache.borrow_mut();
     if let Some(easing) = cache.get(&key) {
-      return *easing;
+      return Ok(*easing);
     }
+    self.allocate(2 * (core::mem::size_of::<(String, [f32; 4])>() + 1) + key.capacity())?;
+    cache.try_reserve(1).map_err(|_| Error::LimitExceeded(Limit::ParseMemory))?;
     cache.insert(key, controls);
-    controls
+    Ok(controls)
   }
 
   fn err(&self, kind: JsonErrorKind) -> Error {
@@ -112,6 +185,7 @@ impl<'a> Cursor<'a> {
   }
 
   pub fn expect(&mut self, expected: u8) -> Result<()> {
+    self.work(1)?;
     match self.peek() {
       Some(b) if b == expected => {
         self.pos += 1;
@@ -134,6 +208,7 @@ impl<'a> Cursor<'a> {
     loop {
       match self.bump() {
         Some(b'"') => {
+          self.work(self.pos - start)?;
           return self.bytes.get(start..self.pos - 1).ok_or_else(|| self.err(JsonErrorKind::BadString));
         }
         Some(b'\\') => {
@@ -188,6 +263,7 @@ impl<'a> Cursor<'a> {
         return Err(self.err(JsonErrorKind::BadNumber));
       }
     }
+    self.work(self.pos - start)?;
     let token = self.bytes.get(start..self.pos).ok_or_else(|| self.err(JsonErrorKind::BadNumber))?;
     if integer_token {
       let digits = if negative { token.get(1..).unwrap_or(&[]) } else { token };
@@ -229,6 +305,7 @@ impl<'a> Cursor<'a> {
     match self.peek() {
       Some(b'"') => self.read_string_bytes().map(|_| ()),
       Some(b'{' | b'[') => {
+        let start = self.pos;
         let mut depth: usize = 0;
         loop {
           match self.bump() {
@@ -241,6 +318,7 @@ impl<'a> Cursor<'a> {
             Some(b'}' | b']') => {
               depth -= 1;
               if depth == 0 {
+                self.work(self.pos - start)?;
                 return Ok(());
               }
             }

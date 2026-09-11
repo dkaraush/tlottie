@@ -181,7 +181,20 @@ impl CPURenderer {
         };
         let _source_dirty = self.surface_dirty.pop().unwrap_or_else(DirtyBox::empty);
         let source_rows = self.surface_rows.pop().unwrap_or_default();
-        apply_matte(&mut target, &source, kind, source_opacity, self.comp.channel_order);
+        // Matte multiplication cannot make a transparent target nonzero,
+        // including inverted mattes. Visit only rows written by the target.
+        let width = self.width;
+        if width != 0 && !target_dirty.is_empty() {
+          let height = target.len().min(source.len()) / width;
+          for y in target_dirty.y0.min(height)..target_dirty.y1.saturating_add(1).min(height) {
+            let Some(bounds) = target_rows.get(y).filter(|bounds| !bounds.is_empty()) else { continue };
+            let start = y * width + bounds.x0.min(width);
+            let end = y * width + bounds.x1.saturating_add(1).min(width);
+            if let (Some(target), Some(source)) = (target.get_mut(start..end), source.get(start..end)) {
+              apply_matte(target, source, kind, source_opacity, self.comp.channel_order);
+            }
+          }
+        }
         let width = self.width;
         composite_over_rows(self.active(), &target, width, &target_rows, target_dirty, opacity);
         if !target_dirty.is_empty() {
