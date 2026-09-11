@@ -15,9 +15,9 @@ fn easing_cache_reuses_first_curve_across_forked_cursors() {
   let cursor = Cursor::new(b"", 8);
   let fork = cursor.fork_at(0);
   let first = [0.809, 0.0, 0.667, 1.0];
-  assert_eq!(cursor.intern_easing(first), first);
+  assert_eq!(cursor.intern_easing(first).unwrap(), first);
   // Both outgoing X values format to 0.81, matching the compatibility
   // cache key used by rlottie and ThorVG.
-  assert_eq!(fork.intern_easing([0.814, 0.0, 0.667, 1.0]), first);
-  assert_eq!(fork.intern_easing([0.821, 0.0, 0.667, 1.0]), [0.821, 0.0, 0.667, 1.0]);
+  assert_eq!(fork.intern_easing([0.814, 0.0, 0.667, 1.0]).unwrap(), first);
+  assert_eq!(fork.intern_easing([0.821, 0.0, 0.667, 1.0]).unwrap(), [0.821, 0.0, 0.667, 1.0]);
 }

@@ -4,6 +4,7 @@ use crate::model::FillRule;
 use crate::renderer::frame::{Composite, FrameRenderer, Geometry, GradientKind, GradientPaint, Paint, Rule};
 use alloc::vec::Vec;
 
+use super::executor::{mark_row_bounds, RowBounds};
 use super::executor::{mode_s_wins, pack_span, unpack_span, CovEntry, PlaneData, RenderScratch, SPAN_CAPTURE_MAX};
 
 pub(super) struct Alpha8Renderer<'a> {
@@ -13,6 +14,8 @@ pub(super) struct Alpha8Renderer<'a> {
   pub(super) antialias: bool,
   pub(super) state: &'a mut RenderScratch,
   surfaces: Vec<Vec<u8>>,
+  surface_rows: Vec<Vec<RowBounds>>,
+  row_bounds_pool: Vec<Vec<RowBounds>>,
   mask: Option<Vec<u8>>,
   gradient_row: Vec<u32>,
   gradient_alpha: Vec<u8>,
@@ -30,6 +33,8 @@ impl<'a> Alpha8Renderer<'a> {
       antialias,
       state,
       surfaces: Vec::new(),
+      surface_rows: Vec::new(),
+      row_bounds_pool: Vec::new(),
       mask: None,
       gradient_row: Vec::new(),
       gradient_alpha: Vec::new(),
@@ -52,6 +57,7 @@ impl<'a> Alpha8Renderer<'a> {
 
     if let Some(entry) = self.state.cov_cache.get(key) {
       let (gradient_row, gradient_alpha) = (&mut self.gradient_row, &mut self.gradient_alpha);
+      let mut dirty_rows = self.surface_rows.last_mut().map(Vec::as_mut_slice);
       let target = match self.surfaces.last_mut() {
         Some(surface) => surface.as_mut_slice(),
         None => &mut *self.pixels,
@@ -63,6 +69,7 @@ impl<'a> Alpha8Renderer<'a> {
             let (y, x0, len) = (y as usize, x0 as usize, len as usize);
             let start = y.saturating_mul(width).saturating_add(x0);
             if let (Some(row), Some(coverage)) = (target.get_mut(start..start.saturating_add(len)), data.get(offset..offset.saturating_add(len))) {
+              mark_row_bounds(&mut dirty_rows, y, x0, x0 + len);
               blend_paint(row, coverage, y, x0, paint, uniform_gradient_alpha, gradient_row, gradient_alpha);
             }
             offset = offset.saturating_add(len);
@@ -74,6 +81,7 @@ impl<'a> Alpha8Renderer<'a> {
             let (y, x0, len, coverage) = unpack_span(span);
             let start = y.saturating_mul(width).saturating_add(x0);
             if let Some(row) = target.get_mut(start..start.saturating_add(len)) {
+              mark_row_bounds(&mut dirty_rows, y, x0, x0 + len);
               blend_uniform_paint(row, coverage, y, x0, paint, uniform_gradient_alpha, gradient_row, gradient_alpha);
             }
           }
@@ -90,6 +98,7 @@ impl<'a> Alpha8Renderer<'a> {
       let mut spans = Vec::new();
       let mut capture_overflow = false;
       let (gradient_row, gradient_alpha) = (&mut self.gradient_row, &mut self.gradient_alpha);
+      let mut dirty_rows = self.surface_rows.last_mut().map(Vec::as_mut_slice);
       let target = match self.surfaces.last_mut() {
         Some(surface) => surface.as_mut_slice(),
         None => &mut *self.pixels,
@@ -103,6 +112,7 @@ impl<'a> Alpha8Renderer<'a> {
         |y, x0, len, coverage| {
           let start = y.saturating_mul(width).saturating_add(x0);
           if let Some(row) = target.get_mut(start..start.saturating_add(len)) {
+            mark_row_bounds(&mut dirty_rows, y, x0, x0 + len);
             blend_uniform_paint(row, coverage, y, x0, paint, uniform_gradient_alpha, gradient_row, gradient_alpha);
           }
           if capture {
@@ -132,6 +142,7 @@ impl<'a> Alpha8Renderer<'a> {
     let capture = self.state.cov_cache.capture_enabled();
     let mut entry = CovEntry::default();
     let (gradient_row, gradient_alpha) = (&mut self.gradient_row, &mut self.gradient_alpha);
+    let mut dirty_rows = self.surface_rows.last_mut().map(Vec::as_mut_slice);
     let target = match self.surfaces.last_mut() {
       Some(surface) => surface.as_mut_slice(),
       None => &mut *self.pixels,
@@ -147,6 +158,7 @@ impl<'a> Alpha8Renderer<'a> {
         let Some(row) = target.get_mut(start..start.saturating_add(coverage.len())) else {
           return;
         };
+        mark_row_bounds(&mut dirty_rows, y, x0, x0 + coverage.len());
         blend_paint(row, coverage, y, x0, paint, uniform_gradient_alpha, gradient_row, gradient_alpha);
         if capture {
           entry.rows.push((y as u32, x0 as u32, coverage.len() as u32));
@@ -193,19 +205,51 @@ impl<'a> Alpha8Renderer<'a> {
     }
   }
 
+  fn composite_surface(&mut self, source: &[u8], rows: &[RowBounds], opacity: u8) {
+    let width = self.width;
+    if width == 0 {
+      return;
+    }
+    let mut dirty_rows = self.surface_rows.last_mut().map(Vec::as_mut_slice);
+    let target = self.surfaces.last_mut().map_or(&mut *self.pixels, Vec::as_mut_slice);
+    let height = target.len().min(source.len()) / width;
+    for (y, bounds) in rows.iter().take(height).enumerate() {
+      if bounds.is_empty() {
+        continue;
+      }
+      let x0 = bounds.x0.min(width);
+      let x1 = bounds.x1.saturating_add(1).min(width);
+      let start = y * width + x0;
+      let end = y * width + x1;
+      if let (Some(target), Some(source)) = (target.get_mut(start..end), source.get(start..end)) {
+        composite_over(target, source, opacity);
+        mark_row_bounds(&mut dirty_rows, y, x0, x1);
+      }
+    }
+  }
+
+  fn recycle_surface(&mut self, surface: Vec<u8>, rows: Vec<RowBounds>) {
+    self.state.put_surface_u8(surface, self.width, &rows);
+    self.row_bounds_pool.push(rows);
+  }
+
   pub(super) fn finish(mut self) {
     if let Some(mask) = self.mask.take() {
       self.state.put_u8(mask);
     }
-    for surface in self.surfaces.drain(..) {
-      self.state.put_u8(surface);
+    for (surface, rows) in self.surfaces.drain(..).zip(self.surface_rows.drain(..)) {
+      self.state.put_surface_u8(surface, self.width, &rows);
     }
   }
 }
 
 impl FrameRenderer for Alpha8Renderer<'_> {
   fn save_layer(&mut self) {
-    self.surfaces.push(self.state.take_u8(self.width.saturating_mul(self.height), 0));
+    self.surfaces.push(self.state.take_surface_u8(self.width.saturating_mul(self.height)));
+    let mut rows = self.row_bounds_pool.pop().unwrap_or_default();
+    rows.clear();
+    rows.resize(self.height, RowBounds::empty());
+    self.surface_rows.push(rows);
   }
 
   fn draw(&mut self, geometry: Geometry<'_>, paint: Paint<'_>) {
@@ -220,20 +264,36 @@ impl FrameRenderer for Alpha8Renderer<'_> {
     match composite {
       Composite::Over { opacity } => {
         if let Some(source) = self.surfaces.pop() {
-          composite_over(self.active(), &source, opacity);
-          self.state.put_u8(source);
+          let rows = self.surface_rows.pop().unwrap_or_default();
+          self.composite_surface(&source, &rows, opacity);
+          self.recycle_surface(source, rows);
         }
       }
       Composite::Matte { kind, opacity, source_opacity } => {
         let Some(mut target) = self.surfaces.pop() else { return };
+        let target_rows = self.surface_rows.pop().unwrap_or_default();
         let Some(source) = self.surfaces.pop() else {
-          self.state.put_u8(target);
+          self.recycle_surface(target, target_rows);
           return;
         };
-        crate::simd::alpha_matte(&mut target, &source, source_opacity, kind != 1);
-        composite_over(self.active(), &target, opacity);
-        self.state.put_u8(target);
-        self.state.put_u8(source);
+        let source_rows = self.surface_rows.pop().unwrap_or_default();
+        let width = self.width;
+        if width != 0 {
+          let height = target.len().min(source.len()) / width;
+          for (y, bounds) in target_rows.iter().take(height).enumerate() {
+            if bounds.is_empty() {
+              continue;
+            }
+            let start = y * width + bounds.x0.min(width);
+            let end = y * width + bounds.x1.saturating_add(1).min(width);
+            if let (Some(target), Some(source)) = (target.get_mut(start..end), source.get(start..end)) {
+              crate::simd::alpha_matte(target, source, source_opacity, kind != 1);
+            }
+          }
+        }
+        self.composite_surface(&target, &target_rows, opacity);
+        self.recycle_surface(target, target_rows);
+        self.recycle_surface(source, source_rows);
       }
     }
   }

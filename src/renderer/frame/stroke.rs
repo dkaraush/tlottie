@@ -193,9 +193,11 @@ pub(crate) fn stroke_outline(
   let mut b1 = Border::new(pool.pop().unwrap_or_default());
   b0.pts.clear();
   b1.pts.clear();
-  let cap_pts = 2 + (core::f32::consts::PI / 0.0655) as usize;
-  b0.pts.try_reserve(2 * segments.len() + cap_pts + 8).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
-  b1.pts.try_reserve(2 * segments.len() + 8).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
+  // Reserve the straight borders only. Corners and round caps grow on
+  // demand within the preflight bound; tiny butt-capped dashes otherwise
+  // retain dozens of unused points per output contour.
+  b0.pts.try_reserve_exact(2 * segments.len()).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
+  b1.pts.try_reserve_exact(2 * segments.len()).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
 
   // Subpath start: moveto on each border (movable = false).
   let (first_d, first_p) = match segments.first() {
@@ -330,7 +332,9 @@ pub(crate) fn stroke_outline(
     let original_len = b0.pts.len();
     let mut loop_pts = b0.pts;
     emit_cap(&mut loop_pts, end_center, last.d, hw, cap);
-    loop_pts.try_reserve(b1.pts.len() + 2 * arc_steps).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
+    loop_pts
+      .try_reserve_exact(b1.pts.len() + if cap == Cap::Round { 2 * arc_steps } else { 0 })
+      .map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
     loop_pts.extend(b1.pts.iter().rev().copied());
     pool.push(b1.pts);
     emit_cap(&mut loop_pts, first_p, Vec2::new(-first_d.x, -first_d.y), hw, cap);

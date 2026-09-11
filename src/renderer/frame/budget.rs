@@ -11,6 +11,7 @@ pub(crate) struct Budget {
   points: Cell<usize>,
   work: Cell<usize>,
   layers: Cell<usize>,
+  dash_bytes: Cell<usize>,
 }
 
 impl Budget {
@@ -24,6 +25,22 @@ impl Budget {
   }
   pub(crate) fn points(&self, amount: usize) -> Result<()> {
     Self::charge(&self.points, amount, Limits::default().max_render_points, Limit::RenderGeometry)
+  }
+  pub(crate) fn dash_output(&self, points: usize, new_piece: bool) -> Result<()> {
+    self.work(points)?;
+    // Account for geometrically grown point/anchor buffers and for the
+    // outer Vec's two Vec headers per piece, even on whole-element dashes.
+    let headers = if new_piece {
+      core::mem::size_of::<(alloc::vec::Vec<crate::math::Vec2>, alloc::vec::Vec<bool>)>()
+    } else {
+      0
+    };
+    let bytes = points
+      .max(if new_piece { 4 } else { 0 })
+      .saturating_mul(core::mem::size_of::<crate::math::Vec2>() + 1)
+      .saturating_add(headers)
+      .saturating_mul(2);
+    Self::charge(&self.dash_bytes, bytes, Limits::default().max_render_dash_bytes, Limit::RenderMemory)
   }
   pub(crate) fn work(&self, amount: usize) -> Result<()> {
     Self::charge(&self.work, amount, Limits::default().max_render_work, Limit::RenderWork)
@@ -159,7 +176,16 @@ impl<'a, R: FrameRenderer> GuardedRenderer<'a, R> {
     }
     // Twice the Manhattan perimeter bounds horizontal + twice vertical
     // crossings. Add fixed per-edge overhead before raster allocation.
-    let work = ((metrics.perim * 2.0).ceil() as usize).saturating_add(metrics.points.saturating_mul(8));
+    let mut work = ((metrics.perim * 2.0).ceil() as usize).saturating_add(metrics.points.saturating_mul(8));
+    if metrics.points == 0 {
+      // Coverage replay omits every contour: the backend already holds this
+      // geometry, so there is nothing left to measure and the formula above
+      // yields zero. A replay still blends real spans across the canvas, so
+      // price it like a full-canvas path. Charging zero let an evicted
+      // `pixel_costs` entry (cleared at 512) turn every later replay of the
+      // same key into free work, uncapped by anything but `pixel_limit`.
+      work = 4usize.saturating_mul(self.width.saturating_add(self.height));
+    }
     if work > Limits::default().max_render_points {
       return Err(Error::LimitExceeded(Limit::RenderGeometry));
     }
@@ -413,7 +439,7 @@ mod tests {
     assert!(sink.saves < 100);
   }
   #[test]
-  fn cached_geometry_still_consumes_pixel_budget() {
+  fn cached_geometry_still_consumes_work_and_pixel_budget() {
     let mut sink = Sink::default();
     let mut guarded = GuardedRenderer::new(&mut sink, 128, 128, Default::default());
     let paint = Paint::Solid(SolidPaint {
@@ -422,11 +448,13 @@ mod tests {
       color: crate::math::Color::BLACK,
       opacity: 1.0,
     });
-    for _ in 0..16385 {
+    let per_draw = 4 * (128 + 128);
+    let allowed = Limits::default().max_render_work / per_draw;
+    for _ in 0..allowed + 1 {
       guarded.draw(Geometry::new(&[], 1), paint);
     }
     assert_eq!(guarded.status(), Err(Error::LimitExceeded(Limit::RenderWork)));
-    assert_eq!(sink.draws, 16384);
+    assert_eq!(sink.draws, allowed);
   }
 
   #[test]
@@ -534,6 +562,10 @@ pub(crate) fn validate_model(comp: &crate::Composition) -> Result<()> {
   if comp.assets.len() > limits.max_assets {
     return Err(Error::LimitExceeded(Limit::Assets));
   }
+  let (focal, strokes) = crate::parse::expanded_gradient_paints(comp)?;
+  if focal > limits.max_focal_radial_gradient_expansion || strokes > limits.max_expanded_gradient_strokes {
+    return Err(Error::LimitExceeded(Limit::RenderWork));
+  }
   fn layers(comp: &crate::Composition, items: &[crate::model::Layer], resources: &Budget, depth: usize) -> Result<()> {
     if depth > 16 {
       return Err(Error::LimitExceeded(Limit::NestingDepth));
@@ -554,7 +586,8 @@ pub(crate) fn validate_model(comp: &crate::Composition) -> Result<()> {
         resources.property(&mask.opacity)?;
       }
       if layer.kind == crate::model::LayerKind::Precomp {
-        resources.work(comp.assets.len())?;
+        // Charge the bytes the id scan compares, not just the asset count.
+        resources.work(comp.assets.len().saturating_mul(layer.ref_id.as_deref().map_or(0, str::len).saturating_add(1)))?;
         if let Some(asset) = layer.ref_id.as_deref().and_then(|id| comp.assets.iter().find(|asset| asset.id == id)) {
           layers(comp, &asset.layers, resources, depth + 1)?;
         }

@@ -1319,6 +1319,7 @@ def init_worker(
     accuracy_diff_threshold: float,
     curve_tolerance: float,
     alpha_only: bool,
+    tlottie_version_names: tuple[str, ...] = (),
 ) -> None:
     global _WORKER_RENDERERS, _WORKER_RENDERER_ORDER, _WORKER_SIZE, _WORKER_FRAMES, _WORKER_ROOT, _WORKER_REPS
     global _WORKER_ACCURACY_ENABLED, _WORKER_ACCURACY_SIZE, _WORKER_ACCURACY_TOLERANCE, _WORKER_ACCURACY_DIFF_THRESHOLD, _WORKER_CURVE_TOLERANCE, _WORKER_ALPHA_ONLY
@@ -1336,7 +1337,7 @@ def init_worker(
     _WORKER_ALPHA_ONLY = alpha_only
     for renderer in renderers:
         lib = Path(libs[renderer])
-        if renderer == "tlottie" or renderer in TLOTTIE_VERSION_NAMES:
+        if renderer == "tlottie" or renderer in tlottie_version_names:
             _WORKER_RENDERERS[renderer] = Tlottie(lib, curve_tolerance, alpha_only)
         elif renderer in RLOTTIE_RENDERERS:
             _WORKER_RENDERERS[renderer] = Rlottie(lib)
@@ -1480,6 +1481,8 @@ def run_size_batch(
             accuracy_diff_threshold,
             curve_tolerance,
             alpha_only,
+            # Spawned workers do not inherit registrations made in main().
+            TLOTTIE_VERSION_NAMES,
         ),
     ) as pool:
         for done, (file_rows, accuracy_row) in enumerate(

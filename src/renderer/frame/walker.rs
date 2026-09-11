@@ -555,11 +555,15 @@ impl RenderCtx<'_> {
         continue;
       }
       let complex_precomp = if layer.kind == LayerKind::Precomp {
-        layer
-          .ref_id
-          .as_deref()
-          .and_then(|ref_id| self.comp.assets.iter().find(|asset| asset.id == ref_id))
-          .is_some_and(|asset| asset.layers.len() > 1)
+        // Same full-id scan as the expansion path below, and it runs for every
+        // layer of every frame; charge the bytes it compares.
+        match layer.ref_id.as_deref() {
+          Some(ref_id) => {
+            scratch.budget.work(self.comp.assets.len().saturating_mul(ref_id.len().saturating_add(1)))?;
+            self.comp.assets.iter().find(|asset| asset.id == ref_id).is_some_and(|asset| asset.layers.len() > 1)
+          }
+          None => false,
+        }
       } else {
         false
       };
@@ -753,7 +757,12 @@ impl RenderCtx<'_> {
         let Some(ref_id) = layer.ref_id.as_deref() else {
           return Ok(());
         };
-        scratch.budget.work(self.comp.assets.len())?;
+        // `String == String` compares the full id whenever the lengths match,
+        // so scanning N assets costs N * |ref_id| bytes, not N. Charging the
+        // count alone let 256 equal-length ids sharing a long prefix turn one
+        // lookup into megabytes of memcmp, repeated for every expanded precomp
+        // layer. Corpus maximum: 20 assets x 9-byte ids = 180 per lookup.
+        scratch.budget.work(self.comp.assets.len().saturating_mul(ref_id.len().saturating_add(1)))?;
         let Some(asset) = self.comp.assets.iter().find(|a| a.id == ref_id) else {
           return Ok(());
         };

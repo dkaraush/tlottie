@@ -434,7 +434,10 @@ impl ShapeWalker<'_> {
           }
           let copies = copies.max(0.0) as usize;
           let base_contours = arena.len() - scope_start;
-          let points = arena.iter().skip(scope_start).fold(0usize, |n, (c, _)| n.saturating_add(c.points.len()));
+          // `apply_repeater` clones BOTH lists per copy, and they can differ
+          // in length (a collapsed trim empties `points`), so charge the
+          // longer one rather than assuming the point count covers the clone.
+          let points = arena.iter().skip(scope_start).fold(0usize, |n, (c, _)| n.saturating_add(c.points.len().max(c.anchors.len())));
           self.scratch.budget.points(points.saturating_mul(copies))?;
           // Every copied arena entry also carries a fixed `Contour` footprint
           // (two Vec headers + linearization cache, ~64 bytes = 8 point slots)
@@ -682,10 +685,14 @@ impl ShapeWalker<'_> {
       }
     }
     // Originals are replaced by the copies: blank the base geometry and
-    // disarm the original paint jobs.
+    // disarm the original paint jobs. Drop the anchors with the points --
+    // a contour with no points carries no anchor information, and leaving
+    // the list behind hands a stacked repeater bytes to clone that no
+    // point count prices.
     if let Some(range) = arena.get_mut(scope_start..base_end) {
       for (c, _) in range {
         c.points.clear();
+        c.anchors.clear();
       }
     }
     let _ = base_len;
@@ -706,6 +713,10 @@ impl ShapeWalker<'_> {
       if let Some(geoms) = arena.get_mut(scope_start..) {
         for (c, _) in geoms {
           c.points.clear();
+          // Anchors are one flag per point; keeping them on an emptied
+          // contour leaves bytes that later clones (repeaters) would copy
+          // without any point count to charge them against.
+          c.anchors.clear();
         }
       }
       return Ok(());

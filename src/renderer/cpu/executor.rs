@@ -47,6 +47,7 @@ pub(crate) struct RenderScratch {
   /// general scratch planes, acquiring one therefore does not need to clear
   /// the full canvas again.
   surface_u32: Vec<Surface>,
+  surface_u8: Vec<Vec<u8>>,
   bufs_u8: Vec<Vec<u8>>,
   /// Gradient LUT memoization: building a 1024-entry premultiplied table
   /// from the stop list is pure, and stop values repeat across frames
@@ -201,6 +202,30 @@ impl RenderScratch {
   pub(crate) fn put_u32(&mut self, b: Vec<u32>) {
     if self.bufs_u32.len() < SCRATCH_POOL_CAP {
       self.bufs_u32.push(b);
+    }
+  }
+
+  pub(crate) fn take_surface_u8(&mut self, n: usize) -> Vec<u8> {
+    let mut surface = self.surface_u8.pop().unwrap_or_default();
+    surface.resize(n, 0);
+    surface
+  }
+
+  pub(crate) fn put_surface_u8(&mut self, mut surface: Vec<u8>, width: usize, rows: &[RowBounds]) {
+    if width != 0 {
+      let height = surface.len() / width;
+      for (y, row) in rows.iter().take(height).enumerate() {
+        if !row.is_empty() {
+          let start = y * width + row.x0.min(width);
+          let end = y * width + row.x1.saturating_add(1).min(width);
+          if let Some(span) = surface.get_mut(start..end) {
+            span.fill(0);
+          }
+        }
+      }
+    }
+    if self.surface_u8.len() < SCRATCH_POOL_CAP {
+      self.surface_u8.push(surface);
     }
   }
 
