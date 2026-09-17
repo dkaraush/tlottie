@@ -137,6 +137,31 @@ fn primitive_direction_matches_rlottie_field_order() {
 }
 
 #[test]
+fn empty_path_tangents_are_corners() {
+  let path = r#"{"v":[[0,0],[10,0],[10,10]],"i":[[],[1,2],[]],"o":[[],[],[]],"c":true}"#;
+  for json in [String::from(path), format!("[{path}]")] {
+    let data = parse_path_value(&mut Cursor::new(json.as_bytes(), 128), &Limits::default()).unwrap();
+    assert_eq!(data.in_tangents, vec![Vec2::ZERO, Vec2::new(1.0, 2.0), Vec2::ZERO]);
+    assert_eq!(data.out_tangents, vec![Vec2::ZERO; 3]);
+  }
+}
+
+#[test]
+fn empty_tangent_compatibility_preserves_validation() {
+  let limits = Limits { max_path_points: 2, max_path_coordinate_abs: 10.0, ..Limits::default() };
+  for json in [r#"{"v":[[]]}"#, r#"{"i":[[null]]}"#, r#"{"o":[[0,]]}"#] {
+    assert!(parse_path_value(&mut Cursor::new(json.as_bytes(), 128), &limits).is_err());
+  }
+  assert!(parse_vec2(&mut Cursor::new(b"[]", 128)).is_err());
+  for key in ["i", "o"] {
+    let json = format!(r#"{{"{key}":[[],[],[]]}}"#);
+    assert!(matches!(parse_path_value(&mut Cursor::new(json.as_bytes(), 128), &limits), Err(Error::LimitExceeded(Limit::PathPoints))));
+    let json = format!(r#"{{"{key}":[[],[11,0]]}}"#);
+    assert!(matches!(parse_path_value(&mut Cursor::new(json.as_bytes(), 128), &limits), Err(Error::LimitExceeded(Limit::PathCoordinate))));
+  }
+}
+
+#[test]
 fn stroke_dash_array_before_type_is_preserved() {
   let comp =
     parse(r#"{"fr":30,"ip":0,"op":30,"w":100,"h":100,"layers":[{"ty":4,"ip":0,"op":30,"shapes":[{"d":[{"n":"d","v":{"k":4}},{"n":"g","v":{"k":2}}],"ty":"st","c":{"k":[1,0,0,1]},"w":{"k":2}}]}]}"#)

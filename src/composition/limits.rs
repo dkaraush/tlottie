@@ -1,14 +1,8 @@
 /// Hard resource limits applied while parsing and rendering.
 ///
-/// Authored-data and geometry defaults retain at least five times the measured
-/// fixture-corpus maxima. Canvas storage uses four times the measured peak at
-/// each output size, scaling with area. See `benchmarks/limits-corpus.md` and
-/// `benchmarks/limits-2000.md` for measurements and limits with no observed usage.
-/// Rendering limits count concrete geometry, pixel visits and storage;
-/// there is no aggregate CPU work-unit budget.
-/// Every limit maps to an
-/// [`crate::error::Limit`] error —
-/// exceeding one is a clean `Err`, never a crash or an OOM spiral.
+/// Defaults allow at least 5x the observed fixture usage, or 4x for canvas
+/// storage, which scales with output area. Exceeding a limit returns
+/// [`crate::Error::LimitExceeded`].
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
   /// Maximum input size in bytes.
