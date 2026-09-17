@@ -1,4 +1,4 @@
-//! Deterministic, per-frame work limits. Charge before expanding geometry or
+//! Concrete per-frame resource limits. Charge before expanding geometry or
 //! invoking a backend, including when commands replay from a cache.
 use super::renderer::*;
 #[cfg(not(feature = "std"))]
@@ -9,7 +9,6 @@ use core::cell::Cell;
 #[derive(Default)]
 pub(crate) struct Budget {
   points: Cell<usize>,
-  work: Cell<usize>,
   layers: Cell<usize>,
   dash_bytes: Cell<usize>,
 }
@@ -27,7 +26,6 @@ impl Budget {
     Self::charge(&self.points, amount, Limits::default().max_render_points, Limit::RenderGeometry)
   }
   pub(crate) fn dash_output(&self, points: usize, new_piece: bool) -> Result<()> {
-    self.work(points)?;
     // Account for geometrically grown point/anchor buffers and for the
     // outer Vec's two Vec headers per piece, even on whole-element dashes.
     let headers = if new_piece {
@@ -41,9 +39,6 @@ impl Budget {
       .saturating_add(headers)
       .saturating_mul(2);
     Self::charge(&self.dash_bytes, bytes, Limits::default().max_render_dash_bytes, Limit::RenderMemory)
-  }
-  pub(crate) fn work(&self, amount: usize) -> Result<()> {
-    Self::charge(&self.work, amount, Limits::default().max_render_work, Limit::RenderWork)
   }
   pub(crate) fn layers(&self, amount: usize) -> Result<()> {
     Self::charge(&self.layers, amount, Limits::default().max_precomp_expansion, Limit::PrecompExpansion)
@@ -96,6 +91,16 @@ impl Budget {
   }
 }
 
+fn canvas_memory_limit(width: u32, height: u32) -> usize {
+  // Surface storage grows with canvas area. Scale the fixture-calibrated
+  // allowance in both directions to preserve the same nesting limit at
+  // every resolution. Use a wide product before clamping
+  // to the address space; scaling must never wrap to a smaller allowance.
+  let reference_area = 720u128 * 720;
+  let area = u128::from(width) * u128::from(height);
+  ((Limits::default().max_render_bytes as u128 * area) / reference_area).min(usize::MAX as u128) as usize
+}
+
 pub(crate) fn canvas_size(width: u32, height: u32) -> Result<usize> {
   let limits = Limits::default();
   if width == 0 || height == 0 || width > limits.max_dimension || height > limits.max_dimension {
@@ -104,7 +109,7 @@ pub(crate) fn canvas_size(width: u32, height: u32) -> Result<usize> {
   let pixels = (width as usize).checked_mul(height as usize).ok_or(Error::LimitExceeded(Limit::RenderMemory))?;
   // Allow for the dense raster, mask planes, fallback bitmap and pooled
   // planes before any renderer-side allocation (including Alpha8 fallback).
-  if pixels > limits.max_render_bytes / 32 {
+  if pixels > canvas_memory_limit(width, height) / 32 {
     return Err(Error::LimitExceeded(Limit::RenderMemory));
   }
   Ok(pixels)
@@ -113,7 +118,6 @@ pub(crate) fn canvas_size(width: u32, height: u32) -> Result<usize> {
 /// Bounds belong to the same immutable geometry key as retained coverage.
 #[derive(Clone, Copy)]
 pub(crate) struct DrawCost {
-  work: usize,
   pixels: usize,
   sparse: bool,
 }
@@ -125,7 +129,7 @@ pub(crate) struct GuardedRenderer<'a, R> {
   depth: usize,
   pixels: Cell<usize>,
   pixel_limit: usize,
-  budget: Budget,
+  memory_limit: usize,
   error: Option<Error>,
   pub(crate) pixel_costs: crate::compat::HashMap<u128, DrawCost>,
 }
@@ -137,10 +141,10 @@ impl<'a, R: FrameRenderer> GuardedRenderer<'a, R> {
       height: height as usize,
       depth: 0,
       pixels: Cell::new(0),
-      // Pixel work grows with output area even for the same authored scene.
-      // Keep the small-canvas floor while allowing proportional raster work.
+      // Pixel visits grow with output area for the same authored scene.
+      // Scale the allowance with the canvas area above the small-canvas floor.
       pixel_limit: ((Limits::default().max_render_pixels as u64).saturating_mul((width as u64 * height as u64).max(64 * 64)) / (64 * 64)).min(usize::MAX as u64) as usize,
-      budget: Budget::default(),
+      memory_limit: canvas_memory_limit(width, height),
       error: None,
       pixel_costs,
     }
@@ -158,38 +162,21 @@ impl<'a, R: FrameRenderer> GuardedRenderer<'a, R> {
     }
   }
   fn pixels(&self, times: usize) -> Result<()> {
-    Budget::charge(&self.pixels, self.width.saturating_mul(self.height).saturating_mul(times), self.pixel_limit, Limit::RenderWork)
+    Budget::charge(&self.pixels, self.width.saturating_mul(self.height).saturating_mul(times), self.pixel_limit, Limit::RenderPixels)
   }
-  fn geometry(&mut self, geometry: &mut Geometry<'_>, pixel_weight: usize) -> Result<()> {
+  fn geometry(&mut self, geometry: &mut Geometry<'_>) -> Result<()> {
     let translation = geometry.raw_translation();
     if !translation.x.is_finite() || !translation.y.is_finite() {
       return Err(Error::LimitExceeded(Limit::PathCoordinate));
     }
     if let Some(cost) = self.pixel_costs.get(&geometry.cache_key) {
-      self.budget.work(cost.work)?;
       geometry.raster_mode = Some(cost.sparse);
-      return Budget::charge(&self.pixels, cost.pixels.saturating_mul(pixel_weight), self.pixel_limit, Limit::RenderWork);
+      return Budget::charge(&self.pixels, cost.pixels, self.pixel_limit, Limit::RenderPixels);
     }
     let metrics = crate::geometry::RasterMetrics::new(geometry.raw_contours());
     if !metrics.perim.is_finite() {
       return Err(Error::LimitExceeded(Limit::PathCoordinate));
     }
-    // Twice the Manhattan perimeter bounds horizontal + twice vertical
-    // crossings. Add fixed per-edge overhead before raster allocation.
-    let mut work = ((metrics.perim * 2.0).ceil() as usize).saturating_add(metrics.points.saturating_mul(8));
-    if metrics.points == 0 {
-      // Coverage replay omits every contour: the backend already holds this
-      // geometry, so there is nothing left to measure and the formula above
-      // yields zero. A replay still blends real spans across the canvas, so
-      // price it like a full-canvas path. Charging zero let an evicted
-      // `pixel_costs` entry (cleared at 512) turn every later replay of the
-      // same key into free work, uncapped by anything but `pixel_limit`.
-      work = 4usize.saturating_mul(self.width.saturating_add(self.height));
-    }
-    if work > Limits::default().max_render_points {
-      return Err(Error::LimitExceeded(Limit::RenderGeometry));
-    }
-    self.budget.work(work)?;
     geometry.raster_mode = Some(metrics.sparse(self.width.saturating_mul(self.height)));
     let (x0, y0, x1, y1) = (metrics.x0 + translation.x, metrics.y0 + translation.y, metrics.x1 + translation.x, metrics.y1 + translation.y);
     if metrics.points > 0 && [x0, y0, x1, y1].iter().any(|v| !v.is_finite()) {
@@ -206,7 +193,6 @@ impl<'a, R: FrameRenderer> GuardedRenderer<'a, R> {
       self.pixel_costs.insert(
         geometry.cache_key,
         DrawCost {
-          work,
           pixels,
           sparse: geometry.raster_mode.unwrap_or(false),
         },
@@ -217,7 +203,7 @@ impl<'a, R: FrameRenderer> GuardedRenderer<'a, R> {
       // bounding-box charge across frames; on a miss charge the full canvas.
       self.width.saturating_mul(self.height)
     };
-    Budget::charge(&self.pixels, pixels.saturating_mul(pixel_weight), self.pixel_limit, Limit::RenderWork)
+    Budget::charge(&self.pixels, pixels, self.pixel_limit, Limit::RenderPixels)
   }
 }
 impl<R: FrameRenderer> FrameRenderer for GuardedRenderer<'_, R> {
@@ -229,7 +215,7 @@ impl<R: FrameRenderer> FrameRenderer for GuardedRenderer<'_, R> {
   }
   fn save_layer(&mut self) {
     let bytes = self.width.saturating_mul(self.height).saturating_mul(32 + 4 * (self.depth + 1));
-    let result = if bytes > Limits::default().max_render_bytes {
+    let result = if bytes > self.memory_limit {
       Err(Error::LimitExceeded(Limit::RenderMemory))
     } else {
       self.pixels(1)
@@ -243,19 +229,7 @@ impl<R: FrameRenderer> FrameRenderer for GuardedRenderer<'_, R> {
     if self.error.is_some() {
       return;
     }
-    // Gradient mapping, LUT lookup and blending cost more than a solid fill;
-    // focal sampling also solves a quadratic. Charge evaluated paint kinds so
-    // animation and coverage replay cannot bypass this work allowance. These
-    // conservative weights are work units, not hardware timing predictions.
-    let pixel_weight = match paint {
-      Paint::Solid(_) => 1,
-      Paint::Gradient(gradient) => match gradient.kind {
-        GradientKind::Linear { .. } => 8,
-        GradientKind::Radial { .. } => 16,
-        GradientKind::Focal { .. } => 32,
-      },
-    };
-    let result = self.geometry(&mut geometry, pixel_weight);
+    let result = self.geometry(&mut geometry);
     if self.accept(result) {
       self.inner.draw(geometry, paint);
     }
@@ -264,7 +238,7 @@ impl<R: FrameRenderer> FrameRenderer for GuardedRenderer<'_, R> {
     if self.error.is_some() {
       return;
     }
-    let result = self.geometry(&mut geometry, 1).and_then(|()| self.pixels(3));
+    let result = self.geometry(&mut geometry).and_then(|()| self.pixels(3));
     if self.accept(result) {
       self.inner.apply_mask(geometry, mode, inverted, opacity, first, last);
     }
@@ -291,7 +265,6 @@ impl Budget {
       if n > Limits::default().max_keyframes {
         return Err(Error::LimitExceeded(Limit::Keyframes));
       }
-      self.work(n)?;
     }
     Ok(())
   }
@@ -316,7 +289,7 @@ impl Budget {
       if n > Limits::default().max_path_points {
         return Err(Error::LimitExceeded(Limit::PathPoints));
       }
-      self.work(n)
+      Ok(())
     })
   }
   fn stops(&self, property: &crate::property::Property<crate::model::FloatList>) -> Result<()> {
@@ -324,7 +297,7 @@ impl Budget {
       if p.0.len() > Limits::default().max_gradient_stop_values {
         return Err(Error::LimitExceeded(Limit::GradientStopValues));
       }
-      self.work(p.0.len())
+      Ok(())
     })
   }
   pub(crate) fn transform(&self, transform: &crate::model::Transform) -> Result<()> {
@@ -352,10 +325,9 @@ impl Budget {
     Ok(())
   }
   pub(crate) fn shape_tree(&self, shapes: &[crate::model::Shape], depth: usize) -> Result<()> {
-    if depth > 40 {
+    if depth > crate::composition::parse::MAX_GROUP_DEPTH {
       return Err(Error::LimitExceeded(Limit::NestingDepth));
     }
-    self.work(shapes.len())?;
     for shape in shapes {
       self.shape(shape)?;
       if let crate::model::Shape::Group(group) = shape {
@@ -439,7 +411,31 @@ mod tests {
     assert!(sink.saves < 100);
   }
   #[test]
-  fn cached_geometry_still_consumes_work_and_pixel_budget() {
+  fn canvas_sizes_preserve_the_surface_nesting_limit() {
+    let mut counts = alloc::vec::Vec::new();
+    for (width, height) in [(64, 64), (320, 320), (720, 720), (2000, 2000), (4000, 1000), (1000, 4000), (8192, 8192)] {
+      assert_eq!(canvas_size(width, height), Ok(width as usize * height as usize));
+      let mut sink = Sink::default();
+      let mut guarded = GuardedRenderer::new(&mut sink, width, height, Default::default());
+      for _ in 0..100 {
+        guarded.save_layer();
+      }
+      assert_eq!(guarded.status(), Err(Error::LimitExceeded(Limit::RenderMemory)));
+      assert!(sink.saves >= 2, "a 2K canvas must allow a second nested surface");
+      assert!(sink.saves < 100, "surface nesting must still be bounded");
+      counts.push(sink.saves);
+    }
+    assert!(counts.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_eq!(canvas_size(0, 2000), Err(Error::LimitExceeded(Limit::CompositionSize)));
+    assert_eq!(canvas_size(Limits::default().max_dimension + 1, 2000), Err(Error::LimitExceeded(Limit::CompositionSize)));
+  }
+
+  #[test]
+  fn canvas_memory_scaling_does_not_wrap() {
+    assert_eq!(canvas_memory_limit(u32::MAX, u32::MAX), usize::MAX);
+  }
+  #[test]
+  fn cached_geometry_still_consumes_pixel_budget() {
     let mut sink = Sink::default();
     let mut guarded = GuardedRenderer::new(&mut sink, 128, 128, Default::default());
     let paint = Paint::Solid(SolidPaint {
@@ -448,21 +444,20 @@ mod tests {
       color: crate::math::Color::BLACK,
       opacity: 1.0,
     });
-    let per_draw = 4 * (128 + 128);
-    let allowed = Limits::default().max_render_work / per_draw;
+    let allowed = guarded.pixel_limit / (128 * 128);
     for _ in 0..allowed + 1 {
       guarded.draw(Geometry::new(&[], 1), paint);
     }
-    assert_eq!(guarded.status(), Err(Error::LimitExceeded(Limit::RenderWork)));
+    assert_eq!(guarded.status(), Err(Error::LimitExceeded(Limit::RenderPixels)));
     assert_eq!(sink.draws, allowed);
   }
 
   #[test]
-  fn cached_coverage_is_charged_for_the_current_gradient_kind() {
+  fn cached_coverage_counts_pixels_equally_for_every_paint() {
     use crate::geometry::Contour;
     use crate::math::Vec2;
-    // The first frame caches coverage with a cheap paint. A later frame can
-    // reuse those points with a different (or newly focal) animated gradient.
+    // A later frame can replay retained coverage with another paint kind.
+    // Pixel visits are concrete counts, independent of paint complexity.
     let contours = [Contour {
       points: alloc::vec![Vec2::new(0.0, 0.0), Vec2::new(128.0, 0.0), Vec2::new(128.0, 128.0), Vec2::new(0.0, 128.0)],
       ..Contour::default()
@@ -480,29 +475,24 @@ mod tests {
     );
     assert_eq!(guarded.status(), Ok(()));
     let costs = guarded.pixel_costs;
-    for (kind, expected_draws) in [
-      (
-        GradientKind::Linear {
-          sx: 0.0,
-          sy: 0.0,
-          dx: 1.0,
-          dy: 1.0,
-          inv_len_sq: 0.5,
-        },
-        2048,
-      ),
-      (GradientKind::Radial { sx: 0.0, sy: 0.0, inv_r: 1.0 }, 1024),
-      (
-        GradientKind::Focal {
-          fx: 0.0,
-          fy: 0.0,
-          dx: 1.0,
-          dy: 0.0,
-          a: 1.0,
-          r: 1.0,
-        },
-        512,
-      ),
+    let expected_draws = Limits::default().max_render_pixels / (64 * 64);
+    for kind in [
+      GradientKind::Linear {
+        sx: 0.0,
+        sy: 0.0,
+        dx: 1.0,
+        dy: 1.0,
+        inv_len_sq: 0.5,
+      },
+      GradientKind::Radial { sx: 0.0, sy: 0.0, inv_r: 1.0 },
+      GradientKind::Focal {
+        fx: 0.0,
+        fy: 0.0,
+        dx: 1.0,
+        dy: 0.0,
+        a: 1.0,
+        r: 1.0,
+      },
     ] {
       let gradient = GradientPaint {
         rule: Rule::NonZero,
@@ -524,7 +514,7 @@ mod tests {
       for _ in 0..=expected_draws {
         guarded.draw(Geometry::new(&[], 1), Paint::Gradient(&gradient));
       }
-      assert_eq!(guarded.status(), Err(Error::LimitExceeded(Limit::RenderWork)));
+      assert_eq!(guarded.status(), Err(Error::LimitExceeded(Limit::RenderPixels)));
       assert_eq!(sink.draws, expected_draws);
     }
   }
@@ -537,7 +527,6 @@ pub(crate) fn parent_matrix(layers: &[crate::model::Layer], layer: &crate::model
   let mut depth = 0usize;
   let mut parent = layer.parent;
   while let Some(index) = parent {
-    budget.work(layers.len())?;
     let Some(layer) = layers.iter().find(|layer| layer.index == index) else { break };
     let Some(slot) = chain.get_mut(depth) else {
       return Err(Error::LimitExceeded(Limit::ParentChainDepth));
@@ -563,11 +552,14 @@ pub(crate) fn validate_model(comp: &crate::Composition) -> Result<()> {
     return Err(Error::LimitExceeded(Limit::Assets));
   }
   let (focal, strokes) = crate::parse::expanded_gradient_paints(comp)?;
-  if focal > limits.max_focal_radial_gradient_expansion || strokes > limits.max_expanded_gradient_strokes {
-    return Err(Error::LimitExceeded(Limit::RenderWork));
+  if focal > limits.max_focal_radial_gradient_expansion {
+    return Err(Error::LimitExceeded(Limit::FocalRadialGradientExpansion));
+  }
+  if strokes > limits.max_expanded_gradient_strokes {
+    return Err(Error::LimitExceeded(Limit::ExpandedGradientStrokes));
   }
   fn layers(comp: &crate::Composition, items: &[crate::model::Layer], resources: &Budget, depth: usize) -> Result<()> {
-    if depth > 16 {
+    if depth > crate::renderer::cpu::executor::MAX_PRECOMP_DEPTH {
       return Err(Error::LimitExceeded(Limit::NestingDepth));
     }
     resources.layers(items.len())?;
@@ -586,9 +578,7 @@ pub(crate) fn validate_model(comp: &crate::Composition) -> Result<()> {
         resources.property(&mask.opacity)?;
       }
       if layer.kind == crate::model::LayerKind::Precomp {
-        // Charge the bytes the id scan compares, not just the asset count.
-        resources.work(comp.assets.len().saturating_mul(layer.ref_id.as_deref().map_or(0, str::len).saturating_add(1)))?;
-        if let Some(asset) = layer.ref_id.as_deref().and_then(|id| comp.assets.iter().find(|asset| asset.id == id)) {
+        if let Some(asset) = layer.asset_index.and_then(|index| comp.assets.get(index)) {
           layers(comp, &asset.layers, resources, depth + 1)?;
         }
       }

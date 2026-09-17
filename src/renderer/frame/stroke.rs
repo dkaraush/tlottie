@@ -145,7 +145,6 @@ pub(crate) fn stroke_outline(
   let n = pts.len();
   let seg_count = if closed { n } else { n.saturating_sub(1) };
   segments.clear();
-  budget.work(seg_count)?;
   segments.try_reserve(seg_count).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
   out.try_reserve(2).map_err(|_| Error::LimitExceeded(Limit::RenderMemory))?;
   let mut dropped_gap = false;

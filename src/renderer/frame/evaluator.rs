@@ -166,10 +166,6 @@ impl ShapeWalker<'_> {
 
   pub(crate) fn materialize(&mut self, pj: &PendingJob, arena: &[(Contour, bool)], retained: &impl Fn(u128) -> bool) -> Result<DrawJob> {
     let slice = arena.get(pj.start..pj.end.min(arena.len())).unwrap_or(&[]);
-    self.scratch.budget.work(slice.len())?;
-    for (c, _) in slice {
-      self.scratch.budget.work(c.points.len())?;
-    }
     Ok(match &pj.paint {
       PendingPaint::Solid { rule, color, opacity } => {
         let key = self.fill_key(slice, *rule);
@@ -347,7 +343,6 @@ impl ShapeWalker<'_> {
     }
     let scope_start = arena.len();
     let jobs_start = pending.len();
-    self.scratch.budget.work(shapes.len())?;
     for shape in shapes {
       if pending.len() >= crate::Limits::default().max_paints_per_layer || arena.len() >= crate::Limits::default().max_shapes_per_layer {
         return Err(crate::Error::LimitExceeded(crate::Limit::RenderGeometry));
@@ -446,7 +441,6 @@ impl ShapeWalker<'_> {
           // 10k-contour scope × 64 copies balloon the arena to tens of MB
           // before the next check fires.
           self.scratch.budget.points(base_contours.saturating_mul(copies).saturating_mul(8))?;
-          self.scratch.budget.work(pending.len().saturating_add(arena.len()).saturating_mul(copies))?;
           if pending.len().saturating_mul(copies.saturating_add(1)) > crate::Limits::default().max_paints_per_layer {
             return Err(crate::Error::LimitExceeded(crate::Limit::PaintsPerLayer));
           }
@@ -725,7 +719,6 @@ impl ShapeWalker<'_> {
       return Ok(()); // full path
     }
     let points = arena.iter().skip(scope_start).fold(0usize, |n, (c, _)| n.saturating_add(c.points.len()));
-    self.scratch.budget.work(points.saturating_mul(4))?;
     self.scratch.budget.points(points.saturating_mul(2).saturating_add(arena.len().saturating_mul(4)))?;
     let s = start_pct + offset;
     let e = end_pct + offset;
@@ -791,7 +784,7 @@ impl ShapeWalker<'_> {
               }
             }
           }
-          i = splice_trimmed(arena, pending, i, pieces, &self.scratch.budget)?;
+          i = splice_trimmed(arena, pending, i, pieces);
         }
       }
       TrimMode::Individual => {
@@ -830,7 +823,7 @@ impl ShapeWalker<'_> {
           }
           acc += total;
           ti += 1;
-          i = splice_trimmed(arena, pending, i, pieces, &self.scratch.budget)?;
+          i = splice_trimmed(arena, pending, i, pieces);
         }
       }
     }
@@ -1039,16 +1032,7 @@ impl ShapeWalker<'_> {
 /// inside every paint range that covered the original contour; recorded
 /// job indices past the insertion point are shifted to compensate.
 /// Returns the index of the next original entry.
-fn splice_trimmed(
-  arena: &mut Vec<(Contour, bool)>,
-  pending: &mut Vec<PendingJob>,
-  idx: usize,
-  mut pieces: Vec<(Vec<Vec2>, Vec<bool>)>,
-  budget: &crate::renderer::frame::budget::Budget,
-) -> Result<usize> {
-  if pieces.len() > 1 {
-    budget.work(arena.len().saturating_add(pending.len()))?;
-  }
+fn splice_trimmed(arena: &mut Vec<(Contour, bool)>, pending: &mut Vec<PendingJob>, idx: usize, mut pieces: Vec<(Vec<Vec2>, Vec<bool>)>) -> usize {
   let (first, first_anchors) = if pieces.is_empty() { (Vec::new(), Vec::new()) } else { pieces.remove(0) };
   if let Some((contour, closed)) = arena.get_mut(idx) {
     contour.points = first;
@@ -1080,7 +1064,7 @@ fn splice_trimmed(
       }
     }
   }
-  Ok(idx + 1 + extra)
+  idx + 1 + extra
 }
 
 /// Clones a pending paint with opacity scaled (repeater copies).

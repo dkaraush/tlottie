@@ -96,7 +96,7 @@ const engines = [
 
 // Cap the render target: huge comps would otherwise chew CPU for pixels
 // the <canvas> just scales down anyway.
-const MAX_DIM = 1024;
+const MAX_DIM = 2000;
 const WINDOW = 360;  // rolling-average window, in draws
 
 let raf = 0;

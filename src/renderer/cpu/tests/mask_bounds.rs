@@ -52,6 +52,7 @@ fn layer_with_masks(masks: Vec<Mask>) -> Layer {
     transform: Transform::identity(),
     shapes: Vec::new(),
     ref_id: None,
+    asset_index: None,
     precomp_size: None,
     masks,
     matte: None,

@@ -9,6 +9,56 @@ use alloc::vec::Vec;
 use super::executor::{apply_matte, mode_s_wins, modulate, Canvas, CovCache, DirtyBox, GradientMap, GradientMapKind, RowBounds};
 use super::CPURenderer;
 
+/// A fixed solid source-over maps each destination byte monotonically back
+/// into 0..=255. Repetition reaches a fixed point after at most 255 changes;
+/// subsequent identical draws cannot change any pixel, including AA edges.
+/// Keep this local to the CPU's integer blend implementation.
+#[derive(Default)]
+pub(super) struct SolidRepeat {
+  previous: Option<(u128, Rule, [u32; 7])>,
+  draws: u8,
+}
+
+impl SolidRepeat {
+  fn skip(&mut self, geometry: &Geometry<'_>, paint: Paint<'_>, retained: bool) -> bool {
+    let Paint::Solid(solid) = paint else {
+      *self = Self::default();
+      return false;
+    };
+    // A large coverage plane may not fit the cache. Fresh contours describe
+    // the same operation too; a missing plane with no contours does not.
+    if !retained && geometry.is_empty() {
+      *self = Self::default();
+      return false;
+    }
+    let translation = geometry.raw_translation();
+    let color = solid.color;
+    let signature = (
+      geometry.cache_key,
+      solid.rule,
+      [
+        color.r.to_bits(),
+        color.g.to_bits(),
+        color.b.to_bits(),
+        color.a.to_bits(),
+        solid.opacity.to_bits(),
+        translation.x.to_bits(),
+        translation.y.to_bits(),
+      ],
+    );
+    if self.previous.as_ref() != Some(&signature) {
+      self.previous = Some(signature);
+      self.draws = 1;
+      return false;
+    }
+    if self.draws == u8::MAX {
+      return true;
+    }
+    self.draws += 1;
+    false
+  }
+}
+
 struct BitmapReset<'a>(&'a mut CPURenderer);
 
 impl Drop for BitmapReset<'_> {
@@ -60,6 +110,7 @@ impl CPURenderer {
     // empty-target fast paths use the same source-over compositors as
     // layers, masks, and mattes.
     self.bitmap_dirty = !options.clear;
+    self.solid_repeat = Default::default();
     self.state.cov_cache.set_budget_for_canvas(self.width, self.height);
     self.state.cov_cache.frame_tick();
     self.bitmap = Some(core::ptr::NonNull::from(target));
@@ -87,6 +138,9 @@ impl CPURenderer {
     let contours = geometry.raw_contours();
     let translation = geometry.raw_translation();
     let retained = paint_is_retained(&self.state.cov_cache, key, paint, self.alpha_only);
+    if self.solid_repeat.skip(&geometry, paint, retained) {
+      return;
+    }
     let work = (!retained).then(|| (self.state.take_raster(self.width, self.height), self.state.take_cells(self.width, self.height)));
     let scratch = &mut self.state;
     let pixels = match self.surfaces.last_mut() {
@@ -155,6 +209,7 @@ impl CPURenderer {
   }
 
   fn end_layer(&mut self, composite: Composite) {
+    self.solid_repeat = Default::default();
     match composite {
       Composite::Over { opacity } => {
         let Some(source) = self.surfaces.pop() else {
@@ -224,6 +279,7 @@ impl CPURenderer {
   }
 
   fn apply_mask(&mut self, geometry: crate::renderer::frame::Geometry<'_>, mode: u8, inverted: bool, opacity: u8, first: bool, last: bool) {
+    self.solid_repeat = Default::default();
     let len = self.width.saturating_mul(self.height);
     // A single mask needs no accumulator: its final factor is just its
     // coverage (add/intersect/difference) or inverse coverage (subtract),
@@ -567,6 +623,7 @@ fn fill_gradient<const TRACK_ROWS: bool>(
 
 impl FrameRenderer for CPURenderer {
   fn save_layer(&mut self) {
+    self.solid_repeat = Default::default();
     let layer = self.state.take_surface_u32(self.width.saturating_mul(self.height));
     let mut rows = self.row_bounds_pool.pop().unwrap_or_default();
     rows.clear();
@@ -742,3 +799,97 @@ fn gradient_map(paint: &GradientPaint) -> GradientMap {
 #[cfg(test)]
 #[path = "tests/pipeline_equivalence.rs"]
 mod tests;
+
+#[cfg(test)]
+mod solid_repeat_tests {
+  use super::*;
+
+  #[test]
+  fn integer_source_over_reaches_a_fixed_point() {
+    // Exhaust every effective source channel/alpha. The two extreme input
+    // bytes bound every other input under this monotone, nonexpansive map.
+    for alpha in 0..=255u32 {
+      for source in 0..=alpha {
+        let blend = |dst: u32| (source + ((dst * (256 - alpha)) >> 8)).min(255);
+        let (mut lo, mut hi) = (0, 255);
+        for _ in 0..255 {
+          lo = blend(lo);
+          hi = blend(hi);
+        }
+        assert_eq!(blend(lo), lo);
+        assert_eq!(blend(hi), hi);
+        for byte in lo..=hi {
+          assert_eq!(blend(byte), byte);
+        }
+      }
+    }
+    // Also exercise the actual scalar/SIMD dispatch with fractional coverage
+    // and every starting destination byte, including non-premultiplied data.
+    for alpha in [1, 2, 63, 127, 254, 255] {
+      for coverage in [1u8, 2, 63, 127, 254, 255] {
+        let mut pixels: Vec<u32> = (0..=255u32).map(|v| v * 0x01010101).collect();
+        let cov = [coverage; 256];
+        for _ in 0..255 {
+          crate::simd::fill_span_solid(&mut pixels, &cov, 17, 193, 255, alpha, true);
+        }
+        let expected = pixels.clone();
+        crate::simd::fill_span_solid(&mut pixels, &cov, 17, 193, 255, alpha, true);
+        assert_eq!(pixels, expected);
+        crate::simd::fill_span_uniform(&mut pixels, coverage, 17, 193, 255, alpha);
+        assert_eq!(pixels, expected);
+      }
+    }
+  }
+
+  #[test]
+  fn repeated_solids_match_unoptimized_commands_and_reset_at_boundaries() {
+    use crate::geometry::rect_contour;
+    use crate::math::{Color, Mat2x3, Vec2};
+    use crate::renderer::frame::SolidPaint;
+    let comp = crate::Composition::parse(br#"{"w":32,"h":32,"fr":60,"ip":0,"op":2,"layers":[]}"#, &crate::Limits::default()).unwrap();
+    for retain_coverage in [false, true] {
+      let mut actual = [0x80402010; 32 * 32];
+      let mut expected = actual;
+      let contour = rect_contour(Vec2::new(16.25, 15.75), Vec2::new(21.5, 22.5), 0.0, false, &Mat2x3::IDENTITY, 0.125);
+      let contours = [contour];
+      let color = Color { r: 0.2, g: 0.7, b: 0.4, a: 0.3 };
+      for (pixels, optimize) in [(&mut actual, true), (&mut expected, false)] {
+        let mut cpu = CPURenderer::new(comp.clone());
+        cpu
+          .with_bitmap(pixels, 32, 32, crate::RenderOptions { clear: false, ..Default::default() }, |cpu| {
+            for phase in 0..5 {
+              if phase == 1 {
+                FrameRenderer::save_layer(cpu);
+              }
+              if phase == 2 {
+                FrameRenderer::end_layer(cpu, Composite::Over { opacity: 127 });
+              }
+              if phase == 3 {
+                FrameRenderer::apply_mask(cpu, Geometry::translated(&contours, 2, 0.0, 0.0), b'a', false, 127, true, true);
+              }
+              for _ in 0..300 {
+                if !optimize {
+                  cpu.solid_repeat = Default::default();
+                }
+                if !retain_coverage {
+                  cpu.state.cov_cache = Default::default();
+                }
+                cpu.draw(
+                  Geometry::translated(&contours, 1, 0.0, 0.0),
+                  Paint::Solid(SolidPaint {
+                    rule: Rule::NonZero,
+                    rgba: 0,
+                    color,
+                    opacity: if phase == 4 { 0.25 } else { 1.0 },
+                  }),
+                );
+              }
+            }
+            Ok(())
+          })
+          .unwrap();
+      }
+      assert_eq!(actual, expected);
+    }
+  }
+}

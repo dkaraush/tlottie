@@ -21,9 +21,7 @@ struct ParseState {
   saw_animated: Cell<bool>,
   inherited_keyframe_bytes: Cell<usize>,
   allocated_bytes: Cell<usize>,
-  work: Cell<usize>,
   max_bytes: Cell<usize>,
-  max_work: Cell<usize>,
   failed: Cell<Option<Limit>>,
 }
 
@@ -42,7 +40,6 @@ impl<'a> Cursor<'a> {
       max_depth,
       state: Rc::new(ParseState {
         max_bytes: Cell::new(crate::Limits::default().max_parse_bytes),
-        max_work: Cell::new(crate::Limits::default().max_parse_work),
         ..ParseState::default()
       }),
     }
@@ -84,7 +81,6 @@ impl<'a> Cursor<'a> {
 
   pub fn resource_limits(&self, limits: &crate::Limits) {
     self.state.max_bytes.set(limits.max_parse_bytes);
-    self.state.max_work.set(limits.max_parse_work);
   }
 
   pub fn allocate(&self, bytes: usize) -> Result<()> {
@@ -95,17 +91,6 @@ impl<'a> Cursor<'a> {
       return Err(Error::LimitExceeded(Limit::ParseMemory));
     }
     self.state.allocated_bytes.set(used + bytes);
-    Ok(())
-  }
-
-  pub fn work(&self, amount: usize) -> Result<()> {
-    self.status()?;
-    let used = self.state.work.get();
-    if amount > self.state.max_work.get().saturating_sub(used) {
-      self.state.failed.set(Some(Limit::ParseWork));
-      return Err(Error::LimitExceeded(Limit::ParseWork));
-    }
-    self.state.work.set(used + amount);
     Ok(())
   }
 
@@ -185,7 +170,6 @@ impl<'a> Cursor<'a> {
   }
 
   pub fn expect(&mut self, expected: u8) -> Result<()> {
-    self.work(1)?;
     match self.peek() {
       Some(b) if b == expected => {
         self.pos += 1;
@@ -208,7 +192,6 @@ impl<'a> Cursor<'a> {
     loop {
       match self.bump() {
         Some(b'"') => {
-          self.work(self.pos - start)?;
           return self.bytes.get(start..self.pos - 1).ok_or_else(|| self.err(JsonErrorKind::BadString));
         }
         Some(b'\\') => {
@@ -263,7 +246,6 @@ impl<'a> Cursor<'a> {
         return Err(self.err(JsonErrorKind::BadNumber));
       }
     }
-    self.work(self.pos - start)?;
     let token = self.bytes.get(start..self.pos).ok_or_else(|| self.err(JsonErrorKind::BadNumber))?;
     if integer_token {
       let digits = if negative { token.get(1..).unwrap_or(&[]) } else { token };
@@ -305,7 +287,6 @@ impl<'a> Cursor<'a> {
     match self.peek() {
       Some(b'"') => self.read_string_bytes().map(|_| ()),
       Some(b'{' | b'[') => {
-        let start = self.pos;
         let mut depth: usize = 0;
         loop {
           match self.bump() {
@@ -318,7 +299,6 @@ impl<'a> Cursor<'a> {
             Some(b'}' | b']') => {
               depth -= 1;
               if depth == 0 {
-                self.work(self.pos - start)?;
                 return Ok(());
               }
             }

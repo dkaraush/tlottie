@@ -1,9 +1,11 @@
 /// Hard resource limits applied while parsing and rendering.
 ///
-/// Defaults are sized generously against the Telegram fixture corpus
-/// (17.2k real files: p99 input ~748 KB, max ~1.7 MB) while still bounding
-/// hostile input. Authored-data caps leave headroom above observed maxima;
-/// rendering budgets separately bound generated work and scratch storage.
+/// Authored-data and geometry defaults retain at least five times the measured
+/// fixture-corpus maxima. Canvas storage uses four times the measured peak at
+/// each output size, scaling with area. See `benchmarks/limits-corpus.md` and
+/// `benchmarks/limits-2000.md` for measurements and limits with no observed usage.
+/// Rendering limits count concrete geometry, pixel visits and storage;
+/// there is no aggregate CPU work-unit budget.
 /// Every limit maps to an
 /// [`crate::error::Limit`] error —
 /// exceeding one is a clean `Err`, never a crash or an OOM spiral.
@@ -57,8 +59,6 @@ pub struct Limits {
   pub max_fitz_entries: usize,
   /// Maximum cumulative parser allocation capacity, including discarded data.
   pub max_parse_bytes: usize,
-  /// Maximum cumulative token, scan and object decoding work across cursor forks.
-  pub max_parse_work: usize,
   /// Maximum authored gradient strokes after expanding referenced precomps.
   pub max_expanded_gradient_strokes: usize,
   /// Maximum expanded precomp-layer references in the asset graph.
@@ -87,14 +87,12 @@ pub struct Limits {
   pub max_render_points: usize,
   /// Maximum cumulative dash output allocation estimate per frame, in bytes.
   pub max_render_dash_bytes: usize,
-  /// Maximum geometry/raster work units charged per frame.
-  pub max_render_work: usize,
-  /// Maximum weighted pixel visits per frame at 64x64 or smaller.
+  /// Maximum estimated pixel visits per frame at 64x64 or smaller.
   /// Larger outputs scale this allowance proportionally to canvas area.
-  /// Solid fills cost 1 per pixel; linear, radial and focal gradients cost
-  /// 8, 16 and 32 respectively, including cached coverage replay.
+  /// Counts covered pixels equally for every paint, including cached replay.
   pub max_render_pixels: usize,
-  /// Maximum canvas-dependent scratch allocation estimate, in bytes.
+  /// Maximum canvas-dependent scratch allocation estimate at 720x720, in bytes.
+  /// Other output sizes scale this allowance proportionally to canvas area.
   pub max_render_bytes: usize,
 }
 
@@ -102,47 +100,45 @@ impl Default for Limits {
   fn default() -> Self {
     Self {
       max_input_bytes: 16 << 20, // 16 MiB
-      max_nesting_depth: 128,
-      max_layers: 2304,
-      max_shapes_per_layer: 10_000,
-      max_paints_per_layer: 2560,
-      max_paint_source_items_per_layer: 4096,
-      max_focal_radial_gradients_per_layer: 160,
-      max_focal_radial_gradient_expansion: 256,
-      max_painted_shape_layers: 2048,
+      max_nesting_depth: 175,
+      max_layers: 2_720,
+      max_shapes_per_layer: 20_480,
+      max_paints_per_layer: 5_120,
+      max_paint_source_items_per_layer: 5_120,
+      max_focal_radial_gradients_per_layer: 175,
+      max_focal_radial_gradient_expansion: 850,
+      max_painted_shape_layers: 2_715,
       max_solid_layers: 256,
       max_keyframes: 2048,
       max_inherited_keyframe_bytes: 8 << 20,
-      max_path_points: 4096,
-      max_path_coordinate_abs: 140_000.0,
+      max_path_points: 4_355,
+      max_path_coordinate_abs: 165_389.0,
       max_masks_per_layer: 16,
       max_masks: 256,
       max_mask_path_points: 128,
       max_dash_elements: 32,
       max_dashed_strokes_per_group: 128,
-      max_gradient_strokes_per_group: 24,
-      max_dashed_path_segment_span: 5000.0,
-      max_gradient_stop_values: 1024,
-      max_fitz_entries: 16,
-      max_parse_bytes: 13_031_466,
-      max_parse_work: 8_533_990,
-      max_expanded_gradient_strokes: 840,
-      max_precomp_expansion: 6144,
+      max_gradient_strokes_per_group: 45,
+      max_dashed_path_segment_span: 10_110.0,
+      max_gradient_stop_values: 1_860,
+      max_fitz_entries: 20,
+      max_parse_bytes: 43_681_460,
+      max_expanded_gradient_strokes: 6_645,
+      max_precomp_expansion: 18_005,
       max_parent_chain_depth: 128,
       max_parent_chain_total_depth: 16_384,
       max_polystar_points: 128.0,
       max_repeater_copies: 64.0,
       max_round_corners_per_layer: 8,
-      max_trims_per_layer: 320,
-      max_dashed_piece_estimate_per_group: 2048,
+      max_trims_per_layer: 360,
+      max_dashed_piece_estimate_per_group: 6_105,
       max_repeater_product_per_group: 4096,
       max_assets: 256,
       max_dimension: 8192,
-      max_render_points: 1_048_576,
-      max_render_dash_bytes: 6_330_240,
-      max_render_work: 4_194_304,
+      max_render_points: 3_620_695,
+      max_render_dash_bytes: 15_825_600,
       max_render_pixels: 64 * 1024 * 1024,
-      max_render_bytes: 36 * 1024 * 1024,
+      max_render_bytes: 116_121_600, // 4x measured 720px peak; scales with output area.
     }
   }
 }

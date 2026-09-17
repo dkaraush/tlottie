@@ -25,11 +25,11 @@ use crate::stroke::{stroke_polyline, StrokeSegment};
 use alloc::vec::Vec;
 
 /// Maximum group recursion while rendering (matches parse-side bound).
-const MAX_RENDER_DEPTH: usize = 40;
+const MAX_RENDER_DEPTH: usize = crate::composition::parse::MAX_GROUP_DEPTH;
 /// Gradient LUT resolution; rlottie uses a 1024-entry table
 /// (VGradient::colorTableSize) — 256 visibly quantizes steep ramps.
 /// Maximum precomp nesting during render.
-pub(crate) const MAX_PRECOMP_DEPTH: usize = 16;
+pub(crate) const MAX_PRECOMP_DEPTH: usize = 25;
 
 /// Reusable render-time buffers: rasterizer accumulators, offscreen pixel
 /// planes, mask planes, gradient LUT memos. Owned by [`crate::CPURenderer`]
@@ -323,8 +323,6 @@ impl RenderScratch {
     if let Some(lut) = self.lut_cache.get(self.lut_key.as_slice()) {
       return Ok((lut.clone(), id));
     }
-    // Each LUT sample can scan the color and opacity stops on a cache miss.
-    self.budget.work(GRADIENT_LUT_SIZE.saturating_mul(stops.0.len().saturating_add(1)))?;
     let lut = build_gradient_lut(stops, color_count, opacity);
     if self.lut_cache.len() >= LUT_CACHE_CAP {
       self.lut_cache.clear();
@@ -441,14 +439,8 @@ impl RenderCtx<'_> {
       // applied. Folding opacity into every paint would compound it where
       // fills and strokes overlap.
       let translucent_shape = k < 255 && layer.kind == LayerKind::Shape && shapes_have_multiple_paints(&layer.shapes);
-      let complex_precomp = layer_opacity < 0.999
-        && matches!(layer.kind, LayerKind::Precomp)
-        && layer
-          .ref_id
-          .as_deref()
-          .and_then(|id| self.comp.assets.iter().find(|a| a.id == id))
-          .map(|a| a.layers.len() > 1)
-          .unwrap_or(false);
+      let complex_precomp =
+        layer_opacity < 0.999 && matches!(layer.kind, LayerKind::Precomp) && layer.asset_index.and_then(|index| self.comp.assets.get(index)).map(|a| a.layers.len() > 1).unwrap_or(false);
       let needs_offscreen = !layer.masks.is_empty() || layer.matte.is_some() || translucent_shape || complex_precomp;
       if !needs_offscreen {
         self.draw_layer_content(scratch, canvas, layer, m, frame, combined_opacity, clip, precomp_depth)?;
@@ -638,10 +630,7 @@ impl RenderCtx<'_> {
         }
       }
       LayerKind::Precomp => {
-        let Some(ref_id) = layer.ref_id.as_deref() else {
-          return Ok(());
-        };
-        let Some(asset) = self.comp.assets.iter().find(|a| a.id == ref_id) else {
+        let Some(asset) = layer.asset_index.and_then(|index| self.comp.assets.get(index)) else {
           return Ok(());
         };
         let mut child_clip: ClipQuad = clip.clone();

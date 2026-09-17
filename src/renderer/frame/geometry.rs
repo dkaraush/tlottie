@@ -340,7 +340,6 @@ pub(crate) fn clip_to_quad(c: &Contour, quad: &[Vec2; 4], budget: &crate::render
       let t = (ex * (a.y - p.y) - ey * (a.x - p.x)) / denom;
       Vec2::new(p.x + dpx * t.clamp(0.0, 1.0), p.y + dpy * t.clamp(0.0, 1.0))
     };
-    budget.work(pts.len())?;
     if pts.iter().all(&inside) {
       continue;
     }
@@ -407,7 +406,6 @@ pub(crate) fn clip_contour(c: &Contour, w: f32, h: f32, budget: &crate::renderer
         Vec2::new(a.x + (b.x - a.x) * t, bound_x)
       }
     };
-    budget.work(pts.len())?;
     if pts.iter().all(&inside) {
       continue;
     }
@@ -683,7 +681,6 @@ pub(crate) fn dash_polyline_bounded<'a>(
   offset: f32,
   budget: &'a crate::renderer::frame::budget::Budget,
 ) -> crate::Result<Vec<(Vec<Vec2>, Vec<bool>)>> {
-  budget.work(points.len())?;
   budget.points(points.len())?;
   let mut d = VDasher::new(points, anchors, closed, pattern, offset);
   d.budget = Some(budget);
@@ -933,15 +930,13 @@ impl<'a> VDasher<'a> {
     } else {
       // A complete pattern cycle consumes cycle_length. Allow an initial
       // partial cycle and a factor of two for f32 subtraction rounding. The
-      // work cap keeps the cycle/phase count below the precision at which a
-      // whole cycle could stop making progress. Charge all scans and splits
-      // here, before entering the dash loop (including discarded gaps).
+      // generated-point cap bounds the possible splits before entering the
+      // dash loop, including discarded gaps.
       #[cfg(feature = "cpu")]
       if let Some(budget) = self.budget {
         let cycles = ((2.0 * elem_len as f64 / self.cycle_length).ceil() as usize).saturating_add(1);
         let iterations = cycles.saturating_mul(2 * self.pairs.len());
-        let work = iterations.saturating_mul(verts.len().saturating_add(2 * self.pairs.len() + 2));
-        if let Err(error) = budget.work(work).and_then(|()| budget.points(iterations.saturating_mul(4))) {
+        if let Err(error) = budget.points(iterations.saturating_mul(4)) {
           self.error = Some(error);
           return;
         }

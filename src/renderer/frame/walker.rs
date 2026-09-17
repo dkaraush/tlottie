@@ -555,15 +555,7 @@ impl RenderCtx<'_> {
         continue;
       }
       let complex_precomp = if layer.kind == LayerKind::Precomp {
-        // Same full-id scan as the expansion path below, and it runs for every
-        // layer of every frame; charge the bytes it compares.
-        match layer.ref_id.as_deref() {
-          Some(ref_id) => {
-            scratch.budget.work(self.comp.assets.len().saturating_mul(ref_id.len().saturating_add(1)))?;
-            self.comp.assets.iter().find(|asset| asset.id == ref_id).is_some_and(|asset| asset.layers.len() > 1)
-          }
-          None => false,
-        }
+        layer.asset_index.and_then(|index| self.comp.assets.get(index)).is_some_and(|asset| asset.layers.len() > 1)
       } else {
         false
       };
@@ -754,16 +746,7 @@ impl RenderCtx<'_> {
         }
       }
       LayerKind::Precomp => {
-        let Some(ref_id) = layer.ref_id.as_deref() else {
-          return Ok(());
-        };
-        // `String == String` compares the full id whenever the lengths match,
-        // so scanning N assets costs N * |ref_id| bytes, not N. Charging the
-        // count alone let 256 equal-length ids sharing a long prefix turn one
-        // lookup into megabytes of memcmp, repeated for every expanded precomp
-        // layer. Corpus maximum: 20 assets x 9-byte ids = 180 per lookup.
-        scratch.budget.work(self.comp.assets.len().saturating_mul(ref_id.len().saturating_add(1)))?;
-        let Some(asset) = self.comp.assets.iter().find(|a| a.id == ref_id) else {
+        let Some(asset) = layer.asset_index.and_then(|index| self.comp.assets.get(index)) else {
           return Ok(());
         };
         let mut child_clip: ClipQuad = clip.clone();

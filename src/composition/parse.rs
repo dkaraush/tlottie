@@ -58,7 +58,7 @@ pub(crate) fn with_limits_check<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
 }
 
 /// Maximum nesting of `gr` shape groups (separate from raw JSON depth).
-pub(crate) const MAX_GROUP_DEPTH: usize = 32;
+pub(crate) const MAX_GROUP_DEPTH: usize = 65;
 
 // ---------------------------------------------------------------------------
 // Object / array walking helpers
@@ -319,7 +319,6 @@ fn parse_path_value(c: &mut Cursor<'_>, limits: &Limits) -> Result<PathData> {
 }
 
 fn parse_path_object(c: &mut Cursor<'_>, limits: &Limits) -> Result<PathData> {
-  c.work(core::mem::size_of::<PathData>())?;
   let mut data = PathData::default();
   parse_object_once!(c, |c, key| {
     b"v" => { data.vertices = parse_vec2_list(c, limits)?; },
@@ -454,7 +453,6 @@ fn timeline_is_constant<T: PartialEq>(first: &Keyframe<T>, rest: &[Keyframe<T>])
 }
 
 fn parse_one_keyframe<T: Lerp, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(c: &mut Cursor<'_>, parse_val: F) -> Result<RawKeyframe<T>> {
-  c.work(core::mem::size_of::<RawKeyframe<T>>())?;
   let mut t = 0.0f32;
   let mut value: Option<T> = None;
   let mut end: Option<T> = None;
@@ -1024,7 +1022,6 @@ fn path_span_metrics(shape: &Shape) -> (f32, f32) {
 }
 
 fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
-  c.work(core::mem::size_of::<Shape>())?;
   let mut ty: Option<[u8; 2]> = None;
   let mut hidden = false;
   let mut it_pos: Option<usize> = None;
@@ -1040,6 +1037,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
   let mut e_pos: Option<usize> = None;
   let mut g_pos: Option<usize> = None;
   let mut d_pos: Option<usize> = None;
+  let mut direction_after_type = false;
   let mut pt_pos: Option<usize> = None;
   let mut ir_pos: Option<usize> = None;
   let mut or_pos: Option<usize> = None;
@@ -1141,6 +1139,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
       c.skip_value()?;
     }
     b"d" => {
+      direction_after_type = ty.is_some();
       d_pos = Some(c.pos());
       c.skip_value()?;
     }
@@ -1208,10 +1207,10 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
       None => Ok(Property::Static(default)),
     }
   };
-  // Path direction on primitives: `d` == 3 reverses the winding. rlottie
-  // supports this too, but accidentally ignores `d` if it appears before
-  // `ty`; honor the authored field order-independently.
-  let direction_reversed = |c: &Cursor<'_>, pos: Option<usize>| -> bool { pos.is_some_and(|p| parse_f32(&mut c.fork_at(p)).unwrap_or(1.0) == 3.0) };
+  // Match rlottie_2019's primitive direction dispatch: it only reads `d`
+  // after `ty`. Some Telegram patterns rely on the resulting winding to
+  // cut holes in a non-zero fill. Dash arrays keep their independent d_pos.
+  let direction_reversed = |c: &Cursor<'_>, pos: Option<usize>| -> bool { direction_after_type && pos.is_some_and(|p| parse_f32(&mut c.fork_at(p)).unwrap_or(1.0) == 3.0) };
 
   match &ty {
     b"gr" => Ok(it_pos.map_or(ParsedItem::Ignored, |pos| ParsedItem::Group { pos, inline: inline_group })),
@@ -1537,7 +1536,6 @@ fn parse_layer(
   total_painted_shape_layers: &mut usize,
   total_solid_layers: &mut usize,
 ) -> Result<Layer> {
-  c.work(core::mem::size_of::<Layer>())?;
   let mut ty = 255u8;
   let mut index = 0i32;
   let mut parent: Option<i32> = None;
@@ -1564,7 +1562,7 @@ fn parse_layer(
   let mut auto_orient = false;
   // A layer with no `nm` behaves like the empty name, so an (empty) prefix
   // matching "" already decides the override before the object is walked.
-  let mut color_override = match_layer_color(c, b"", replacements)?;
+  let mut color_override = match_layer_color(b"", replacements);
 
   parse_object_once!(c, |c, key| {
       b"ty" => {
@@ -1572,7 +1570,7 @@ fn parse_layer(
       }
       b"nm" => {
         let raw = c.read_string_bytes()?;
-        color_override = match_layer_color(c, raw, replacements)?;
+        color_override = match_layer_color(raw, replacements);
       }
       b"ind" => {
         index = parse_f32(c)? as i32;
@@ -1729,6 +1727,7 @@ fn parse_layer(
     transform,
     shapes,
     ref_id,
+    asset_index: None,
     precomp_size,
     masks,
     matte,
@@ -1744,14 +1743,13 @@ fn parse_layer(
 /// Byte-wise `starts_with` is equivalent to the previous `String::from_utf8_lossy`
 /// comparison for every prefix that is itself valid UTF-8 and contains no
 /// U+FFFD, and avoids allocating a `String` per layer.
-fn match_layer_color(c: &Cursor<'_>, raw: &[u8], replacements: &[LayerColorReplacement]) -> Result<Option<Color>> {
+fn match_layer_color(raw: &[u8], replacements: &[LayerColorReplacement]) -> Option<Color> {
   for replacement in replacements {
-    c.work(raw.len().min(replacement.layer_name_prefix.len()).saturating_add(1))?;
     if raw.starts_with(replacement.layer_name_prefix.as_bytes()) {
-      return Ok(Some(argb_color(replacement.color)));
+      return Some(argb_color(replacement.color));
     }
   }
-  Ok(None)
+  None
 }
 
 fn argb_color(argb: u32) -> Color {
@@ -1873,7 +1871,6 @@ fn apply_source_colors(c: &Cursor<'_>, layers: &mut [Layer], assets: &mut [Asset
   if replacements.is_empty() {
     return Ok(());
   }
-  c.work(replacements.len())?;
   let mut lookup = crate::compat::HashMap::new();
   for replacement in replacements {
     insert_color(c, &mut lookup, replacement.source_color & 0x00ff_ffff, replacement.target_color)?;
@@ -1915,7 +1912,6 @@ fn apply_fitz_layers(layers: &mut [Layer], entries: &crate::compat::HashMap<u32,
 }
 
 fn apply_fitz(c: &Cursor<'_>, layers: &mut [Layer], assets: &mut [Asset], entries: &[FitzEntry], index: usize) -> Result<()> {
-  c.work(entries.len())?;
   let mut lookup = crate::compat::HashMap::new();
   for entry in entries {
     insert_color(c, &mut lookup, entry.original, entry.replacements.get(index).copied().unwrap_or(0))?;
@@ -1997,6 +1993,25 @@ pub(crate) fn expanded_gradient_paints(comp: &Composition) -> Result<(usize, usi
   let mut visiting = vec![false; comp.assets.len()];
   let cost = layer_list_expansion(&comp.layers, &comp.assets, &asset_by_id, &mut memo, &mut visiting, &limits)?;
   Ok((cost.focal_radial_gradients, cost.gradient_strokes))
+}
+
+// Keep authored IDs for validation, but never scan or hash them during a
+// frame. Resolve missing IDs too, and preserve the old first-match behavior
+// for duplicate asset IDs. Indices remain valid when Composition is cloned.
+fn resolve_asset_references(layers: &mut [Layer], assets: &mut [Asset]) {
+  let mut by_id = crate::compat::HashMap::new();
+  for (index, asset) in assets.iter().enumerate() {
+    by_id.entry(asset.id.as_str()).or_insert(index);
+  }
+  let indices: Vec<Option<usize>> = layers
+    .iter()
+    .chain(assets.iter().flat_map(|asset| &asset.layers))
+    .map(|layer| layer.ref_id.as_deref().and_then(|id| by_id.get(id).copied()))
+    .collect();
+  drop(by_id);
+  for (layer, index) in layers.iter_mut().chain(assets.iter_mut().flat_map(|asset| &mut asset.layers)).zip(indices) {
+    layer.asset_index = index;
+  }
 }
 
 fn validate_precomp_expansion(layers: &[Layer], assets: &[Asset], limits: &Limits) -> Result<()> {
@@ -2267,7 +2282,6 @@ fn parse_asset(
   total_painted_shape_layers: &mut usize,
   total_solid_layers: &mut usize,
 ) -> Result<Option<Asset>> {
-  c.work(core::mem::size_of::<Asset>())?;
   let mut id = String::new();
   let mut layers = Vec::new();
   let mut has_layers = false;
@@ -2368,6 +2382,7 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
   if !out_point.is_finite() || !in_point.is_finite() || out_point <= in_point {
     return Err(missing("out point must be greater than in point"));
   }
+  resolve_asset_references(&mut layers, &mut assets);
   validate_precomp_expansion(&layers, &assets, limits)?;
 
   // Static detection piggybacks on parsing: every deferred cursor shares the

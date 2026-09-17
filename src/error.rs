@@ -50,8 +50,8 @@ pub enum JsonErrorKind {
 pub enum Limit {
   /// Generated geometry or raster storage exceeds the per-frame budget.
   RenderGeometry,
-  /// Cumulative evaluation, rasterization or pixel work exceeds the frame budget.
-  RenderWork,
+  /// Estimated pixel visits exceed the per-frame allowance.
+  RenderPixels,
   /// Render surface and scratch storage exceeds the memory budget.
   RenderMemory,
   /// Input larger than [`crate::Limits::max_input_bytes`].
@@ -80,8 +80,6 @@ pub enum Limit {
   InheritedKeyframeBytes,
   /// Cumulative parser allocations exceed the configured limit.
   ParseMemory,
-  /// Cumulative parser token/scan work exceeds the configured limit.
-  ParseWork,
   /// More points in one path than [`crate::Limits::max_path_points`].
   PathPoints,
   /// A path coordinate exceeded [`crate::Limits::max_path_coordinate_abs`].
@@ -104,6 +102,8 @@ pub enum Limit {
   GradientStopValues,
   /// More Fitzpatrick metadata entries than [`crate::Limits::max_fitz_entries`].
   FitzEntries,
+  /// Gradient strokes exceed [`crate::Limits::max_expanded_gradient_strokes`] after precomp expansion.
+  ExpandedGradientStrokes,
   /// Precomp references expand beyond [`crate::Limits::max_precomp_expansion`].
   PrecompExpansion,
   /// Parent chain deeper than [`crate::Limits::max_parent_chain_depth`].
