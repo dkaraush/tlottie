@@ -15,6 +15,9 @@
 // Unit tests always use the standard test harness even when exercising the
 // opt-in no_std feature set. Production no_std artifacts stay genuinely so.
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
+// `core::arch::loongarch64` is still unstable (`stdarch_loongarch`),
+// so these two feature needs a nightly compiler or use RUSTC_BOOTSTRAP=1.
+#![cfg_attr(all(target_arch = "loongarch64", any(feature = "lsx", feature = "lasx")), feature(stdarch_loongarch))]
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 

@@ -21,6 +21,8 @@ std = []
 cli = ["cpu", "std"]
 c-api = ["cpu"]
 wasm = ["cpu"]
+lsx = []
+lasx = []
 
 [dependencies]
 hashbrown = { version = "0.15", default-features = false, features = ["default-hasher", "inline-more"], optional = true }
