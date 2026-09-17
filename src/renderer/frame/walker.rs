@@ -555,11 +555,7 @@ impl RenderCtx<'_> {
         continue;
       }
       let complex_precomp = if layer.kind == LayerKind::Precomp {
-        layer
-          .ref_id
-          .as_deref()
-          .and_then(|ref_id| self.comp.assets.iter().find(|asset| asset.id == ref_id))
-          .is_some_and(|asset| asset.layers.len() > 1)
+        layer.asset_index.and_then(|index| self.comp.assets.get(index)).is_some_and(|asset| asset.layers.len() > 1)
       } else {
         false
       };
@@ -750,11 +746,7 @@ impl RenderCtx<'_> {
         }
       }
       LayerKind::Precomp => {
-        let Some(ref_id) = layer.ref_id.as_deref() else {
-          return Ok(());
-        };
-        scratch.budget.work(self.comp.assets.len())?;
-        let Some(asset) = self.comp.assets.iter().find(|a| a.id == ref_id) else {
+        let Some(asset) = layer.asset_index.and_then(|index| self.comp.assets.get(index)) else {
           return Ok(());
         };
         let mut child_clip: ClipQuad = clip.clone();

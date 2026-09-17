@@ -21,7 +21,6 @@ use crate::model::{
 };
 use crate::property::{Easing, Keyframe, Lerp, Property, Timeline};
 use crate::stroke::{Cap, Join};
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -59,7 +58,7 @@ pub(crate) fn with_limits_check<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
 }
 
 /// Maximum nesting of `gr` shape groups (separate from raw JSON depth).
-pub(crate) const MAX_GROUP_DEPTH: usize = 32;
+pub(crate) const MAX_GROUP_DEPTH: usize = 65;
 
 // ---------------------------------------------------------------------------
 // Object / array walking helpers
@@ -262,6 +261,7 @@ fn parse_f32_list(c: &mut Cursor<'_>, max_len: usize, limit: Limit) -> Result<Fl
     if limits_check() && out.len() >= max_len {
       return Err(Error::LimitExceeded(limit));
     }
+    c.reserve(&mut out, 1)?;
     out.push(parse_f32(c)?);
     Ok(())
   })?;
@@ -294,6 +294,7 @@ fn parse_vec2_list(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<Vec2>> {
     if limits_check() && (point.x.abs() > limits.max_path_coordinate_abs || point.y.abs() > limits.max_path_coordinate_abs) {
       return Err(Error::LimitExceeded(Limit::PathCoordinate));
     }
+    c.reserve(&mut out, 1)?;
     out.push(point);
     Ok(())
   })?;
@@ -328,6 +329,10 @@ fn parse_path_object(c: &mut Cursor<'_>, limits: &Limits) -> Result<PathData> {
   })?;
   let n = data.vertices.len();
   // Tolerate missing/short tangent arrays by padding with zeros (= corners).
+  let missing_in = n.saturating_sub(data.in_tangents.len());
+  let missing_out = n.saturating_sub(data.out_tangents.len());
+  c.reserve(&mut data.in_tangents, missing_in)?;
+  c.reserve(&mut data.out_tangents, missing_out)?;
   data.in_tangents.resize(n, Vec2::ZERO);
   data.out_tangents.resize(n, Vec2::ZERO);
   data.in_tangents.truncate(n);
@@ -382,13 +387,17 @@ fn parse_keyframes<T: Lerp + PartialEq, F: Fn(&mut Cursor<'_>) -> Result<T> + Co
     if limits_check() && raw.len() >= limits.max_keyframes {
       return Err(Error::LimitExceeded(Limit::Keyframes));
     }
-    raw.push(parse_one_keyframe(c, parse_val)?);
+    let keyframe = parse_one_keyframe(c, parse_val)?;
+
+    c.reserve(&mut raw, 1)?;
+    raw.push(keyframe);
     Ok(())
   })?;
 
   // Resolve values: a keyframe without `s` (common for the final keyframe)
   // takes the previous keyframe's segment end value.
-  let mut kfs: Vec<Keyframe<T>> = Vec::with_capacity(raw.len());
+  let mut kfs: Vec<Keyframe<T>> = Vec::new();
+  c.reserve(&mut kfs, raw.len())?;
   for rk in raw {
     let value = match rk.value {
       Some(v) => v,
@@ -420,6 +429,7 @@ fn parse_keyframes<T: Lerp + PartialEq, F: Fn(&mut Cursor<'_>) -> Result<T> + Co
     [a, b] => a.t <= b.t,
     _ => true,
   });
+  c.allocate(kfs.len().saturating_mul(core::mem::size_of::<Keyframe<T>>()))?;
   let mut it = kfs.into_iter();
   let first = it.next().ok_or_else(|| invalid(c, "empty keyframe list"))?;
   let rest: Vec<Keyframe<T>> = it.collect();
@@ -465,7 +475,7 @@ fn parse_one_keyframe<T: Lerp, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(c: &m
   let easing = if hold {
     Easing::HOLD
   } else {
-    let [ox, oy, ix, iy] = c.intern_easing([o.0, o.1, i.0, i.1]);
+    let [ox, oy, ix, iy] = c.intern_easing([o.0, o.1, i.0, i.1])?;
     Easing { ox, oy, ix, iy, hold: false }
   };
   let spatial = match (to, ti) {
@@ -614,7 +624,7 @@ impl Default for ShapeList {
 }
 
 impl ShapeList {
-  fn push(&mut self, s: Shape, limits: &Limits, count: &mut ShapeCounts) -> Result<()> {
+  fn push(&mut self, s: Shape, c: &Cursor<'_>, limits: &Limits, count: &mut ShapeCounts) -> Result<()> {
     if is_paint(&s) {
       count.paints += 1;
       if limits_check() && count.paints > limits.max_paints_per_layer {
@@ -679,6 +689,7 @@ impl ShapeList {
     if self.shapes.last().is_some_and(|previous| redundant_opaque_gradient_fill(previous, &s)) {
       return Ok(());
     }
+    c.reserve(&mut self.shapes, 1)?;
     self.shapes.push(s);
     Ok(())
   }
@@ -713,10 +724,10 @@ fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
       let Some((cursor, parent)) = parents.pop() else {
         return Ok((list.shapes, list.transform));
       };
-      let group = Shape::Group(Box::new(Group {
+      let group = Shape::Group(c.alloc_box(Group {
         transform: list.transform.unwrap_or_else(Transform::identity),
         shapes: list.shapes,
-      }));
+      })?);
       if let Some(cursor) = cursor {
         *c = cursor;
       } else {
@@ -740,7 +751,7 @@ fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
         }
       }
       list = parent;
-      list.push(group, limits, count)?;
+      list.push(group, c, limits, count)?;
       continue;
     }
     list.first = false;
@@ -760,12 +771,13 @@ fn parse_shape_list(c: &mut Cursor<'_>, limits: &Limits, depth: usize, count: &m
           let child = c.fork_at(pos);
           Some(core::mem::replace(c, child))
         };
+        c.reserve(&mut parents, 1)?;
         parents.push((parent, list));
         list = ShapeList::default();
         c.skip_ws();
         c.expect(b'[')?;
       }
-      ParsedItem::Shape(s) => list.push(s, limits, count)?,
+      ParsedItem::Shape(s) => list.push(s, c, limits, count)?,
       ParsedItem::GroupTransform(t) => list.transform = Some(t),
       ParsedItem::Ignored => {}
     }
@@ -1010,7 +1022,6 @@ fn path_span_metrics(shape: &Shape) -> (f32, f32) {
 }
 
 fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
-  // Record positions of every field we might need, dispatch after `ty` is known.
   let mut ty: Option<[u8; 2]> = None;
   let mut hidden = false;
   let mut it_pos: Option<usize> = None;
@@ -1026,6 +1037,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
   let mut e_pos: Option<usize> = None;
   let mut g_pos: Option<usize> = None;
   let mut d_pos: Option<usize> = None;
+  let mut direction_after_type = false;
   let mut pt_pos: Option<usize> = None;
   let mut ir_pos: Option<usize> = None;
   let mut or_pos: Option<usize> = None;
@@ -1127,6 +1139,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
       c.skip_value()?;
     }
     b"d" => {
+      direction_after_type = ty.is_some();
       d_pos = Some(c.pos());
       c.skip_value()?;
     }
@@ -1194,10 +1207,10 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
       None => Ok(Property::Static(default)),
     }
   };
-  // Path direction on primitives: `d` == 3 reverses the winding. rlottie
-  // supports this too, but accidentally ignores `d` if it appears before
-  // `ty`; honor the authored field order-independently.
-  let direction_reversed = |c: &Cursor<'_>, pos: Option<usize>| -> bool { pos.is_some_and(|p| parse_f32(&mut c.fork_at(p)).unwrap_or(1.0) == 3.0) };
+  // Match rlottie_2019's primitive direction dispatch: it only reads `d`
+  // after `ty`. Some Telegram patterns rely on the resulting winding to
+  // cut holes in a non-zero fill. Dash arrays keep their independent d_pos.
+  let direction_reversed = |c: &Cursor<'_>, pos: Option<usize>| -> bool { direction_after_type && pos.is_some_and(|p| parse_f32(&mut c.fork_at(p)).unwrap_or(1.0) == 3.0) };
 
   match &ty {
     b"gr" => Ok(it_pos.map_or(ParsedItem::Ignored, |pos| ParsedItem::Group { pos, inline: inline_group })),
@@ -1292,7 +1305,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
         Some(pos) => parse_dashes(&mut c.fork_at(pos), limits)?,
         None => Vec::new(),
       };
-      Ok(ParsedItem::Shape(Shape::Stroke(Box::new(Stroke {
+      Ok(ParsedItem::Shape(Shape::Stroke(c.alloc_box(Stroke {
         color,
         opacity,
         width,
@@ -1300,7 +1313,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
         join,
         miter_limit,
         dashes,
-      }))))
+      })?)))
     }
     b"gf" => {
       let s_pos_ = s_pos.ok_or(Error::InvalidLottie {
@@ -1332,7 +1345,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
       let kind = if grad_type as i64 == 2 { GradientKind::Radial } else { GradientKind::Linear };
       let highlight_len = prop_scalar(c, h_pos, 0.0)?;
       let highlight_angle = prop_scalar(c, a_pos, 0.0)?;
-      Ok(ParsedItem::Shape(Shape::GradientFill(Box::new(GradientFill {
+      Ok(ParsedItem::Shape(Shape::GradientFill(c.alloc_box(GradientFill {
         kind,
         start,
         end,
@@ -1342,7 +1355,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
         color_count,
         opacity,
         rule,
-      }))))
+      })?)))
     }
     b"tm" => {
       let start = prop_scalar(c, s_pos, 0.0)?;
@@ -1352,7 +1365,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
       };
       let offset = prop_scalar(c, o_pos, 0.0)?;
       let mode = if trim_mode as i64 == 2 { TrimMode::Individual } else { TrimMode::Simultaneous };
-      Ok(ParsedItem::Shape(Shape::Trim(Box::new(Trim { start, end, offset, mode }))))
+      Ok(ParsedItem::Shape(Shape::Trim(c.alloc_box(Trim { start, end, offset, mode })?)))
     }
     b"gs" => {
       let s_pos_ = s_pos.ok_or(Error::InvalidLottie {
@@ -1393,7 +1406,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
       let kind = if grad_type as i64 == 2 { GradientKind::Radial } else { GradientKind::Linear };
       let highlight_len = prop_scalar(c, h_pos, 0.0)?;
       let highlight_angle = prop_scalar(c, a_pos, 0.0)?;
-      Ok(ParsedItem::Shape(Shape::GradientStroke(Box::new(GradientStroke {
+      Ok(ParsedItem::Shape(Shape::GradientStroke(c.alloc_box(GradientStroke {
         kind,
         start,
         end,
@@ -1407,7 +1420,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
         join,
         miter_limit: miter_limit.max(1.0),
         dashes,
-      }))))
+      })?)))
     }
     b"sr" => {
       let prop_scalar_req = |pos: Option<usize>, default: f32| -> Result<Property<f32>> {
@@ -1420,7 +1433,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
       if limits_check() && property_max_abs_f32(&points).is_some_and(|value| value > limits.max_polystar_points) {
         return Err(Error::LimitExceeded(Limit::PolystarPoints));
       }
-      Ok(ParsedItem::Shape(Shape::Polystar(Box::new(PolystarShape {
+      Ok(ParsedItem::Shape(Shape::Polystar(c.alloc_box(PolystarShape {
         star: star_type as i64 != 2,
         reversed: direction_reversed(c, d_pos),
         points,
@@ -1430,9 +1443,9 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
         outer_radius: prop_scalar_req(or_pos, 0.0)?,
         inner_roundness: prop_scalar_req(is_pos, 0.0)?,
         outer_roundness: prop_scalar_req(os_pos, 0.0)?,
-      }))))
+      })?)))
     }
-    b"rd" => Ok(ParsedItem::Shape(Shape::RoundCorners(Box::new(RoundCorners { radius: prop_scalar(c, r_pos, 0.0)? })))),
+    b"rd" => Ok(ParsedItem::Shape(Shape::RoundCorners(c.alloc_box(RoundCorners { radius: prop_scalar(c, r_pos, 0.0)? })?))),
     b"rp" => {
       let copies = match c_pos {
         Some(pos) => parse_property(&mut c.fork_at(pos), limits, parse_scalar)?,
@@ -1446,13 +1459,13 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
         Some(pos) => parse_repeater_transform(&mut c.fork_at(pos), limits)?,
         None => (Transform::identity(), Property::Static(100.0), Property::Static(100.0)),
       };
-      Ok(ParsedItem::Shape(Shape::Repeater(Box::new(Repeater {
+      Ok(ParsedItem::Shape(Shape::Repeater(c.alloc_box(Repeater {
         copies,
         offset,
         transform,
         start_opacity,
         end_opacity,
-      }))))
+      })?)))
     }
     // rp/mm/... : later phases.
     _ => Ok(ParsedItem::Ignored),
@@ -1484,6 +1497,7 @@ fn parse_dashes(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<DashElement>>
         return Err(Error::LimitExceeded(Limit::DashElements));
       }
       let value = parse_property(&mut c.fork_at(pos), limits, parse_scalar)?;
+      c.reserve(&mut out, 1)?;
       out.push(DashElement { value });
     }
     Ok(())
@@ -1555,7 +1569,8 @@ fn parse_layer(
         ty = parse_f32(c)? as u8;
       }
       b"nm" => {
-        color_override = match_layer_color(c.read_string_bytes()?, replacements);
+        let raw = c.read_string_bytes()?;
+        color_override = match_layer_color(raw, replacements);
       }
       b"ind" => {
         index = parse_f32(c)? as i32;
@@ -1594,7 +1609,7 @@ fn parse_layer(
       }
       b"refId" => {
         let raw = c.read_string_bytes()?;
-        ref_id = Some(String::from_utf8_lossy(raw).into_owned());
+        ref_id = Some(c.owned_string(raw)?);
       }
       b"masksProperties" => {
         masks_pos = Some(c.pos());
@@ -1712,6 +1727,7 @@ fn parse_layer(
     transform,
     shapes,
     ref_id,
+    asset_index: None,
     precomp_size,
     masks,
     matte,
@@ -1728,10 +1744,12 @@ fn parse_layer(
 /// comparison for every prefix that is itself valid UTF-8 and contains no
 /// U+FFFD, and avoids allocating a `String` per layer.
 fn match_layer_color(raw: &[u8], replacements: &[LayerColorReplacement]) -> Option<Color> {
-  replacements
-    .iter()
-    .find(|replacement| raw.starts_with(replacement.layer_name_prefix.as_bytes()))
-    .map(|replacement| argb_color(replacement.color))
+  for replacement in replacements {
+    if raw.starts_with(replacement.layer_name_prefix.as_bytes()) {
+      return Some(argb_color(replacement.color));
+    }
+  }
+  None
 }
 
 fn argb_color(argb: u32) -> Color {
@@ -1772,6 +1790,7 @@ fn parse_fitz_entries(c: &mut Cursor<'_>, entries: &mut Vec<FitzEntry>, limits: 
       }
       Ok(())
     })?;
+    c.reserve(entries, 1)?;
     entries.push(entry);
     Ok(())
   })
@@ -1793,16 +1812,16 @@ fn fitz_color(encoded: u32) -> Color {
   }
 }
 
-fn replace_source_color(color: &mut Color, replacements: &[SourceColorReplacement]) {
+fn replace_source_color(color: &mut Color, replacements: &crate::compat::HashMap<u32, u32>) {
   let key = fitz_key(*color);
-  if let Some(replacement) = replacements.iter().find(|replacement| replacement.source_color & 0x00ff_ffff == key) {
+  if let Some(replacement) = replacements.get(&key) {
     let alpha = color.a;
-    *color = fitz_color(replacement.target_color & 0x00ff_ffff);
+    *color = fitz_color(*replacement & 0x00ff_ffff);
     color.a = alpha;
   }
 }
 
-fn replace_gradient_colors(stops: &mut FloatList, color_count: usize, replacements: &[SourceColorReplacement]) {
+fn replace_gradient_colors(stops: &mut FloatList, color_count: usize, replacements: &crate::compat::HashMap<u32, u32>) {
   for stop in stops.0.chunks_exact_mut(4).take(color_count) {
     let mut color = Color {
       r: stop[1],
@@ -1817,7 +1836,7 @@ fn replace_gradient_colors(stops: &mut FloatList, color_count: usize, replacemen
   }
 }
 
-fn apply_source_colors_shapes(shapes: &mut [Shape], replacements: &[SourceColorReplacement]) {
+fn apply_source_colors_shapes(shapes: &mut [Shape], replacements: &crate::compat::HashMap<u32, u32>) {
   for shape in shapes {
     match shape {
       Shape::Group(group) => apply_source_colors_shapes(&mut group.shapes, replacements),
@@ -1830,7 +1849,7 @@ fn apply_source_colors_shapes(shapes: &mut [Shape], replacements: &[SourceColorR
   }
 }
 
-fn apply_source_colors_layers(layers: &mut [Layer], replacements: &[SourceColorReplacement]) {
+fn apply_source_colors_layers(layers: &mut [Layer], replacements: &crate::compat::HashMap<u32, u32>) {
   for layer in layers {
     apply_source_colors_shapes(&mut layer.shapes, replacements);
     if let Some((_, _, color)) = &mut layer.solid {
@@ -1839,64 +1858,82 @@ fn apply_source_colors_layers(layers: &mut [Layer], replacements: &[SourceColorR
   }
 }
 
-fn apply_source_colors(layers: &mut [Layer], assets: &mut [Asset], replacements: &[SourceColorReplacement]) {
-  apply_source_colors_layers(layers, replacements);
-  for asset in assets {
-    apply_source_colors_layers(&mut asset.layers, replacements);
+fn insert_color(c: &Cursor<'_>, lookup: &mut crate::compat::HashMap<u32, u32>, source: u32, target: u32) -> Result<()> {
+  if !lookup.contains_key(&source) {
+    c.allocate(2 * (core::mem::size_of::<(u32, u32)>() + 1))?;
+    lookup.try_reserve(1).map_err(|_| Error::LimitExceeded(Limit::ParseMemory))?;
+    lookup.insert(source, target);
   }
+  Ok(())
 }
 
-fn replace_fitz_color(color: &mut Color, entries: &[FitzEntry], index: usize) {
+fn apply_source_colors(c: &Cursor<'_>, layers: &mut [Layer], assets: &mut [Asset], replacements: &[SourceColorReplacement]) -> Result<()> {
+  if replacements.is_empty() {
+    return Ok(());
+  }
+  let mut lookup = crate::compat::HashMap::new();
+  for replacement in replacements {
+    insert_color(c, &mut lookup, replacement.source_color & 0x00ff_ffff, replacement.target_color)?;
+  }
+  apply_source_colors_layers(layers, &lookup);
+  for asset in assets {
+    apply_source_colors_layers(&mut asset.layers, &lookup);
+  }
+  Ok(())
+}
+
+fn replace_fitz_color(color: &mut Color, entries: &crate::compat::HashMap<u32, u32>) {
   let key = fitz_key(*color);
-  if let Some(replacement) = entries
-    .iter()
-    .find(|entry| entry.original == key)
-    .and_then(|entry| entry.replacements.get(index))
-    .copied()
-    .filter(|value| *value != 0)
-  {
+  if let Some(replacement) = entries.get(&key).copied().filter(|value| *value != 0) {
     let alpha = color.a;
     *color = fitz_color(replacement);
     color.a = alpha;
   }
 }
 
-fn apply_fitz_shapes(shapes: &mut [Shape], entries: &[FitzEntry], index: usize) {
+fn apply_fitz_shapes(shapes: &mut [Shape], entries: &crate::compat::HashMap<u32, u32>) {
   for shape in shapes {
     match shape {
-      Shape::Group(group) => apply_fitz_shapes(&mut group.shapes, entries, index),
-      Shape::Fill(fill) => fill.color.map_values(|color| replace_fitz_color(color, entries, index)),
-      Shape::Stroke(stroke) => stroke.color.map_values(|color| replace_fitz_color(color, entries, index)),
+      Shape::Group(group) => apply_fitz_shapes(&mut group.shapes, entries),
+      Shape::Fill(fill) => fill.color.map_values(|color| replace_fitz_color(color, entries)),
+      Shape::Stroke(stroke) => stroke.color.map_values(|color| replace_fitz_color(color, entries)),
       _ => {}
     }
   }
 }
 
-fn apply_fitz_layers(layers: &mut [Layer], entries: &[FitzEntry], index: usize) {
+fn apply_fitz_layers(layers: &mut [Layer], entries: &crate::compat::HashMap<u32, u32>) {
   for layer in layers {
-    apply_fitz_shapes(&mut layer.shapes, entries, index);
+    apply_fitz_shapes(&mut layer.shapes, entries);
     if let Some((_, _, color)) = &mut layer.solid {
-      replace_fitz_color(color, entries, index);
+      replace_fitz_color(color, entries);
     }
   }
 }
 
-fn apply_fitz(layers: &mut [Layer], assets: &mut [Asset], entries: &[FitzEntry], index: usize) {
-  apply_fitz_layers(layers, entries, index);
-  for asset in assets {
-    apply_fitz_layers(&mut asset.layers, entries, index);
+fn apply_fitz(c: &Cursor<'_>, layers: &mut [Layer], assets: &mut [Asset], entries: &[FitzEntry], index: usize) -> Result<()> {
+  let mut lookup = crate::compat::HashMap::new();
+  for entry in entries {
+    insert_color(c, &mut lookup, entry.original, entry.replacements.get(index).copied().unwrap_or(0))?;
   }
+  apply_fitz_layers(layers, &lookup);
+  for asset in assets {
+    apply_fitz_layers(&mut asset.layers, &lookup);
+  }
+  Ok(())
 }
 
 #[derive(Clone, Copy, Default)]
 struct ExpansionCost {
   layers: usize,
   focal_radial_gradients: usize,
+  gradient_strokes: usize,
 }
 
 impl ExpansionCost {
   fn add_layer(&mut self, layer: &Layer) {
     self.layers = self.layers.saturating_add(1);
+    self.gradient_strokes = self.gradient_strokes.saturating_add(gradient_strokes_in_shapes(&layer.shapes));
     if layer.kind == LayerKind::Shape {
       self.focal_radial_gradients = self.focal_radial_gradients.saturating_add(focal_radial_gradients_in_shapes(&layer.shapes));
     }
@@ -1904,6 +1941,7 @@ impl ExpansionCost {
 
   fn add(&mut self, other: Self) {
     self.layers = self.layers.saturating_add(other.layers);
+    self.gradient_strokes = self.gradient_strokes.saturating_add(other.gradient_strokes);
     self.focal_radial_gradients = self.focal_radial_gradients.saturating_add(other.focal_radial_gradients);
   }
 
@@ -1927,6 +1965,52 @@ fn focal_radial_gradients_in_shape(shape: &Shape) -> usize {
     Shape::Group(group) => focal_radial_gradients_in_shapes(&group.shapes),
     shape if is_focal_radial_gradient(shape) => 1,
     _ => 0,
+  }
+}
+
+fn gradient_strokes_in_shapes(shapes: &[Shape]) -> usize {
+  shapes.iter().fold(0usize, |count, shape| {
+    count.saturating_add(match shape {
+      Shape::Group(group) => gradient_strokes_in_shapes(&group.shapes),
+      Shape::GradientStroke(_) => 1,
+      _ => 0,
+    })
+  })
+}
+
+#[cfg(any(feature = "cpu", test))]
+pub(crate) fn expanded_gradient_paints(comp: &Composition) -> Result<(usize, usize)> {
+  let limits = Limits {
+    max_precomp_expansion: usize::MAX,
+    max_focal_radial_gradient_expansion: usize::MAX,
+    ..Limits::default()
+  };
+  let mut asset_by_id = crate::compat::HashMap::new();
+  for (index, asset) in comp.assets.iter().enumerate() {
+    asset_by_id.entry(asset.id.as_str()).or_insert(index);
+  }
+  let mut memo = vec![None; comp.assets.len()];
+  let mut visiting = vec![false; comp.assets.len()];
+  let cost = layer_list_expansion(&comp.layers, &comp.assets, &asset_by_id, &mut memo, &mut visiting, &limits)?;
+  Ok((cost.focal_radial_gradients, cost.gradient_strokes))
+}
+
+// Keep authored IDs for validation, but never scan or hash them during a
+// frame. Resolve missing IDs too, and preserve the old first-match behavior
+// for duplicate asset IDs. Indices remain valid when Composition is cloned.
+fn resolve_asset_references(layers: &mut [Layer], assets: &mut [Asset]) {
+  let mut by_id = crate::compat::HashMap::new();
+  for (index, asset) in assets.iter().enumerate() {
+    by_id.entry(asset.id.as_str()).or_insert(index);
+  }
+  let indices: Vec<Option<usize>> = layers
+    .iter()
+    .chain(assets.iter().flat_map(|asset| &asset.layers))
+    .map(|layer| layer.ref_id.as_deref().and_then(|id| by_id.get(id).copied()))
+    .collect();
+  drop(by_id);
+  for (layer, index) in layers.iter_mut().chain(assets.iter_mut().flat_map(|asset| &mut asset.layers)).zip(indices) {
+    layer.asset_index = index;
   }
 }
 
@@ -2069,9 +2153,11 @@ fn parse_layer_list(
   let mut layers = Vec::new();
   for_each_element(c, |c| {
     *total_layers += 1;
-    if limits_check() && *total_layers > limits.max_layers {
+    // Bound model allocation even when renderer tests bypass shape checks.
+    if *total_layers > limits.max_layers {
       return Err(Error::LimitExceeded(Limit::Layers));
     }
+    c.reserve(&mut layers, 1)?;
     layers.push(parse_layer(c, limits, replacements, total_masks, total_painted_shape_layers, total_solid_layers)?);
     Ok(())
   })?;
@@ -2164,6 +2250,7 @@ fn parse_masks(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<Mask>> {
       Some(pos) => parse_property(&mut c.fork_at(pos), limits, parse_scalar)?,
       None => Property::Static(100.0),
     };
+    c.reserve(&mut out, 1)?;
     out.push(Mask { mode, invert, path, opacity });
     Ok(())
   })?;
@@ -2201,7 +2288,7 @@ fn parse_asset(
   parse_object_once!(c, |c, key| {
       b"id" => {
         let raw = c.read_string_bytes()?;
-        id = String::from_utf8_lossy(raw).into_owned();
+        id = c.owned_string(raw)?;
       }
       b"layers" => {
         has_layers = true;
@@ -2225,6 +2312,7 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
   }
 
   let mut c = Cursor::new(bytes, limits.max_nesting_depth);
+  c.resource_limits(limits);
   let mut width: Option<f64> = None;
   let mut height: Option<f64> = None;
   let mut frame_rate: Option<f64> = None;
@@ -2253,6 +2341,7 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
             return Err(Error::LimitExceeded(Limit::Assets));
           }
           if let Some(asset) = parse_asset(c, limits, &options.layer_color_replacements, &mut total_layers, &mut total_masks, &mut total_painted_shape_layers, &mut total_solid_layers)? {
+            c.reserve(&mut assets, 1)?;
             assets.push(asset);
           }
           Ok(())
@@ -2272,6 +2361,7 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
     return Err(json_err(&c, JsonErrorKind::TrailingData));
   }
 
+  c.status()?;
   let offset = c.pos();
   let missing = |what: &'static str| Error::InvalidLottie { offset, what };
 
@@ -2292,6 +2382,7 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
   if !out_point.is_finite() || !in_point.is_finite() || out_point <= in_point {
     return Err(missing("out point must be greater than in point"));
   }
+  resolve_asset_references(&mut layers, &mut assets);
   validate_precomp_expansion(&layers, &assets, limits)?;
 
   // Static detection piggybacks on parsing: every deferred cursor shares the
@@ -2305,9 +2396,9 @@ pub(crate) fn parse_composition(bytes: &[u8], limits: &Limits, options: &ParseOp
       .all(|layer| layer.hidden || layer.out_point <= in_point as f32 || layer.in_point >= out_point as f32 || (layer.in_point <= in_point as f32 && layer.out_point >= out_point as f32));
 
   if let Some(index) = options.fitz_modifier.replacement_index() {
-    apply_fitz(&mut layers, &mut assets, &fitz_entries, index);
+    apply_fitz(&c, &mut layers, &mut assets, &fitz_entries, index)?;
   }
-  apply_source_colors(&mut layers, &mut assets, &options.source_color_replacements);
+  apply_source_colors(&c, &mut layers, &mut assets, &options.source_color_replacements)?;
 
   let mut composition = Composition {
     width: width as u32,

@@ -105,8 +105,10 @@ pub(crate) fn flatten_path_reusing(data: &PathData, m: &Mat2x3, tolerance: f32, 
   contour.points.clear();
   contour.anchors.clear();
   contour.inv_lin = None;
-  contour.points.reserve(n * 4);
-  contour.anchors.reserve(n * 4);
+  // Straight paths need one point per vertex, plus the closing endpoint.
+  // Curves grow on demand under the flattener preflight budget.
+  contour.points.reserve_exact(n.saturating_add(1));
+  contour.anchors.reserve_exact(n.saturating_add(1));
   if n == 0 {
     return contour;
   }
@@ -338,7 +340,6 @@ pub(crate) fn clip_to_quad(c: &Contour, quad: &[Vec2; 4], budget: &crate::render
       let t = (ex * (a.y - p.y) - ey * (a.x - p.x)) / denom;
       Vec2::new(p.x + dpx * t.clamp(0.0, 1.0), p.y + dpy * t.clamp(0.0, 1.0))
     };
-    budget.work(pts.len())?;
     if pts.iter().all(&inside) {
       continue;
     }
@@ -405,7 +406,6 @@ pub(crate) fn clip_contour(c: &Contour, w: f32, h: f32, budget: &crate::renderer
         Vec2::new(a.x + (b.x - a.x) * t, bound_x)
       }
     };
-    budget.work(pts.len())?;
     if pts.iter().all(&inside) {
       continue;
     }
@@ -681,7 +681,6 @@ pub(crate) fn dash_polyline_bounded<'a>(
   offset: f32,
   budget: &'a crate::renderer::frame::budget::Budget,
 ) -> crate::Result<Vec<(Vec<Vec2>, Vec<bool>)>> {
-  budget.work(points.len())?;
   budget.points(points.len())?;
   let mut d = VDasher::new(points, anchors, closed, pattern, offset);
   d.budget = Some(budget);
@@ -841,6 +840,15 @@ impl<'a> VDasher<'a> {
     if self.discard || span.is_empty() {
       return;
     }
+    #[cfg(feature = "cpu")]
+    if let Some(budget) = self.budget {
+      // Charge the output on both dash branches. A whole-element dash may
+      // skip the split loop, but still allocates points and two Vec headers.
+      if let Err(error) = budget.dash_output(span.len(), self.start_new_segment) {
+        self.error = Some(error);
+        return;
+      }
+    }
     if self.start_new_segment {
       let mut piece = (Vec::new(), Vec::new());
       for &(p, a) in span {
@@ -922,20 +930,22 @@ impl<'a> VDasher<'a> {
     } else {
       // A complete pattern cycle consumes cycle_length. Allow an initial
       // partial cycle and a factor of two for f32 subtraction rounding. The
-      // work cap keeps the cycle/phase count below the precision at which a
-      // whole cycle could stop making progress. Charge all scans and splits
-      // here, before entering the dash loop (including discarded gaps).
+      // generated-point cap bounds the possible splits before entering the
+      // dash loop, including discarded gaps.
       #[cfg(feature = "cpu")]
       if let Some(budget) = self.budget {
         let cycles = ((2.0 * elem_len as f64 / self.cycle_length).ceil() as usize).saturating_add(1);
         let iterations = cycles.saturating_mul(2 * self.pairs.len());
-        let work = iterations.saturating_mul(verts.len().saturating_add(2 * self.pairs.len() + 2));
-        if let Err(error) = budget.work(work).and_then(|()| budget.points(iterations.saturating_mul(4))) {
+        if let Err(error) = budget.points(iterations.saturating_mul(4)) {
           self.error = Some(error);
           return;
         }
       }
       while remaining > self.current_length {
+        #[cfg(feature = "cpu")]
+        if self.error.is_some() {
+          return;
+        }
         remaining -= self.current_length;
         let target = local + self.current_length;
         self.add_span(&collect(local, target));
@@ -971,6 +981,13 @@ impl<'a> VDasher<'a> {
       return;
     }
     if no_length || no_gap {
+      #[cfg(feature = "cpu")]
+      if let Some(budget) = self.budget {
+        if let Err(error) = budget.dash_output(self.points.len(), true) {
+          self.error = Some(error);
+          return;
+        }
+      }
       let mut piece = (Vec::new(), Vec::new());
       for (i, p) in self.points.iter().enumerate() {
         piece.0.push(*p);

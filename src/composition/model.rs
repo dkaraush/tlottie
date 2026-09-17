@@ -43,7 +43,7 @@ pub struct Composition {
   pub(crate) static_content: bool,
   /// Layers in file order (index 0 is drawn on top).
   pub(crate) layers: Vec<Layer>,
-  /// Precomp assets, looked up by `Layer::ref_id`.
+  /// Precomp assets, indexed by the references resolved during parsing.
   pub(crate) assets: Vec<Asset>,
   /// Byte order the model's colors are stored in. Everything except the luma
   /// matte is channel-order agnostic, so this is only consulted there.
@@ -135,6 +135,8 @@ pub(crate) struct Layer {
   pub shapes: Vec<Shape>,
   /// Asset reference (only for `LayerKind::Precomp`).
   pub ref_id: Option<String>,
+  /// First matching asset, resolved once after all assets have been parsed.
+  pub asset_index: Option<usize>,
   /// Precomp viewport (layer w/h); content is clipped to it.
   pub precomp_size: Option<(f32, f32)>,
   /// Layer masks (`masksProperties`).

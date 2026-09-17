@@ -113,21 +113,36 @@ fn parses_shape_layer() {
 }
 
 #[test]
-fn primitive_direction_is_order_independent() {
-  let comp = parse(
-    r#"{"fr":30,"ip":0,"op":30,"w":100,"h":100,"layers":[
-              {"ty":4,"ind":1,"ip":0,"op":30,"st":0,"ks":{},
-               "shapes":[
-                  {"d":3,"ty":"el","p":{"a":0,"k":[50,50]},"s":{"a":0,"k":[10,10]}},
-                  {"ty":"fl","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"r":1}
-               ]}
-          ]}"#,
-  )
-  .unwrap();
-  let Some(Shape::Ellipse(ellipse)) = comp.layers[0].shapes.first() else {
-    panic!("expected ellipse");
-  };
-  assert!(ellipse.reversed);
+fn primitive_direction_matches_rlottie_field_order() {
+  for ty in ["el", "rc", "sr"] {
+    for (fields, reversed) in [
+      (format!(r#""d":3,"ty":"{ty}""#), false),
+      (format!(r#""ty":"{ty}","d":3"#), true),
+      (format!(r#""d":1,"ty":"{ty}""#), false),
+      (format!(r#""ty":"{ty}","d":1"#), false),
+    ] {
+      let json = format!(
+        r#"{{"fr":30,"ip":0,"op":30,"w":100,"h":100,"layers":[{{"ty":4,"ip":0,"op":30,"shapes":[{{{fields},"p":{{"k":[50,50]}},"s":{{"k":[10,10]}},"pt":{{"k":5}},"or":{{"k":10}},"ir":{{"k":5}}}}]}}]}}"#
+      );
+      let comp = parse(&json).unwrap();
+      let actual = match &comp.layers[0].shapes[0] {
+        Shape::Ellipse(shape) => shape.reversed,
+        Shape::Rect(shape) => shape.reversed,
+        Shape::Polystar(shape) => shape.reversed,
+        _ => panic!("expected primitive"),
+      };
+      assert_eq!(actual, reversed, "{fields}");
+    }
+  }
+}
+
+#[test]
+fn stroke_dash_array_before_type_is_preserved() {
+  let comp =
+    parse(r#"{"fr":30,"ip":0,"op":30,"w":100,"h":100,"layers":[{"ty":4,"ip":0,"op":30,"shapes":[{"d":[{"n":"d","v":{"k":4}},{"n":"g","v":{"k":2}}],"ty":"st","c":{"k":[1,0,0,1]},"w":{"k":2}}]}]}"#)
+      .unwrap();
+  let Shape::Stroke(stroke) = &comp.layers[0].shapes[0] else { panic!("expected stroke") };
+  assert_eq!(stroke.dashes.len(), 2);
 }
 
 #[test]
@@ -438,5 +453,15 @@ fn group_walk_preserves_siblings_transforms_and_shared_limits() {
   }
   for json in [br#"[{"ty":"gr","it":[]},]"#.as_slice(), br#"[{"ty":"gr","it":[,]}]"#] {
     assert!(parse_shape_list(&mut Cursor::new(json, 128), &Limits::default(), 0, &mut ShapeCounts::default()).is_err());
+  }
+}
+
+#[test]
+fn asset_indices_resolve_forward_missing_and_duplicate_ids() {
+  let comp = parse(r#"{"w":8,"h":8,"fr":60,"ip":0,"op":2,"layers":[{"ty":0,"refId":"later"},{"ty":0,"refId":"missing"}],"assets":[{"id":"later","layers":[{"ty":0,"refId":"leaf"}]},{"id":"later","layers":[]},{"id":"leaf","layers":[]}]}"#).unwrap();
+  for comp in [&comp, &comp.clone()] {
+    assert_eq!(comp.layers[0].asset_index, Some(0));
+    assert_eq!(comp.layers[1].asset_index, None);
+    assert_eq!(comp.assets[0].layers[0].asset_index, Some(2));
   }
 }

@@ -17,6 +17,8 @@ use crate::geometry::Contour;
 use crate::model::FillRule;
 use alloc::vec::Vec;
 
+const MAX_RETAINED_CELL_BYTES: usize = 4 << 20;
+
 /// Subpixel bits (24.8 fixed point, FreeType's PIXEL_BITS = 8).
 const PIX_B: i32 = 8;
 /// One pixel in fixed-point units.
@@ -62,6 +64,22 @@ impl CellRaster {
   }
 
   pub fn reset(&mut self) {
+    // Row buckets keep their capacity across reset (pool semantics) so
+    // steady-state content never reallocates, but the retained total is the
+    // SUM over scanlines of each row's high-water mark, and no per-frame
+    // budget bounds that sum: content landing on FRESH rows every frame grows
+    // the pool without limit. Over budget, drop the buckets outright -- they
+    // are pure scratch, rebuilt from geometry every frame, so releasing them
+    // costs at most one reallocation and never a rendering error.
+    let retained = self.rows.iter().map(Vec::capacity).sum::<usize>().saturating_mul(core::mem::size_of::<Cell>());
+    if retained > MAX_RETAINED_CELL_BYTES {
+      for row in &mut self.rows {
+        *row = Vec::new();
+      }
+      self.min_y = usize::MAX;
+      self.max_y = 0;
+      return;
+    }
     if self.min_y <= self.max_y {
       for row in self.rows.get_mut(self.min_y..=self.max_y.min(self.h.saturating_sub(1))).unwrap_or_default() {
         row.clear();
