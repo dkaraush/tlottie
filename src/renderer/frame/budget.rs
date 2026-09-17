@@ -92,10 +92,8 @@ impl Budget {
 }
 
 fn canvas_memory_limit(width: u32, height: u32) -> usize {
-  // Surface storage grows with canvas area. Scale the fixture-calibrated
-  // allowance in both directions to preserve the same nesting limit at
-  // every resolution. Use a wide product before clamping
-  // to the address space; scaling must never wrap to a smaller allowance.
+  // Scale with area so every resolution allows the same surface nesting.
+  // Use u128 to avoid overflow before clamping to usize.
   let reference_area = 720u128 * 720;
   let area = u128::from(width) * u128::from(height);
   ((Limits::default().max_render_bytes as u128 * area) / reference_area).min(usize::MAX as u128) as usize

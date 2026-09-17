@@ -206,6 +206,10 @@ fn parse_scalar(c: &mut Cursor<'_>) -> Result<f32> {
 
 /// `[x, y, ...]` (extra components ignored).
 fn parse_vec2(c: &mut Cursor<'_>) -> Result<Vec2> {
+  parse_vec2_with_empty(c, false)
+}
+
+fn parse_vec2_with_empty(c: &mut Cursor<'_>, allow_empty: bool) -> Result<Vec2> {
   let mut got: [Option<f32>; 2] = [None, None];
   let mut i = 0usize;
   for_each_element(c, |c| {
@@ -222,6 +226,7 @@ fn parse_vec2(c: &mut Cursor<'_>) -> Result<Vec2> {
   match got {
     [Some(x), Some(y)] => Ok(Vec2::new(x, y)),
     [Some(x), None] => Ok(Vec2::new(x, x)),
+    [None, None] if allow_empty => Ok(Vec2::ZERO),
     _ => Err(invalid(c, "expected [x, y]")),
   }
 }
@@ -282,15 +287,14 @@ fn parse_bool(c: &mut Cursor<'_>) -> Result<bool> {
   }
 }
 
-/// Path contour object `{c, v, i, o}`. Also accepts the array-wrapped form
-/// `[{...}]` used in keyframe `s` fields.
-fn parse_vec2_list(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<Vec2>> {
+// rlottie treats empty tangent entries as zero-length handles (corners).
+fn parse_vec2_list(c: &mut Cursor<'_>, limits: &Limits, allow_empty: bool) -> Result<Vec<Vec2>> {
   let mut out = Vec::new();
   for_each_element(c, |c| {
     if limits_check() && out.len() >= limits.max_path_points {
       return Err(Error::LimitExceeded(Limit::PathPoints));
     }
-    let point = parse_vec2(c)?;
+    let point = parse_vec2_with_empty(c, allow_empty)?;
     if limits_check() && (point.x.abs() > limits.max_path_coordinate_abs || point.y.abs() > limits.max_path_coordinate_abs) {
       return Err(Error::LimitExceeded(Limit::PathCoordinate));
     }
@@ -301,6 +305,7 @@ fn parse_vec2_list(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<Vec2>> {
   Ok(out)
 }
 
+/// Path contour object, optionally array-wrapped for keyframe values.
 fn parse_path_value(c: &mut Cursor<'_>, limits: &Limits) -> Result<PathData> {
   c.skip_ws();
   if c.peek() == Some(b'[') {
@@ -321,9 +326,9 @@ fn parse_path_value(c: &mut Cursor<'_>, limits: &Limits) -> Result<PathData> {
 fn parse_path_object(c: &mut Cursor<'_>, limits: &Limits) -> Result<PathData> {
   let mut data = PathData::default();
   parse_object_once!(c, |c, key| {
-    b"v" => { data.vertices = parse_vec2_list(c, limits)?; },
-    b"i" => { data.in_tangents = parse_vec2_list(c, limits)?; },
-    b"o" => { data.out_tangents = parse_vec2_list(c, limits)?; },
+    b"v" => { data.vertices = parse_vec2_list(c, limits, false)?; },
+    b"i" => { data.in_tangents = parse_vec2_list(c, limits, true)?; },
+    b"o" => { data.out_tangents = parse_vec2_list(c, limits, true)?; },
     b"c" => { data.closed = parse_bool(c)?; },
     _ => { c.skip_value()?; },
   })?;
