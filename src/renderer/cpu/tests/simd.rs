@@ -202,6 +202,35 @@ fn focal_horner_preserves_invalid_root_semantics() {
   assert_eq!(behind, [0; 4]);
 }
 
+/// At the focal point itself (`g = 0`, zero step) `det == 0` and
+/// `root == 0`, so the scalar `det >= 0.0` and `r * root >= 0.0` gates both
+/// sit exactly on their boundary. Vector kernels must use the same non-strict
+/// compares, for either sign of `r` (`r * 0.0` may be `-0.0`).
+#[test]
+fn focal_lut_matches_scalar_at_zero_root() {
+  let lut = vec![0xff00_00ffu32; 1024];
+  let scale = (lut.len() - 1) as f32;
+  let (a, dx, dy) = (0.7f32, 0.3f32, 0.1f32);
+  let inv2a = 1.0 / (2.0 * a);
+  for len in [16usize, 17, 32, 64] {
+    for &r in &[0.5f32, -0.5] {
+      let mut va = vec![0u32; len];
+      let mut vb = vec![0u32; len];
+      focal_lut_fill(&mut va, &lut, 0.0, 0.0, 0.0, 0.0, dx, dy, a, inv2a, r, 0.0);
+      focal_lut_fill_scalar(&mut vb, &lut, 0.0, 0.0, 0.0, 0.0, dx, dy, a, inv2a, r, 0.0, scale);
+      assert!(vb.iter().all(|&px| px == 0xff00_00ff), "scalar oracle must sample the LUT at root 0, r={r}");
+      assert_eq!(va, vb, "fill len={len} r={r}");
+
+      let base = vec![0x8040_2010u32; len];
+      let mut va = base.clone();
+      let mut vb = base.clone();
+      focal_lut_over(&mut va, &lut, 0.0, 0.0, 0.0, 0.0, dx, dy, a, inv2a, r, 0.0);
+      focal_lut_over_scalar(&mut vb, &lut, 0.0, 0.0, 0.0, 0.0, dx, dy, a, inv2a, r, 0.0, scale);
+      assert_eq!(va, vb, "over len={len} r={r}");
+    }
+  }
+}
+
 /// NEON == scalar even when positions go non-finite: NaN and ±inf must
 /// take the sentinel (transparent 0) identically in both paths, at any
 /// absolute column offset. Exercises the `is_finite`/`|t|<inf` parity.
