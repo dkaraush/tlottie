@@ -20,6 +20,7 @@ no-std = ["dep:hashbrown", "dep:dlmalloc"]
 std = []
 cli = ["cpu", "std"]
 c-api = ["cpu"]
+capi = ["c-api"]
 wasm = ["cpu"]
 
 [dependencies]
@@ -56,3 +57,13 @@ strip = "symbols"
 [profile.release-nostd]
 inherits = "release"
 panic = "abort"
+
+[package.metadata.capi.header]
+generation = false
+subdirectory = ""
+
+[package.metadata.capi.install.include]
+asset = [{ from = "include/*.h", to = "" }]
+
+[package.metadata.capi.pkg_config]
+description = "Library for rendering Lottie animations"
