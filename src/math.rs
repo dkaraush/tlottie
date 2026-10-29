@@ -22,9 +22,17 @@ impl Vec2 {
   }
 }
 
+/// Distance from the camera to the layer plane that rlottie projects the
+/// X and Y rotations of a 3D layer with (`VMatrix::rotate`).
+const PERSPECTIVE_DISTANCE: f32 = 1024.0;
+
 /// 2x3 affine transform, column notation:
 /// `[ a c tx ]`
 /// `[ b d ty ]`
+///
+/// plus a perspective row `[ px py pw ]`, which stays `[ 0 0 1 ]` except under
+/// the X or Y rotation of a 3D layer: a point maps to
+/// `(a x + c y + tx, b x + d y + ty) / (px x + py y + pw)`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Mat2x3 {
   pub a: f32,
@@ -33,6 +41,9 @@ pub(crate) struct Mat2x3 {
   pub d: f32,
   pub tx: f32,
   pub ty: f32,
+  pub px: f32,
+  pub py: f32,
+  pub pw: f32,
 }
 
 impl Mat2x3 {
@@ -43,6 +54,9 @@ impl Mat2x3 {
     d: 1.0,
     tx: 0.0,
     ty: 0.0,
+    px: 0.0,
+    py: 0.0,
+    pw: 1.0,
   };
 
   pub fn translate(tx: f32, ty: f32) -> Self {
@@ -53,6 +67,7 @@ impl Mat2x3 {
       d: 1.0,
       tx,
       ty,
+      ..Mat2x3::IDENTITY
     }
   }
 
@@ -64,6 +79,7 @@ impl Mat2x3 {
       d: sy,
       tx: 0.0,
       ty: 0.0,
+      ..Mat2x3::IDENTITY
     }
   }
 
@@ -77,7 +93,37 @@ impl Mat2x3 {
       d: cos,
       tx: 0.0,
       ty: 0.0,
+      ..Mat2x3::IDENTITY
     }
+  }
+
+  /// Rotation of a 3D layer around the X axis, seen in perspective from
+  /// [`PERSPECTIVE_DISTANCE`] as rlottie draws it: `y` shrinks by the cosine
+  /// and the half that turns towards the viewer grows.
+  pub fn rotate_x(degrees: f32) -> Self {
+    let (sin, cos) = degrees.to_radians().sin_cos();
+    Mat2x3 {
+      d: cos,
+      py: -sin / PERSPECTIVE_DISTANCE,
+      ..Mat2x3::IDENTITY
+    }
+  }
+
+  /// Rotation of a 3D layer around the Y axis, seen in perspective from
+  /// [`PERSPECTIVE_DISTANCE`] as rlottie draws it: `x` shrinks by the cosine
+  /// and the half that turns towards the viewer grows.
+  pub fn rotate_y(degrees: f32) -> Self {
+    let (sin, cos) = degrees.to_radians().sin_cos();
+    Mat2x3 {
+      a: cos,
+      px: -sin / PERSPECTIVE_DISTANCE,
+      ..Mat2x3::IDENTITY
+    }
+  }
+
+  /// True when the perspective row is `[ 0 0 1 ]`.
+  pub fn is_affine(&self) -> bool {
+    self.px == 0.0 && self.py == 0.0 && self.pw == 1.0
   }
 
   /// Skew by `sk` degrees along axis `sa` degrees (AE semantics):
@@ -91,12 +137,16 @@ impl Mat2x3 {
       d: 1.0,
       tx: 0.0,
       ty: 0.0,
+      ..Mat2x3::IDENTITY
     };
     Mat2x3::rotate(sa_deg).concat(shear).concat(Mat2x3::rotate(-sa_deg))
   }
 
   /// `self * rhs`: applies `rhs` first, then `self`.
   pub fn concat(self, rhs: Mat2x3) -> Mat2x3 {
+    if !self.is_affine() || !rhs.is_affine() {
+      return self.concat_projective(rhs);
+    }
     Mat2x3 {
       a: self.a * rhs.a + self.c * rhs.b,
       b: self.b * rhs.a + self.d * rhs.b,
@@ -104,11 +154,29 @@ impl Mat2x3 {
       d: self.b * rhs.c + self.d * rhs.d,
       tx: self.a * rhs.tx + self.c * rhs.ty + self.tx,
       ty: self.b * rhs.tx + self.d * rhs.ty + self.ty,
+      ..Mat2x3::IDENTITY
     }
   }
 
-  /// Inverse of this affine transform; identity fallback when singular.
+  fn concat_projective(self, rhs: Mat2x3) -> Mat2x3 {
+    Mat2x3 {
+      a: self.a * rhs.a + self.c * rhs.b + self.tx * rhs.px,
+      b: self.b * rhs.a + self.d * rhs.b + self.ty * rhs.px,
+      c: self.a * rhs.c + self.c * rhs.d + self.tx * rhs.py,
+      d: self.b * rhs.c + self.d * rhs.d + self.ty * rhs.py,
+      tx: self.a * rhs.tx + self.c * rhs.ty + self.tx * rhs.pw,
+      ty: self.b * rhs.tx + self.d * rhs.ty + self.ty * rhs.pw,
+      px: self.px * rhs.a + self.py * rhs.b + self.pw * rhs.px,
+      py: self.px * rhs.c + self.py * rhs.d + self.pw * rhs.py,
+      pw: self.px * rhs.tx + self.py * rhs.ty + self.pw * rhs.pw,
+    }
+  }
+
+  /// Inverse of this transform; identity fallback when singular.
   pub fn inverse(&self) -> Mat2x3 {
+    if !self.is_affine() {
+      return self.inverse_projective();
+    }
     let det = self.a * self.d - self.b * self.c;
     if det.abs() < 1e-12 || !det.is_finite() {
       return Mat2x3::IDENTITY;
@@ -125,11 +193,63 @@ impl Mat2x3 {
       d,
       tx: -(a * self.tx + c * self.ty),
       ty: -(b * self.tx + d * self.ty),
+      ..Mat2x3::IDENTITY
+    }
+  }
+
+  /// Adjugate over determinant, the scale rlottie's `VMatrix::inverted` uses.
+  fn inverse_projective(&self) -> Mat2x3 {
+    let Mat2x3 { a, b, c, d, tx, ty, px, py, pw } = *self;
+    let det = a * (d * pw - ty * py) - c * (b * pw - ty * px) + tx * (b * py - d * px);
+    if det.abs() < 1e-12 || !det.is_finite() {
+      return Mat2x3::IDENTITY;
+    }
+    let inv = 1.0 / det;
+    Mat2x3 {
+      a: (d * pw - ty * py) * inv,
+      b: (ty * px - b * pw) * inv,
+      c: (tx * py - c * pw) * inv,
+      d: (a * pw - tx * px) * inv,
+      tx: (c * ty - tx * d) * inv,
+      ty: (tx * b - a * ty) * inv,
+      px: (b * py - d * px) * inv,
+      py: (c * px - a * py) * inv,
+      pw: (a * d - c * b) * inv,
+    }
+  }
+
+  /// The affine transform that agrees with this one at `p` to first order
+  /// (the same transform when it is affine).
+  pub fn tangent_at(&self, p: Vec2) -> Mat2x3 {
+    if self.is_affine() {
+      return *self;
+    }
+    let q = self.apply(p);
+    let w = self.px * p.x + self.py * p.y + self.pw;
+    let a = (self.a - q.x * self.px) / w;
+    let b = (self.b - q.y * self.px) / w;
+    let c = (self.c - q.x * self.py) / w;
+    let d = (self.d - q.y * self.py) / w;
+    Mat2x3 {
+      a,
+      b,
+      c,
+      d,
+      tx: q.x - (a * p.x + c * p.y),
+      ty: q.y - (b * p.x + d * p.y),
+      ..Mat2x3::IDENTITY
     }
   }
 
   pub fn apply(&self, p: Vec2) -> Vec2 {
-    Vec2::new(self.a * p.x + self.c * p.y + self.tx, self.b * p.x + self.d * p.y + self.ty)
+    let x = self.a * p.x + self.c * p.y + self.tx;
+    let y = self.b * p.x + self.d * p.y + self.ty;
+    if self.is_affine() {
+      return Vec2::new(x, y);
+    }
+    // Like rlottie, nothing is clipped at the camera plane.
+    let w = 1.0 / (self.px * p.x + self.py * p.y + self.pw);
+    Vec2::new(x * w, y * w)
   }
 }
 

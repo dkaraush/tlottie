@@ -469,7 +469,9 @@ impl ShapeWalker<'_> {
         }
         Shape::GradientFill(gf) => {
           // Gradient geometry stays in local space; pixels are
-          // pulled back through the inverse CTM at fill time.
+          // pulled back through the inverse CTM at fill time. The
+          // samplers are affine: under the perspective of a 3D layer
+          // they use its tangent at the gradient's start.
           let fill_opacity = (gf.opacity.eval(self.frame) / 100.0).clamp(0.0, 1.0);
           let paint_opacity = opacity * fill_opacity;
           if opacity_byte(paint_opacity) == 0 {
@@ -477,7 +479,7 @@ impl ShapeWalker<'_> {
           }
           let start_p = gf.start.eval(self.frame);
           let end_p = gf.end.eval(self.frame);
-          let inv = m.inverse();
+          let inv = m.tangent_at(start_p).inverse();
           let stops = gf.stops.eval(self.frame);
           let (lut, lut_id) = self.scratch.lut_for(&stops, gf.color_count, paint_opacity)?;
           let map = match gf.kind {
@@ -542,7 +544,7 @@ impl ShapeWalker<'_> {
           }
           let start_p = gs.start.eval(self.frame);
           let end_p = gs.end.eval(self.frame);
-          let inv = m.inverse();
+          let inv = m.tangent_at(start_p).inverse();
           let stops = gs.stops.eval(self.frame);
           let (lut, lut_id) = self.scratch.lut_for(&stops, gs.color_count, paint_opacity)?;
           let map = match gs.kind {
@@ -1110,6 +1112,12 @@ fn clone_paint(p: &PendingPaint, alpha: f32) -> PendingPaint {
 /// mapped axis lengths — NOT the geometric mean det.sqrt(). Equal for
 /// uniform scale; diverges exactly where non-uniform-scale strokes did.
 fn stroke_scale(m: &Mat2x3) -> f32 {
+  if !m.is_affine() {
+    // getScale() maps both points through the perspective too.
+    let o = m.apply(Vec2::ZERO);
+    let p = m.apply(Vec2::new(core::f32::consts::SQRT_2, core::f32::consts::SQRT_2));
+    return ((p.x - o.x) * (p.x - o.x) + (p.y - o.y) * (p.y - o.y)).sqrt() * 0.5;
+  }
   (((m.a + m.c) * (m.a + m.c) + (m.b + m.d) * (m.b + m.d)) * 0.5).sqrt()
 }
 

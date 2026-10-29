@@ -302,6 +302,10 @@ impl Budget {
     self.property(&transform.anchor)?;
     self.property(&transform.scale)?;
     self.property(&transform.rotation)?;
+    if let Some(rotation) = &transform.rotation_3d {
+      self.property(&rotation.x)?;
+      self.property(&rotation.y)?;
+    }
     self.property(&transform.opacity)?;
     self.property(&transform.skew)?;
     self.property(&transform.skew_axis)?;
