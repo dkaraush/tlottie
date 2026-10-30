@@ -519,6 +519,11 @@ fn parse_transform(c: &mut Cursor<'_>, limits: &Limits) -> Result<Transform> {
     b"p" => { tf.position = parse_position(c, limits)?; },
     b"s" => { tf.scale = parse_property(c, limits, parse_vec2)?; },
     b"r" => { tf.rotation = parse_property(c, limits, parse_scalar)?; },
+    // A 3D layer (`ddd`) has `rx`, `ry`, `rz` and `or` instead of `r`.
+    // Like rlottie, `rz` is its Z rotation and `or` is not applied.
+    b"rx" => { tf.rotation_3d_mut().x = parse_property(c, limits, parse_scalar)?; },
+    b"ry" => { tf.rotation_3d_mut().y = parse_property(c, limits, parse_scalar)?; },
+    b"rz" => { tf.rotation = parse_property(c, limits, parse_scalar)?; },
     b"o" => { tf.opacity = parse_property(c, limits, parse_scalar)?; },
     b"sk" => { tf.skew = parse_property(c, limits, parse_scalar)?; },
     b"sa" => { tf.skew_axis = parse_property(c, limits, parse_scalar)?; },

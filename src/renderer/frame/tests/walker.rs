@@ -179,3 +179,65 @@ fn translating_static_layer_matches_a_fresh_walker() {
   // unbounded, and the unclipped geometry it produced dropped scanlines on
   // the recording frame. The equivalence above is the property that matters.
 }
+
+#[derive(Default)]
+struct Points(Vec<Point>);
+
+impl FrameRenderer for Points {
+  fn save_layer(&mut self) {}
+
+  fn draw(&mut self, geometry: Geometry<'_>, _paint: Paint<'_>) {
+    for contour in geometry.contours() {
+      self.0.extend(contour.points());
+    }
+  }
+
+  fn apply_mask(&mut self, _geometry: Geometry<'_>, _mode: u8, _inverted: bool, _opacity: u8, _first: bool, _last: bool) {}
+
+  fn end_layer(&mut self, _composite: Composite) {}
+}
+
+#[test]
+fn ddd_parent_turns_children_in_perspective() {
+  // A 3D layer has `rx`, `ry`, `rz` and `or` in place of `r`.
+  let json = br#"{"fr":30,"ip":0,"op":1,"w":200,"h":200,"layers":[
+    {"ddd":1,"ty":3,"ind":1,"ip":0,"op":1,"st":0,
+     "ks":{"o":{"a":0,"k":100},"rx":{"a":0,"k":30},"ry":{"a":0,"k":-50},"rz":{"a":0,"k":20},"or":{"a":0,"k":[10,20,30]},
+           "p":{"a":0,"k":[100,90,0]},"a":{"a":0,"k":[5,-5,0]},"s":{"a":0,"k":[120,80,100]}}},
+    {"ddd":1,"ty":4,"ind":2,"parent":1,"ip":0,"op":1,"st":0,
+     "ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[0,0,0]},"a":{"a":0,"k":[0,0,0]},"s":{"a":0,"k":[100,100,100]}},
+     "shapes":[{"ty":"gr","it":[
+       {"ty":"sh","ks":{"a":0,"k":{"c":true,"v":[[-40,-30],[40,-30],[40,30],[-40,30]],"i":[[0,0],[0,0],[0,0],[0,0]],"o":[[0,0],[0,0],[0,0],[0,0]]}}},
+       {"ty":"fl","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100},"r":1},
+       {"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},"r":{"a":0,"k":0},"o":{"a":0,"k":100}}
+     ]}]}
+  ]}"#;
+  // As rlottie draws it: the anchored and scaled layer turns around X, then
+  // Y, then Z, and each of the first two is seen from a camera 1024 px away,
+  // so the side that turns towards it grows. `or` is not applied.
+  let expected = |x: f32, y: f32| {
+    let (x, y) = ((x - 5.0) * 1.2, (y + 5.0) * 0.8);
+    let (sin, cos) = 30f32.to_radians().sin_cos();
+    let w = 1.0 - y * sin / 1024.0;
+    let (x, y) = (x / w, y * cos / w);
+    let (sin, cos) = (-50f32).to_radians().sin_cos();
+    let w = 1.0 - x * sin / 1024.0;
+    let (x, y) = (x * cos / w, y / w);
+    let (sin, cos) = 20f32.to_radians().sin_cos();
+    (x * cos - y * sin + 100.0, x * sin + y * cos + 90.0)
+  };
+  let comp = Composition::parse(json, &Limits::default()).unwrap();
+  let mut points = Points::default();
+  walk_frame_into(&comp, 0.0, 200, 200, crate::RenderOptions::default(), &mut points).unwrap();
+
+  assert!(points.0.len() >= 4, "{:?}", points.0);
+  for (point, (x, y)) in points.0.iter().zip([(-40.0, -30.0), (40.0, -30.0), (40.0, 30.0), (-40.0, 30.0)]) {
+    let (ex, ey) = expected(x, y);
+    assert!(
+      (point.x - ex).abs() < 1e-3 && (point.y - ey).abs() < 1e-3,
+      "({x}, {y}) maps to ({}, {}), expected ({ex}, {ey})",
+      point.x,
+      point.y
+    );
+  }
+}

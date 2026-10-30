@@ -90,7 +90,7 @@ fn translated_key(key: u128, tx: f32, ty: f32) -> u128 {
 struct StaticContext {
   composition: usize,
   layer: usize,
-  matrix: [u32; 6],
+  matrix: [u32; 9],
   opacity: u32,
   color: [u32; 5],
   width: usize,
@@ -125,7 +125,17 @@ impl StaticContext {
     Self {
       composition: comp as *const Composition as usize,
       layer: layer as *const Layer as usize,
-      matrix: [matrix.a.to_bits(), matrix.b.to_bits(), matrix.c.to_bits(), matrix.d.to_bits(), matrix.tx.to_bits(), matrix.ty.to_bits()],
+      matrix: [
+        matrix.a.to_bits(),
+        matrix.b.to_bits(),
+        matrix.c.to_bits(),
+        matrix.d.to_bits(),
+        matrix.tx.to_bits(),
+        matrix.ty.to_bits(),
+        matrix.px.to_bits(),
+        matrix.py.to_bits(),
+        matrix.pw.to_bits(),
+      ],
       opacity: opacity.to_bits(),
       color,
       width,

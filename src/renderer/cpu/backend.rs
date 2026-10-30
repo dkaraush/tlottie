@@ -787,6 +787,7 @@ fn gradient_map(paint: &GradientPaint) -> GradientMap {
       d: transform.d,
       tx: transform.tx,
       ty: transform.ty,
+      ..crate::math::Mat2x3::IDENTITY
     },
     kind: match paint.kind {
       GradientKind::Linear { sx, sy, dx, dy, inv_len_sq } => GradientMapKind::Linear { sx, sy, dx, dy, inv_len_sq },

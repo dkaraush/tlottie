@@ -162,8 +162,10 @@ pub(crate) struct Transform {
   pub position: Position,
   /// Percent (100 = identity).
   pub scale: Property<Vec2>,
-  /// Degrees.
+  /// Degrees; `rz` of a 3D layer.
   pub rotation: Property<f32>,
+  /// `rx` and `ry` of a 3D layer, boxed so that other transforms stay small.
+  pub rotation_3d: Option<Box<Rotation3d>>,
   /// Percent (100 = opaque).
   pub opacity: Property<f32>,
   /// Skew amount in degrees and skew axis in degrees.
@@ -174,12 +176,18 @@ pub(crate) struct Transform {
 impl Transform {
   /// True when every track (including opacity) is a constant.
   pub fn is_static(&self) -> bool {
-    self.anchor.is_static() && self.position.is_static() && self.scale.is_static() && self.rotation.is_static() && self.opacity.is_static() && self.skew.is_static() && self.skew_axis.is_static()
+    self.geometry_static() && self.opacity.is_static()
   }
 
   /// True when every geometry track is a constant; opacity may still animate.
   pub fn geometry_static(&self) -> bool {
-    self.anchor.is_static() && self.position.is_static() && self.scale.is_static() && self.rotation.is_static() && self.skew.is_static() && self.skew_axis.is_static()
+    self.anchor.is_static()
+      && self.position.is_static()
+      && self.scale.is_static()
+      && self.rotation.is_static()
+      && self.rotation_3d.as_ref().is_none_or(|r| r.x.is_static() && r.y.is_static())
+      && self.skew.is_static()
+      && self.skew_axis.is_static()
   }
 
   pub fn identity() -> Self {
@@ -188,11 +196,29 @@ impl Transform {
       position: Position::Combined(Property::Static(Vec2::ZERO)),
       scale: Property::Static(Vec2::new(100.0, 100.0)),
       rotation: Property::Static(0.0),
+      rotation_3d: None,
       opacity: Property::Static(100.0),
       skew: Property::Static(0.0),
       skew_axis: Property::Static(0.0),
     }
   }
+
+  /// The X and Y rotations of a 3D layer, added when it has one of them.
+  pub fn rotation_3d_mut(&mut self) -> &mut Rotation3d {
+    self.rotation_3d.get_or_insert_with(|| {
+      Box::new(Rotation3d {
+        x: Property::Static(0.0),
+        y: Property::Static(0.0),
+      })
+    })
+  }
+}
+
+/// X and Y rotations of a 3D layer, degrees.
+#[derive(Debug, Clone)]
+pub(crate) struct Rotation3d {
+  pub x: Property<f32>,
+  pub y: Property<f32>,
 }
 
 /// Position can be a combined animated Vec2 or split x/y scalar tracks.

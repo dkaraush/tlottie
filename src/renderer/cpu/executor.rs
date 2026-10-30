@@ -571,7 +571,7 @@ impl RenderCtx<'_> {
           // replay it without evaluating/flattening anything.
           let mut h = walker.clip_sig();
           h.mix(4); // replay-key tag
-          for v in [m.a, m.b, m.c, m.d, m.tx, m.ty] {
+          for v in [m.a, m.b, m.c, m.d, m.tx, m.ty, m.px, m.py, m.pw] {
             h.mix(v.to_bits());
           }
           h.mix(content_opacity.to_bits());
@@ -951,10 +951,16 @@ pub(crate) fn transform_at(tf: &Transform, frame: f32) -> (Mat2x3, f32) {
   // upstream) never reads those fields; its matrix is translate·rotate·
   // scale·translate(−anchor) only. Applying AE-correct shear diverged on
   // every skewed file (contract review: transforms).
-  let m = Mat2x3::translate(position.x, position.y)
-    .concat(Mat2x3::rotate(rotation))
-    .concat(Mat2x3::scale(scale.x / 100.0, scale.y / 100.0))
-    .concat(Mat2x3::translate(-anchor.x, -anchor.y));
+  let mut m = Mat2x3::translate(position.x, position.y).concat(Mat2x3::rotate(rotation));
+  // 3D layer: like rlottie, the scaled layer turns around X, then Y, each
+  // seen in perspective, then Z (`rz`, read into `rotation`).
+  if let Some(rotation_3d) = &tf.rotation_3d {
+    let (rotation_x, rotation_y) = (rotation_3d.x.eval(frame), rotation_3d.y.eval(frame));
+    if rotation_x != 0.0 || rotation_y != 0.0 {
+      m = m.concat(Mat2x3::rotate_y(rotation_y)).concat(Mat2x3::rotate_x(rotation_x));
+    }
+  }
+  let m = m.concat(Mat2x3::scale(scale.x / 100.0, scale.y / 100.0)).concat(Mat2x3::translate(-anchor.x, -anchor.y));
   (m, opacity)
 }
 
